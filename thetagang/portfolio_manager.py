@@ -3,7 +3,7 @@ import math
 import sys
 from asyncio import Future
 from functools import lru_cache
-from typing import Any, Dict, FrozenSet, List, Optional, Tuple
+from typing import Any, Callable, Dict, FrozenSet, List, Optional, Tuple
 
 import numpy as np
 from ib_insync import (
@@ -36,6 +36,7 @@ from thetagang.util import (
     count_short_option_positions,
     get_higher_price,
     get_lower_price,
+    get_max_dte_for,
     get_minimum_credit,
     get_short_positions,
     get_strike_limit,
@@ -532,7 +533,11 @@ class PortfolioManager:
         ):
             for pos in position:
                 position_values[pos.contract.conId] = {
-                    "qty": ifmt(int(pos.position)),
+                    "qty": (
+                        ifmt(int(pos.position))
+                        if pos.position.is_integer()
+                        else ffmt(pos.position)
+                    ),
                     "mktprice": dfmt(pos.marketPrice),
                     "avgprice": dfmt(pos.averageCost),
                     "value": dfmt(pos.marketValue, 0),
@@ -702,6 +707,8 @@ class PortfolioManager:
     ) -> Tuple[List[Any], List[Any], Group]:
         # Check for puts which may be rolled to the next expiration or a better price
         puts = self.get_short_puts(portfolio_positions)
+        # Filter out an VIX positions
+        puts = [put for put in puts if put.contract.symbol != "VIX"]
 
         # find puts eligible to be rolled or closed
         rollable_puts: List[PortfolioItem] = []
@@ -738,6 +745,8 @@ class PortfolioManager:
     ) -> Tuple[List[Any], List[Any], Group]:
         # Check for calls which may be rolled to the next expiration or a better price
         calls = self.get_short_calls(portfolio_positions)
+        # Filter out an VIX positions
+        calls = [call for call in calls if call.contract.symbol != "VIX"]
 
         # find calls eligible to be rolled
         rollable_calls: List[PortfolioItem] = []
@@ -821,7 +830,9 @@ class PortfolioManager:
             )
             strike_limit = math.ceil(
                 max(
-                    [get_strike_limit(self.config, symbol, "C") or 0]
+                    [
+                        get_strike_limit(self.config, symbol, "C") or 0,
+                    ]
                     + [
                         p.averageCost or 0
                         for p in portfolio_positions[symbol]
@@ -855,10 +866,8 @@ class PortfolioManager:
             )
 
             write_only_when_green = self.config["write_when"]["calls"]["green"]
-            ticker = (
-                self.get_ticker_for_stock(symbol, self.get_primary_exchange(symbol))
-                if write_only_when_green
-                else None
+            ticker = self.get_ticker_for_stock(
+                symbol, self.get_primary_exchange(symbol)
             )
 
             (write_threshold, absolute_daily_change) = (None, None)
@@ -902,13 +911,14 @@ class PortfolioManager:
             ok_to_write = is_ok_to_write_calls(
                 symbol, ticker, write_only_when_green, calls_to_write
             )
+            strike_limit = math.ceil(max([strike_limit, ticker.marketPrice()]))
 
             if calls_to_write > 0 and ok_to_write:
                 call_actions_table.add_row(
                     symbol,
                     "[green]Write",
                     f"[green]Will write {calls_to_write} calls, {new_contracts_needed} needed, "
-                    f"limited to {maximum_new_contracts} new contracts, at or above strike ${strike_limit}"
+                    f"limited to {maximum_new_contracts} new contracts, at or above strike {dfmt(strike_limit)}"
                     f" (target_short_calls={target_short_calls} short_call_count={short_call_count} "
                     f"absolute_daily_change={absolute_daily_change:.2f} write_threshold={write_threshold:.2f})",
                 )
@@ -935,7 +945,7 @@ class PortfolioManager:
                     ),
                     "C",
                     strike_limit,
-                    minimum_price=get_minimum_credit(self.config),
+                    minimum_price=lambda: get_minimum_credit(self.config),
                 )
             except RuntimeError:
                 console.print_exception()
@@ -978,7 +988,7 @@ class PortfolioManager:
                     ),
                     "P",
                     strike_limit,
-                    minimum_price=get_minimum_credit(self.config),
+                    minimum_price=lambda: get_minimum_credit(self.config),
                 )
             except RuntimeError:
                 console.print_exception()
@@ -1082,9 +1092,17 @@ class PortfolioManager:
             targets[symbol] = round(
                 self.config["symbols"][symbol]["weight"] * total_buying_power, 2
             )
-            self.target_quantities[symbol] = math.floor(
-                targets[symbol] / ticker.marketPrice()
-            )
+            market_price = ticker.marketPrice()
+            if (
+                not market_price
+                or math.isnan(market_price)
+                or math.isclose(market_price, 0)
+            ):
+                console.print(
+                    f"[red]Invalid market price for {symbol} (market_price={market_price}), skipping for now"
+                )
+                continue
+            self.target_quantities[symbol] = math.floor(targets[symbol] / market_price)
 
             if symbol in portfolio_positions:
                 # Current number of puts
@@ -1393,12 +1411,16 @@ class PortfolioManager:
                 kind = "calls" if right.startswith("C") else "puts"
 
                 minimum_price = (
-                    get_minimum_credit(self.config)
+                    (lambda: get_minimum_credit(self.config))
                     if not self.config["roll_when"][kind]["credit_only"]
-                    else midpoint_or_market_price(buy_ticker)
-                    + get_minimum_credit(self.config)
+                    else (
+                        lambda: midpoint_or_market_price(buy_ticker)
+                        + get_minimum_credit(self.config)
+                    )
                 )
-                fallback_minimum_price = midpoint_or_market_price(buy_ticker)
+
+                def fallback_minimum_price() -> float:
+                    return midpoint_or_market_price(buy_ticker)
 
                 sell_ticker = self.find_eligible_contracts(
                     Stock(
@@ -1497,10 +1519,10 @@ class PortfolioManager:
         main_contract: Contract,
         right: str,
         strike_limit: Optional[float],
-        minimum_price: float,
+        minimum_price: Callable[[], float],
         exclude_expirations_before: Optional[str] = None,
         exclude_exp_strike: Optional[Tuple[float, str]] = None,
-        fallback_minimum_price: Optional[float] = None,
+        fallback_minimum_price: Optional[Callable[[], float]] = None,
         target_dte: Optional[int] = None,
         target_delta: Optional[float] = None,
     ) -> Ticker:
@@ -1512,13 +1534,15 @@ class PortfolioManager:
             if target_delta
             else get_target_delta(self.config, main_contract.symbol, right)
         )
-        contract_max_dte: Optional[int] = self.config["target"]["max_dte"]
+        contract_max_dte = get_max_dte_for(main_contract.symbol, self.config)
 
         console.print(
             f"[green]Searching option chain for symbol={main_contract.symbol} "
-            f"right={right}, strike_limit={strike_limit}, minimum_price={dfmt(minimum_price,3)} "
-            f"fallback_minimum_price={dfmt(fallback_minimum_price,3)}"
-            " this can take a while...[/green]",
+            f"right={right} strike_limit={strike_limit} minimum_price={dfmt(minimum_price(),3)} "
+            f"fallback_minimum_price={dfmt(fallback_minimum_price() if fallback_minimum_price else 0,3)} "
+            f"contract_target_dte={contract_target_dte} contract_max_dte={contract_max_dte} "
+            f"contract_target_delta={contract_target_delta}, "
+            "this can take a while...",
         )
         with console.status(
             "[bold blue_violet]Hunting for juicy contracts... 😎"
@@ -1526,26 +1550,20 @@ class PortfolioManager:
             self.ib.qualifyContracts(main_contract)
 
             main_contract_ticker = self.get_ticker_for(main_contract, midpoint=True)
-            main_contract_price = midpoint_or_market_price(main_contract_ticker)
+            underlying_price = midpoint_or_market_price(main_contract_ticker)
 
             chains = self.get_chains_for_contract(main_contract)
             chain = next(c for c in chains if c.exchange == main_contract.exchange)
 
             def valid_strike(strike: float) -> bool:
                 if right.startswith("P") and strike_limit:
-                    return (
-                        strike <= main_contract_price + 0.02 * main_contract_price
-                        and strike <= strike_limit
-                    )
+                    return strike <= strike_limit
                 elif right.startswith("P"):
-                    return strike <= main_contract_price + 0.02 * main_contract_price
+                    return strike <= underlying_price + 0.02 * underlying_price
                 elif right.startswith("C") and strike_limit:
-                    return (
-                        strike >= main_contract_price - 0.02 * main_contract_price
-                        and strike >= strike_limit
-                    )
+                    return strike >= strike_limit
                 elif right.startswith("C"):
-                    return strike >= main_contract_price - 0.02 * main_contract_price
+                    return strike >= underlying_price - 0.02 * underlying_price
                 return False
 
             chain_expirations = self.config["option_chains"]["expirations"]
@@ -1562,6 +1580,10 @@ class PortfolioManager:
                 and option_dte(exp) >= min_dte
                 and (not contract_max_dte or option_dte(exp) <= contract_max_dte)
             )[:chain_expirations]
+            if len(expirations) < 1:
+                raise RuntimeError(
+                    f"No valid contract expirations found for {main_contract.symbol}. Continuing anyway..."
+                )
             rights = [right]
 
             def nearest_strikes(strikes: List[float]) -> List[float]:
@@ -1645,12 +1667,12 @@ class PortfolioManager:
                         right.startswith("C")
                         or isinstance(ticker.contract, Option)
                         and ticker.contract.strike
-                        <= midpoint_or_market_price(ticker) + main_contract_price
+                        <= midpoint_or_market_price(ticker) + underlying_price
                     )
 
                 return midpoint_or_market_price(
                     ticker
-                ) > minimum_price and cost_doesnt_exceed_market_price(ticker)
+                ) > minimum_price() and cost_doesnt_exceed_market_price(ticker)
 
             # Filter out tickers with invalid or unavailable prices
             self.wait_for_market_price_for(
@@ -1722,7 +1744,7 @@ class PortfolioManager:
 
             the_chosen_ticker = None
             if len(tickers) == 0:
-                if not math.isclose(minimum_price, 0.0):
+                if not math.isclose(minimum_price(), 0.0):
                     # if we arrive here, it means that 1) we expect to roll for a
                     # credit only, but 2) we didn't find any suitable contracts,
                     # most likely because we can't roll out and up/down to the
@@ -1743,7 +1765,7 @@ class PortfolioManager:
                 # if there's a fallback minimum price specified, try to find
                 # contracts that are at least that price first
                 for ticker in tickers:
-                    if midpoint_or_market_price(ticker) > fallback_minimum_price:
+                    if midpoint_or_market_price(ticker) > fallback_minimum_price():
                         the_chosen_ticker = ticker
                         break
                 if the_chosen_ticker is None:
@@ -1955,7 +1977,7 @@ class PortfolioManager:
                             0,
                             target_delta=delta,
                             target_dte=target_dte,
-                            minimum_price=get_minimum_credit(self.config),
+                            minimum_price=lambda: get_minimum_credit(self.config),
                         )
                         if not isinstance(buy_ticker.contract, Option):
                             raise RuntimeError(

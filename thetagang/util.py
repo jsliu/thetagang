@@ -217,7 +217,7 @@ def midpoint_or_market_price(ticker: Ticker) -> float:
             # Fallback to the model price if the greeks are available
             return ticker.modelGreeks.optPrice
         else:
-            return ticker.marketPrice()
+            return ticker.marketPrice() if not util.isNan(ticker.marketPrice()) else 0.0
 
     return ticker.midpoint()
 
@@ -348,3 +348,12 @@ def maintain_high_water_mark(config: Dict[str, Any], symbol: str) -> bool:
     ):
         return config["symbols"][symbol]["calls"]["maintain_high_water_mark"]
     return config["roll_when"]["calls"]["maintain_high_water_mark"]
+
+
+def get_max_dte_for(symbol: str, config: Dict[str, Any]) -> Optional[int]:
+    if symbol == "VIX" and "max_dte" in config["vix_call_hedge"]:
+        return config["vix_call_hedge"]["max_dte"]
+    if symbol in config["symbols"] and "max_dte" in config["symbols"][symbol]:
+        return config["symbols"][symbol]["max_dte"]
+
+    return config["target"]["max_dte"]
