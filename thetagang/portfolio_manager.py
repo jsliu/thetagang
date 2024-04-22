@@ -536,7 +536,7 @@ class PortfolioManager:
                     "qty": (
                         ifmt(int(pos.position))
                         if pos.position.is_integer()
-                        else ffmt(pos.position)
+                        else ffmt(pos.position, 4)
                     ),
                     "mktprice": dfmt(pos.marketPrice),
                     "avgprice": dfmt(pos.averageCost),
@@ -2233,6 +2233,11 @@ class PortfolioManager:
             range(delay),
             description=f"Waiting {delay}s before we update prices...",
         ):
+            if all([trade.isDone() for trade in self.trades]):
+                console.print(
+                    "[green]All trades are done, no need to adjust prices. Have a nice day 😊"
+                )
+                break
             self.ib.sleep(1)
 
         unfilled = [
@@ -2265,6 +2270,19 @@ class PortfolioManager:
                             ),
                         ]
                     )
+
+                    # We only want to tighten spreads, not widen them. If the
+                    # resulting price change would increase the spread, we'll
+                    # skip it.
+                    if (order.lmtPrice < 0 and updated_price < order.lmtPrice) or (
+                        order.lmtPrice > 0 and updated_price > order.lmtPrice
+                    ):
+                        console.print(
+                            f"[yellow]Skipping order for {contract.symbol}"
+                            f" with old lmtPrice={dfmt(order.lmtPrice)} updated lmtPrice={dfmt(updated_price)}, because updated price would increase spread"
+                        )
+                        continue
+
                     # Check if the updated price is actually any different
                     # before proceeding, and make sure the signs match so we
                     # don't switch a credit to a debit or vice versa.
