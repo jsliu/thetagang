@@ -5,7 +5,7 @@ from typing import Any, Callable, Dict, List, Optional
 
 import ib_insync.objects
 import ib_insync.ticker
-from ib_insync import AccountValue, PortfolioItem, TagValue, Ticker, util
+from ib_insync import AccountValue, Order, PortfolioItem, TagValue, Ticker, util
 from ib_insync.contract import Option
 
 from thetagang.options import option_dte
@@ -123,12 +123,14 @@ def calculate_net_short_positions(positions: List[PortfolioItem], right: str) ->
                 # ignore empty long positions
                 continue
             if long_dte >= short_dte:
-                if (right.upper().startswith("P") and long_strike >= short_strike) or (
-                    right.upper().startswith("C") and long_strike <= short_strike
+                if (
+                    math.isclose(short_strike, long_strike)
+                    or (right.upper().startswith("P") and long_strike >= short_strike)
+                    or (right.upper().startswith("C") and long_strike <= short_strike)
                 ):
                     if short_position + long_position > 0:
-                        short_position = 0
                         long_position = short_position + long_position
+                        short_position = 0
                     else:
                         short_position += long_position
                         long_position = 0
@@ -357,3 +359,12 @@ def get_max_dte_for(symbol: str, config: Dict[str, Any]) -> Optional[int]:
         return config["symbols"][symbol]["max_dte"]
 
     return config["target"]["max_dte"]
+
+
+def would_increase_spread(order: Order, updated_price: float) -> bool:
+    return (
+        order.action == "BUY"
+        and updated_price < order.lmtPrice
+        or order.action == "SELL"
+        and updated_price > order.lmtPrice
+    )
