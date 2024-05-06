@@ -1443,7 +1443,7 @@ class PortfolioManager:
                 if not sell_ticker.contract:
                     raise RuntimeError(f"Invalid ticker (no contract): {sell_ticker}")
 
-                qty_to_roll = abs(position.position)
+                qty_to_roll = math.floor(abs(position.position))
                 maximum_new_contracts = self.get_maximum_new_contracts_for(
                     symbol,
                     self.get_primary_exchange(symbol),
@@ -1456,6 +1456,12 @@ class PortfolioManager:
 
                 price = midpoint_or_market_price(buy_ticker) - midpoint_or_market_price(
                     sell_ticker
+                )
+                # a buy order should be at most the minimum price, when we expect a credit
+                price = (
+                    min([price, -get_minimum_credit(self.config)])
+                    if self.config["roll_when"][kind]["credit_only"]
+                    else price
                 )
 
                 # store a copy of the contracts so we can retrieve them later by conId
