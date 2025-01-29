@@ -1,6 +1,9 @@
 .vscode/
 ibc.log
 tws-installer.sh
+.idea/
+# local configuration
+thetagang.local.toml
 
 # Ignore tws installer dir
 tws/
@@ -146,3 +149,6 @@ cython_debug/
 
 # Ignore dotenv/direnv files
 .env*
+
+# Ignore notebooks
+*.ipynb

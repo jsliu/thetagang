@@ -60,7 +60,7 @@ daily_stddev_window = "30 D"
 exchange = "SMART"
 
 # Range of time to delay, in seconds, before resubmitting an order with updated
-# midpoint price if `symbol.<symbol>.adjust_midpoint_after_delay = true`.
+# midpoint price if `symbol.<symbol>.adjust_price_after_delay = true`.
 price_update_delay = [30, 60]
 
 # Set a minimum credit order price, to avoid orders where the credit (or debit)
@@ -84,7 +84,12 @@ minimum_credit = 0.05
   # For `algoParams`, the TagValue parameter has 2 values, so any values with
   # anything other than 2 parameters are invalid. Pass an empty list to use the
   # defaults (i.e., params = []).
-  params = [["Patient", "adaptivePriority"]]
+  params = [
+    [
+      "adaptivePriority",
+      "Patient",
+    ],
+  ]
 
 [option_chains]
 # The option chains are lazy loaded, and before you can determine the greeks
@@ -116,6 +121,7 @@ min_pnl = 0.0
 
 # Optional: Don't roll contracts when the current DTE is greater than this
 # number of days. This helps avoid cases where you end up rolling out to LEAPs.
+#
 # max_dte = 180
 
 # Optional: Create a closing order when the P&L reaches this threshold. This
@@ -124,12 +130,39 @@ min_pnl = 0.0
 # long-dated options that have slowly become worthless and you just want to get
 # them out of your portfolio. This only applies to short contract positions,
 # long positions are ignored.
+#
 # close_at_pnl = 0.99
+
+# Optional: if we try to roll the position and it fails, just close it (but only
+# if the position currently has positive P&L). This can happen if the underlying
+# moves too much and there are no suitable contracts. See
+# https://github.com/brndnmtthws/thetagang/issues/347 and
+# https://github.com/brndnmtthws/thetagang/issues/439 for a discussion on this.
+#
+# If `roll_when.max_dte` is set, this will only close the position if the DTE is
+# <= `roll_when.max_dte`.
+#
+# This can also be set per-symbol, with
+# `symbols.<symbol>.close_if_unable_to_roll`.
+close_if_unable_to_roll = false
 
   [roll_when.calls]
   # Roll calls to the next expiration even if they're in the money. Defaults to
   # true if not specified.
   itm = true
+
+  # Always roll calls (short-circuit) when they're in the money, regardless of
+  # the P&L. This allows you to avoid assignment risk by eating the cost of
+  # rolling the calls. This is useful if you want to avoid assignment risk
+  # either because you don't own the underlying (i.e., with spreads) or because
+  # you don't want to realize a gain/loss yet. Note that if it's rolling early
+  # (i.e., before `roll_when.dte`) it may only roll a subset of the contracts
+  # based on the `target.maximum_new_contracts_percent` value.
+  #
+  # This can also be set for puts with `roll_when.puts.always_when_itm`. This
+  # option, when enabled, takes precedence over `roll_when.pnl` and
+  # `roll_when.min_pnl`.
+  always_when_itm = false
 
   # Only roll when there's a suitable contract available that will result in a
   # credit. Enabling this may result in the target delta value being ignored in
@@ -165,6 +198,10 @@ min_pnl = 0.0
   [roll_when.puts]
   # Roll puts if they're in the money. Defaults to false if not specified.
   itm = false
+
+  # See comments above for `roll_when.calls.always_when_itm` for details on this
+  # option (which behaves the same for puts as with calls).
+  always_when_itm = false
 
   # Only roll when there's a suitable contract available that will result in a
   # credit. Enabling this may result in the target delta value being ignored in
@@ -206,6 +243,7 @@ calculate_net_contracts = false
   [write_when.calls]
   # Optionally, only write calls when the underlying is green
   green = true
+  red   = false
 
   # With covered calls, we can cap the number of calls to write by this factor. At
   # 1.0, we write covered calls on 100% of our positions. At 0.5, we'd only write
@@ -230,12 +268,28 @@ calculate_net_contracts = false
   # `symbols.<symbol>.calls.cap_target_floor`.
   cap_target_floor = 0.0
 
+  # If set to true, calls are only written on the underlying when the underlying
+  # has an excess of shares. This is useful for covered calls, where you only
+  # want to write calls when you have more shares than you want to hold
+  # long-term. It also provides a way to rebalance your portfolio by writing
+  # calls and taking profits.
+  #
+  # This may also be set per-symbol with `symbols.<symbol>.calls.excess_only`,
+  # which takes precedence.
+  #
+  # When this is set to true, the `cap_factor` and `cap_target_floor` values are
+  # ignored.
+  excess_only = false
+
   [write_when.puts]
   # Optionally, only write puts when the underlying is red
-  red = true
+  green = false
+  red   = true
 
 [target]
 # Target 45 or more days to expiry
+# This value can also be set per-symbol, with `symbols.<symbol>.dte`
+# (see `symbols.QQQ` example below).
 dte = 45
 
 # Optionally, we can prevent contracts from being rolled insanely far out with
@@ -308,13 +362,26 @@ minimum_open_interest = 10
   # randomly from the range defined by `orders.price_update_delay`.
   adjust_price_after_delay = false
 
+  # You can include a symbol, but instruct ThetaGang not to place any trades for
+  # that symbol by setting `no_trading = true`. This allows you to include
+  # placeholders (such as for tracking purposes, or because you want to trade
+  # manually) without actually trading them.
+  #
+  # no_trading = true
+
   [symbols.QQQ]
   weight = 0.3
-
+  # The target DTE may also be specified per-symbol, and takes precedence over
+  # `target.dte`
+  dte = 60
   # Optional: specify the maximum contract DTE for this symbol (i.e., don't open
   # or roll positions past this DTE). This will override the `target.max_dte`
   # value.
   # max_dte = 45
+
+  # Optional: If we try to roll the position and it fails, just close it (but
+  # only if it's profitable).
+  close_if_unable_to_roll = true
 
     # parts = 30
     [symbols.QQQ.puts]
@@ -325,9 +392,9 @@ minimum_open_interest = 10
     strike_limit = 1000.0 # never write a put with a strike above $1000
 
     # Optionally, if we only write new contracts when the underlying is green or
-    # red (`write_when.calls.green=true` or `write_when.puts.red=true`), specify a
-    # minimum threshold as an absolute value daily percentage change (in this
-    # example, use 1% for puts only, but could also be specified as
+    # red (`write_when.*.green=true` && `write_when.*.red=false` or vice versa),
+    # specify a minimum threshold as an absolute value daily percentage change
+    # (in this example, use 1% for puts only, but could also be specified as
     # `symbols.QQQ.write_threshold`). This can also be specified under
     # `constants.write_threshold` and `constants.puts/calls.write_threshold` to
     # apply to all symbols, either for both puts or calls, or individually.
@@ -353,6 +420,11 @@ minimum_open_interest = 10
     #
     # write_threshold_sigma = 1.0 # 1x the standard devation of log returns for the daily stddev window
 
+      # the values for `write_when.*.green` and `write_when.*.red` can also be set per-symbol
+      [symbols.QQQ.puts.write_when]
+      green = false
+      red   = true
+
     [symbols.QQQ.calls]
     strike_limit = 100.0 # never write a call with a strike below $100
 
@@ -363,33 +435,43 @@ minimum_open_interest = 10
     cap_factor       = 1.0
     cap_target_floor = 0.0
 
-[symbols.TLT]
-weight = 0.2
-# parts = 20
-# Override delta for this particular symbol, for both puts and calls.
-delta = 0.4
+    # Optionally, only write calls when the underlying has an excess of shares
+    # when set to `true`. This overrides the `write_when.calls.excess_only`
+    # value.
+    excess_only = false
 
-[symbols.ABNB]
-# For symbols that require an exchange, which is typically any company stock,
-# you must specify the primary exchange.
-primary_exchange = "NASDAQ"
-weight           = 0.05
+  [symbols.TLT]
+  weight = 0.2
+  # parts = 20
+  # Override delta for this particular symbol, for both puts and calls.
+  delta = 0.4
+
+  [symbols.ABNB]
+  # For symbols that require an exchange, which is typically any company stock,
+  # you must specify the primary exchange.
+  primary_exchange = "NASDAQ"
+  weight           = 0.05
+
+  # parts = 5
+  # Sometimes you may need to wrap the symbol in quotes.
+  [symbols."BRK B"]
+  # For symbols that require an exchange, which is typically any company stock,
+  # you must specify the primary exchange.
+  primary_exchange = "NYSE"
+  weight           = 0.05
 
 # parts = 5
-# Sometimes you may need to wrap the symbol in quotes.
-[symbols."BRK B"]
-# For symbols that require an exchange, which is typically any company stock,
-# you must specify the primary exchange.
-primary_exchange = "NYSE"
-weight           = 0.05
-
-# parts = 5
-[ib_insync]
-logfile = '/etc/thetagang/ib_insync.log'
+[ib_async]
+logfile = '/etc/thetagang/ib_async.log'
 
 # Typically the amount of time needed when waiting on data from the IBKR API.
 # Sometimes it can take a while to retrieve data, and it's lazy-loaded by the
 # API, so getting this number right is largely a matter of guesswork.
+# Increasing the number would reduce the throughput since we have to wait maximum X seconds
+# to make sure all the required data fields are ready.
+# You can speed up the thetagang by reducing this number, but you may miss the best opportunities.
+# The rule of thumb to choose the best value is assuming the maximum run time of thetagang
+# will be around 6 (call,puts,roll calls, roll puts, ...) * api_response_wait_time * number_of_symbols you have in the configuration.
 api_response_wait_time = 60
 
 [ibc]
@@ -534,3 +616,41 @@ sell_threshold = 10000
       # ["noTakeLiq", "1"],
     ]
     strategy = "Vwap"
+
+[exchange_hours]
+# ThetaGang can check whether the market is open before running. This is useful
+# to avoid placing orders when the market is closed. We can also (for example)
+# avoid running too early (i.e., immediately after market open) to avoid the
+# initial volatility, or too late (i.e., immediately before market close) to
+# avoid the closing volatility.
+
+# The exchange to check for market hours. XNYS is the NYSE, but you can use any
+# of the ISO exchange codes from
+# https://github.com/gerrymanoim/exchange_calendars?tab=readme-ov-file#Calendars.
+#
+# For example, you'd use "XTKS" for the Tokyo Stock Exchange, "XLON" for the
+# London Stock Exchange, or "XHKG" for the Hong Kong Stock Exchange.
+exchange = "XNYS"
+
+# If the market is closed, we can either exit immediately, wait until it's
+# time to begin, or continue as normal. Specify "exit" to exit, "wait" to wait,
+# and "continue" to continue.
+#
+# Setting this to "continue" is equivalent to disabling this feature.
+action_when_closed = "exit"
+
+# The maximum amount of time, in seconds, to wait for the market to open if you
+# set `exchange_hours.action_when_closed = "wait"`. For example, a value of 3600
+# means ThetaGang will only wait for the market to open if it's within 1 hour of
+# the current time.
+max_wait_until_open = 3600
+
+# The amount of time, in seconds, after the market open, to wait before running
+# ThetaGang. For example, if this is set to 1800, ThetaGang will consider the
+# market closed until 30 minutes after the open.
+delay_after_open = 1800
+
+# The amount of time, in seconds, before the market close, to stop running
+# ThetaGang. For example, if set to 1800, ThetaGang will consider the market
+# closed 30 minutes prior to the actual close.
+delay_before_close = 1800

@@ -28,16 +28,31 @@ example, you might want to use a 60/40 portfolio with SPY (S&P500 fund) and
 TLT (20 year treasury fund). This strategy reduces risk, but may also limit
 gains from big market swings. By reducing risk, one can increase leverage.
 
-The main difference between ThetaGang and simply buying and holding index
-funds is that this script will attempt to harvest volatility by selling
-options, rather than buying shares directly. This works because implied
-volatility is typically higher than realized volatility on average. Instead
-of buying shares, you write puts. This has pros and cons, which are outside
-the scope of this README.
+ThetaGang is quite configurable, and you can adjust the parameters to suit your
+preferences and needs, but the default configuration is designed to be a good
+starting point. ThetaGang makes some assumptions about how to run this strategy,
+but you can tweak it to your liking by modifying the
+[`thetagang.toml`](https://github.com/brndnmtthws/thetagang/blob/main/thetagang.toml)
+file.
 
-You could use this tool on individual stocks, but I personally don't
+The main difference between ThetaGang and simply buying and holding index funds
+is that this script will attempt to harvest volatility by selling options,
+rather than buying shares directly. This works because implied volatility is
+typically higher than realized volatility on average. Instead of buying shares,
+you write puts. This has pros and cons, which are outside the scope of this
+README.
+
+ThetaGang can also be used in combination with other strategies such as PMCCs,
+Zebra, stock replacement, and so forth. For these strategies, however, ThetaGang
+will not manage long positions for you. You will need to manage these positions
+yourself. ThetaGang will, however, continue to execute the short legs of these
+strategies as long as you have the buying power available and set the
+appropriate configuration (in particular, by setting
+`write_when.calculate_net_contracts = true`).
+
+You could use this tool on individual stocks, but I don't
 recommend it because I am not smart enough to understand which stocks to buy.
-That's why I just buy index funds.
+That's why I buy index funds.
 
 ThetaGang will try to acquire your desired allocation of each stock or ETF
 according to the weights you specify in the config. To acquire the positions,
@@ -51,17 +66,20 @@ you will own the underlying). When rolling puts, the strike of the new contracts
 are capped at the old strike plus the premium received (to prevent your account
 from blowing due to over-ratcheting up the buying power usage).
 
-If puts are exercised due to being ITM at expiration, you will own the
-stock, and ThetaGang switches from writing puts to writing calls at a strike
-at least as high as the average cost of the stock held.
+If puts are exercised due to being ITM at expiration, you will own the stock,
+and ThetaGang switches from writing puts to writing calls at a strike at least
+as high as the average cost of the stock held. To avoid missing out on upward
+moves, you can limit the number of calls that are written with
+`write_when.calls.cap_factor`, such as setting this to 0.5 to limit the number
+of calls to 50% of the shares held.
 
 Please note: this strategy is based on the assumption that implied volatility
 is, on average, always higher than realized volatility. In cases where this
 is not true, this strategy will cause you to lose money.
 
 In the case of deep ITM calls, the bot will prefer to roll the calls to next
-strike or expiration rather than allowing the underlying to get called away. If you
-don't have adequate buying power available in your account, it's possible
+strike or expiration rather than allowing the underlying to get called away. If
+you don't have adequate buying power available in your account, it's possible
 that the options may get exercised instead of rolling forward and the process
 starts back at the beginning. Please keep in mind this may have tax
 implications, but that is outside the scope of this README.
@@ -74,10 +92,11 @@ daily is not recommended, but the choice is yours.
 
 ### VIX call hedging
 
-ThetaGang can optionally hedge your account by purchasing VIX calls for the
-next month based on specified parameters. The strategy is based on the [Cboe
-VIX Tail Hedge Index](https://www.cboe.com/us/indices/dashboard/vxth/), which
-you can read about on the internet. You can enable this feature in `thetagang.toml` with:
+ThetaGang can optionally hedge your account by purchasing VIX calls for the next
+month based on specified parameters. The strategy is based on the [Cboe VIX Tail
+Hedge Index](https://www.cboe.com/us/indices/dashboard/vxth/), which you can
+read about on the internet. You can enable this feature in `thetagang.toml`
+with:
 
 ```toml
 [vix_call_hedge]
@@ -162,14 +181,14 @@ redistribution.
 
 ## Requirements
 
-The bot is based on the [ib_insync](https://github.com/erdewit/ib_insync)
+The bot is based on the [ib_async](https://github.com/ib-api-reloaded/ib_async)
 library, and uses [IBC](https://github.com/IbcAlpha/IBC) for managing the API
 gateway.
 
 To use the bot, you'll need an Interactive Brokers account with a working
 installation of IBC. If you want to modify the bot, you'll need an
-installation of Python 3.8 or newer with the
-[`poetry`](https://python-poetry.org/) package manager.
+installation of Python 3.10 or newer with the
+[`uv`](https://docs.astral.sh/uv/) package manager.
 
 One more thing: to run this on a live account, you'll require enough capital
 to purchase at least 100 shares of the stocks or ETFs you choose. For
@@ -211,8 +230,8 @@ here](https://hub.docker.com/repository/docker/brndnmtthws/thetagang).
 
 To run ThetaGang within Docker, you'll need to pass `config.ini` for [IBC
 configuration](https://github.com/IbcAlpha/IBC/blob/master/userguide.md) and
-[`thetagang.toml`](/thetagang.toml) for ThetaGang. There's a sample
-[`ibc-config.ini`](/ibc-config.ini) included in this repo for your convenience.
+[`thetagang.toml`](https://github.com/brndnmtthws/thetagang/blob/main/thetagang.toml) for ThetaGang. There's a sample
+[`ibc-config.ini`](https://github.com/brndnmtthws/thetagang/blob/main/ibc-config.ini) included in this repo for your convenience.
 
 The easiest way to get the config files into the container is by mounting a
 volume.
@@ -273,9 +292,10 @@ recommendations and resources:
 Check out the code to your local machine and install the Python dependencies:
 
 ```console
-poetry install
-poetry run autohooks activate
-poetry run thetagang -h
+# Install the pre-commit hooks
+uv run pre-commit install
+# Run thetagang
+uv run thetagang -h
 ```
 
 You are now ready to make a splash! 🐳
@@ -286,7 +306,8 @@ You are now ready to make a splash! 🐳
 |---|---|---|
 | Requested market data is not subscribed. | Requisite market data subscriptions have not been set up on IBKR. | [Configure](https://www.interactivebrokers.com/en/software/am3/am/settings/marketdatasubscriptions.htm) your market data subscriptions. The default config that ships with this script uses the `Cboe One Add-On Bundle` and the `US Equity and Options Add-On Streaming Bundle`. **Note**: You _must_ fund your account before IBKR will send data for subscriptions. Without funding you can still subscribe but you will get an error from ibc. |
 | No market data during competing live session | Your account is logged in somewhere else, such as the IBKR web portal, the desktop app, or even another instance of this script. | Log out of all sessions and then re-run the script. |
-| `ib_insync.wrapper ERROR Error 200, reqId 10: The contract description specified for SYMBOL is ambiguous.` | IBKR needs to know which exchange is the primary exchange for a given symbol. | You need to specify the primary exchange for the stock. This is normal for companies, typically. For ETFs it usually isn't required. Specify the `primary_exchange` parameter for the symbol, i.e., `primary_exchange = "NYSE"`. |
+| `ib_async.wrapper ERROR Error 200, reqId 10: The contract description specified for SYMBOL is ambiguous.` | IBKR needs to know which exchange is the primary exchange for a given symbol. | You need to specify the primary exchange for the stock. This is normal for companies, typically. For ETFs it usually isn't required. Specify the `primary_exchange` parameter for the symbol, i.e., `primary_exchange = "NYSE"`. |
+| IBKey and MFA-related authentication issues | IBKR requires MFA for the primary account user. | Create a second account with limited permissions using the web portal (remove withdrawal/transfer, client management, IP restriction, etc permissions) and set an IP restriction if possible. When logging into the second account, ignore the MFA nags and do not enable MFA. A [more detailed set of instructions can be found here](https://github.com/Voyz/ibeam/wiki/Runtime-environment#using-a-secondary-account), from a different project. |
 
 ## Support and sponsorship
 
