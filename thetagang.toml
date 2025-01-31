@@ -8,7 +8,7 @@
 # account before trying on a live account.
 [account]
 # The account number to operate on
-number = "DU1234567"
+number = "DU7328717"
 
 # Cancel any existing orders for the symbols configured at startup
 cancel_orders = true
@@ -461,6 +461,14 @@ minimum_open_interest = 10
   weight           = 0.05
 
 # parts = 5
+# Sometimes you may need to wrap the symbol in quotes.
+[symbols."BRK B"]
+# For symbols that require an exchange, which is typically any company stock,
+# you must specify the primary exchange.
+primary_exchange = "NYSE"
+weight           = 0.05
+
+# parts = 5
 [ib_async]
 logfile = '/etc/thetagang/ib_async.log'
 
@@ -484,12 +492,12 @@ tradingMode = 'paper'
 # normal operation this should be false because we often try to make "invalid"
 # requests when scanning option chains for example.
 RaiseRequestErrors = false
-password           = 'demo'
-userid             = 'demo'
+password           = '***REMOVED***'
+userid             = '***REMOVED***'
 # Change this to point to your config.ini for IBC
-ibcIni = '/etc/thetagang/config.ini'
+ibcIni = '/Users/zhenliu/ibc/config.ini'
 # Change or unset this to use something other than the Docker bundled OpenJDK.
-javaPath = '/opt/java/openjdk/bin'
+# javaPath = '/opt/java/openjdk/bin'
 
 # twsPath         = ''
 # twsSettingsPath = ''
@@ -503,7 +511,7 @@ appTimeout     = 20
 clientId       = 1
 connectTimeout = 2
 host           = '127.0.0.1'
-port           = 7497
+port           = 4002
 probeTimeout   = 4
 readonly       = false
 retryDelay     = 2

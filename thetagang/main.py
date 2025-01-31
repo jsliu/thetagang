@@ -44,3 +44,6 @@ def cli(config: str, without_ibc: bool, dry_run: bool) -> None:
     from .thetagang import start
 
     start(config, without_ibc, dry_run)
+
+if __name__ == "__main__":
+    cli()
