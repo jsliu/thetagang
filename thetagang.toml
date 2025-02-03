@@ -348,7 +348,7 @@
   # `target.delta` or `target.puts/calls.delta`. You can specify a value for the
   # symbol, or override individually for puts/calls.
   [symbols.SPY]
-  weight = 0.4
+  weight = 0.2
 
   # OR: specify in terms of parts. Must use either weight or parts, but cannot mix
   # both.
@@ -369,8 +369,8 @@
   #
   # no_trading = true
 
-  [symbols.QQQ]
-  weight = 0.3
+  [symbols.TQQQ]
+  weight = 0.2
   # The target DTE may also be specified per-symbol, and takes precedence over
   # `target.dte`
   dte = 60
@@ -384,7 +384,7 @@
   close_if_unable_to_roll = true
 
   # parts = 30
-  [symbols.QQQ.puts]
+  [symbols.TQQQ.puts]
   # Override delta just for QQQ puts
   delta = 0.5
   # Also, optionally specify a strike limit, for either puts or calls.
@@ -421,11 +421,11 @@
   # write_threshold_sigma = 1.0 # 1x the standard devation of log returns for the daily stddev window
 
   # the values for `write_when.*.green` and `write_when.*.red` can also be set per-symbol
-  [symbols.QQQ.puts.write_when]
+  [symbols.TQQQ.puts.write_when]
   green = false
   red   = true
 
-  [symbols.QQQ.calls]
+  [symbols.TQQQ.calls]
   strike_limit = 100.0 # never write a call with a strike below $100
 
   maintain_high_water_mark = true # maintain the high water mark when rolling calls
@@ -440,25 +440,31 @@
   # value.
   excess_only = false
 
-  [symbols.TLT]
+  [symbols.XLK]
   weight = 0.2
   # parts = 20
   # Override delta for this particular symbol, for both puts and calls.
   delta = 0.4
+  
+  [symbols.VTI]
+  weight = 0.1
+  # parts = 20
+  # Override delta for this particular symbol, for both puts and calls.
+  delta = 0.4
 
-  [symbols.ABNB]
+  [symbols.AVGO]
   # For symbols that require an exchange, which is typically any company stock,
   # you must specify the primary exchange.
   primary_exchange = "NASDAQ"
-  weight           = 0.05
+  weight           = 0.1
 
   # parts = 5
   # Sometimes you may need to wrap the symbol in quotes.
-  [symbols."BRK B"]
+  [symbols.NVDA]
   # For symbols that require an exchange, which is typically any company stock,
   # you must specify the primary exchange.
-  primary_exchange = "NYSE"
-  weight           = 0.05
+  primary_exchange = "NASDAQ"
+  weight           = 0.2
 
 
   # parts = 5
@@ -504,7 +510,7 @@
   clientId       = 1
   connectTimeout = 2
   host           = '127.0.0.1'
-  port           = 4002
+  port           = 7497
   probeTimeout   = 4
   readonly       = false
   retryDelay     = 2
@@ -576,7 +582,7 @@
   # sell the cash fund to get back to the target cash balance.
   #
   # Enables cash management
-  enabled = false
+  enabled = true
 
   # The fund to purchase with your cash. Example of cash funds are SGOV or SHV,
   # which are short-term treasury ETFs with reasonable fees. Be sure to check the
@@ -638,7 +644,8 @@
   # and "continue" to continue.
   #
   # Setting this to "continue" is equivalent to disabling this feature.
-  action_when_closed = "exit"
+  # action_when_closed = "exit"
+  action_when_closed = "continue"
 
   # The maximum amount of time, in seconds, to wait for the market to open if you
   # set `exchange_hours.action_when_closed = "wait"`. For example, a value of 3600
