@@ -8,7 +8,7 @@
   # account before trying on a live account.
   [account]
   # The account number to operate on
-  number = "DU7328717"
+  number = "U12030084"
 
   # Cancel any existing orders for the symbols configured at startup
   cancel_orders = true
@@ -104,7 +104,7 @@
   expirations = 4
 
   # Number of strikes to load from option chains
-  strikes = 15
+  strikes = 50
 
   [roll_when]
   # Roll when P&L reaches 90%
@@ -116,7 +116,7 @@
   # covered calls, it's possible that the P&L would be significantly negative,
   # i.e., -100%. If you want to roll anyway in these situations, set min_pnl to a
   # negative value such as -1 (for -100%).
-  dte     = 15
+  dte     = 3
   min_pnl = 0.0
 
   # Optional: Don't roll contracts when the current DTE is greater than this
@@ -131,7 +131,7 @@
   # them out of your portfolio. This only applies to short contract positions,
   # long positions are ignored.
   #
-  # close_at_pnl = 0.99
+  close_at_pnl = 0.9
 
   # Optional: if we try to roll the position and it fails, just close it (but only
   # if the position currently has positive P&L). This can happen if the underlying
@@ -144,7 +144,7 @@
   #
   # This can also be set per-symbol, with
   # `symbols.<symbol>.close_if_unable_to_roll`.
-  close_if_unable_to_roll = false
+  close_if_unable_to_roll = true
 
   [roll_when.calls]
   # Roll calls to the next expiration even if they're in the money. Defaults to
@@ -238,7 +238,7 @@
   # yourself (by either closing the short side when the long positions expire, or
   # rolling the long positions as they approach expiration). You can avoid rolling
   # excess positions with `roll_when.calls/puts.has_excess = false`.
-  calculate_net_contracts = false
+  calculate_net_contracts = true
 
   [write_when.calls]
   # Optionally, only write calls when the underlying is green
@@ -251,7 +251,7 @@
   #
   # This can also be set per-symbol with
   # `symbols.<symbol>.calls.cap_factor`.
-  cap_factor = 1.0
+  cap_factor = 0.0
 
   # We may want to leave some percentage of our underlying stock perpetually
   # uncovered so we don't miss out on big upside movements. For example, if our
@@ -290,7 +290,7 @@
   # Target 45 or more days to expiry
   # This value can also be set per-symbol, with `symbols.<symbol>.dte`
   # (see `symbols.QQQ` example below).
-  dte = 45
+  dte = 7
 
   # Optionally, we can prevent contracts from being rolled insanely far out with
   # `target.max_dte`. Comment this setting out if you don't care about it. You can
@@ -315,10 +315,10 @@
   #
   # Defaults to 5% of buying power. Set this to 1.0 to effectively disable the
   # limit.
-  maximum_new_contracts_percent = 0.05
+  maximum_new_contracts_percent = 1.0
 
   # Minimum amount of open interest for a contract to qualify
-  minimum_open_interest = 10
+  minimum_open_interest = 1000
 
   # Optional: specify delta separately for puts/calls. Takes precedent over
   # target.delta.
@@ -347,12 +347,12 @@
   # The target delta may also be specified per-symbol, and takes precedence over
   # `target.delta` or `target.puts/calls.delta`. You can specify a value for the
   # symbol, or override individually for puts/calls.
-  [symbols.SPY]
-  weight = 0.2
+  # [symbols.SPY]
+  # weight = 0.2
 
   # OR: specify in terms of parts. Must use either weight or parts, but cannot mix
   # both.
-  # parts = 40
+  # parts = 8
 
   # Sometimes, particularly for stocks/ETFs with limited liquidity, the spreads
   # are too wide to get an order filled at the midpoint on the first attempt. For
@@ -360,7 +360,7 @@
   # amount of time, then resubmit orders that haven't filled (but only for the
   # symbols with this set to true). The amount of time we'll wait is chosen
   # randomly from the range defined by `orders.price_update_delay`.
-  adjust_price_after_delay = false
+  # adjust_price_after_delay = false
 
   # You can include a symbol, but instruct ThetaGang not to place any trades for
   # that symbol by setting `no_trading = true`. This allows you to include
@@ -370,23 +370,23 @@
   # no_trading = true
 
   [symbols.TQQQ]
-  weight = 0.2
+  # weight = 0.2
   # The target DTE may also be specified per-symbol, and takes precedence over
   # `target.dte`
-  dte = 60
+  # dte = 60
   # Optional: specify the maximum contract DTE for this symbol (i.e., don't open
   # or roll positions past this DTE). This will override the `target.max_dte`
   # value.
-  # max_dte = 45
+  max_dte = 45
 
   # Optional: If we try to roll the position and it fails, just close it (but
   # only if it's profitable).
-  close_if_unable_to_roll = true
+  # close_if_unable_to_roll = true
 
-  # parts = 30
+  parts = 3
   [symbols.TQQQ.puts]
   # Override delta just for QQQ puts
-  delta = 0.5
+  delta = 0.3
   # Also, optionally specify a strike limit, for either puts or calls.
   # Interpreted as an upper bound for puts, and a lower bound for calls.
   strike_limit = 1000.0 # never write a put with a strike above $1000
@@ -426,9 +426,9 @@
   red   = true
 
   [symbols.TQQQ.calls]
-  strike_limit = 100.0 # never write a call with a strike below $100
+  # strike_limit = 100.0 # never write a call with a strike below $100
 
-  maintain_high_water_mark = true # maintain the high water mark when rolling calls
+  maintain_high_water_mark = false # maintain the high water mark when rolling calls
 
   # These values can (optionally) be set on a per-symbol basis, in addition to
   # `write_when.calls.cap_factor` and `write_when.calls.cap_target_floor.
@@ -440,34 +440,28 @@
   # value.
   excess_only = false
 
-  [symbols.XLK]
-  weight = 0.2
-  # parts = 20
+  # [symbols.IBKR]
+  # weight = 0.2
+  # parts = 1
   # Override delta for this particular symbol, for both puts and calls.
-  delta = 0.4
-  
-  [symbols.VTI]
-  weight = 0.1
-  # parts = 20
-  # Override delta for this particular symbol, for both puts and calls.
-  delta = 0.4
+  # delta = 0.4
 
-  [symbols.AVGO]
+  # [symbols.TSLA]
   # For symbols that require an exchange, which is typically any company stock,
   # you must specify the primary exchange.
-  primary_exchange = "NASDAQ"
-  weight           = 0.1
+  # primary_exchange = "NASDAQ"
+  # weight = 0.1
 
-  # parts = 5
+  # parts = 6
   # Sometimes you may need to wrap the symbol in quotes.
-  [symbols.NVDA]
+  # [symbols.NVDA]
   # For symbols that require an exchange, which is typically any company stock,
   # you must specify the primary exchange.
-  primary_exchange = "NASDAQ"
-  weight           = 0.2
+  # cprimary_exchange = "NASDAQ"
+  # weight = 0.1
+  # parts = 6
+  
 
-
-  # parts = 5
   [ib_async]
   logfile = '/Users/zhenliu/Documents/project/thetagang/ib_async.log'
 
@@ -510,7 +504,7 @@
   clientId       = 1
   connectTimeout = 2
   host           = '127.0.0.1'
-  port           = 7497
+  port           = 7496
   probeTimeout   = 4
   readonly       = false
   retryDelay     = 2
@@ -587,7 +581,7 @@
   # The fund to purchase with your cash. Example of cash funds are SGOV or SHV,
   # which are short-term treasury ETFs with reasonable fees. Be sure to check the
   # expense ratio before jumping in on ETFs that appear juicier.
-  cash_fund = "SGOV"
+  cash_fund = "SHV"
 
   # You don't usually need to specify the primary exchange for ETFs, but if you
   # do, you can do so with this:
