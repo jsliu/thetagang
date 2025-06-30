@@ -440,19 +440,19 @@
   # value.
   excess_only = false
 
-  # [symbols.IBKR]
+  [symbols.CRCL]
   # weight = 0.2
-  # parts = 1
+  parts = 3
   # Override delta for this particular symbol, for both puts and calls.
   # delta = 0.4
 
-  # [symbols.TSLA]
+  [symbols.COIN]
   # For symbols that require an exchange, which is typically any company stock,
   # you must specify the primary exchange.
   # primary_exchange = "NASDAQ"
   # weight = 0.1
 
-  # parts = 6
+  parts = 1
   # Sometimes you may need to wrap the symbol in quotes.
   # [symbols.NVDA]
   # For symbols that require an exchange, which is typically any company stock,
@@ -519,7 +519,7 @@
   # Tail Hedge Index, described here:
   # https://www.cboe.com/us/indices/dashboard/vxth/
   [vix_call_hedge]
-  enabled = false
+  enabled = true
 
   # Target delta for calls that are purchased
   delta = 0.30
@@ -576,7 +576,7 @@
   # sell the cash fund to get back to the target cash balance.
   #
   # Enables cash management
-  enabled = true
+  enabled = false
 
   # The fund to purchase with your cash. Example of cash funds are SGOV or SHV,
   # which are short-term treasury ETFs with reasonable fees. Be sure to check the
