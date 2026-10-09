@@ -1,33 +1,46 @@
-from typing import List, Optional
-
-from ib_async import Contract, LimitOrder, Trade
+from ib_async import Contract, Order, Trade
 from rich import box
 from rich.pretty import Pretty
 from rich.table import Table
 
 from thetagang import log
+from thetagang.db import DataStore
 from thetagang.fmt import dfmt, ffmt, ifmt
 from thetagang.ibkr import IBKR
 
 
 class Trades:
-    def __init__(self, ibkr: IBKR) -> None:
+    def __init__(self, ibkr: IBKR, data_store: DataStore | None = None) -> None:
         self.ibkr = ibkr
-        self.__records: List[Trade] = []
+        self.data_store = data_store
+        self.__records: list[Trade] = []
 
     def submit_order(
-        self, contract: Contract, order: LimitOrder, idx: Optional[int] = None
-    ) -> None:
+        self,
+        contract: Contract,
+        order: Order,
+        idx: int | None = None,
+        intent_id: int | None = None,
+    ) -> bool:
+        """Submit an order, returning whether local placement succeeded."""
         try:
             trade = self.ibkr.place_order(contract, order)
-            if idx is not None:
-                self.__replace_trade(trade, idx)
-            else:
-                self.__add_trade(trade)
-        except RuntimeError:
-            log.error(f"{contract.symbol}: Failed to submit contract, order={order}")
+        except Exception as exc:  # noqa: BLE001
+            log.error(
+                f"{contract.symbol}: Failed to submit contract, order={order}, "
+                f"error={type(exc).__name__}: {exc}"
+            )
+            return False
 
-    def records(self) -> List[Trade]:
+        if self.data_store:
+            self.data_store.record_order(contract, order, intent_id=intent_id)
+        if idx is not None:
+            self.__replace_trade(trade, idx)
+        else:
+            self.__add_trade(trade)
+        return True
+
+    def records(self) -> list[Trade]:
         return self.__records
 
     def is_empty(self) -> bool:
@@ -55,7 +68,11 @@ class Trades:
                 trade.contract.exchange,
                 Pretty(trade.contract, indent_size=2),
                 trade.order.action,
-                dfmt(trade.order.lmtPrice),
+                dfmt(
+                    float(trade.order.lmtPrice)
+                    if trade.order.lmtPrice is not None
+                    else None
+                ),
                 ifmt(int(trade.order.totalQuantity)),
                 trade.orderStatus.status,
                 ffmt(trade.orderStatus.filled, 0),

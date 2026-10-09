@@ -1,29 +1,40 @@
 import math
+from collections.abc import Iterable
 from operator import itemgetter
-from typing import Dict, List, Optional
+from typing import Any
 
 import ib_async.objects
 import ib_async.ticker
 from ib_async import AccountValue, Order, PortfolioItem, Ticker, util
-from ib_async.contract import Option
+from ib_async.contract import Option, Stock
 
+from thetagang.accounting import AccountSummary, account_summary_from_values
 from thetagang.config import Config
 from thetagang.options import option_dte
 
 
+def working_stock_order_symbols(trades: Iterable[Any], account_number: str) -> set[str]:
+    """Return symbols with active stock orders for the selected account."""
+    return {
+        trade.contract.symbol
+        for trade in trades
+        if isinstance(getattr(trade, "contract", None), Stock)
+        and getattr(getattr(trade, "order", None), "account", None) == account_number
+        and str(getattr(trade.order, "action", "")).upper() in {"BUY", "SELL"}
+        and not (callable(getattr(trade, "isDone", None)) and trade.isDone())
+    }
+
+
 def account_summary_to_dict(
-    account_summary: List[AccountValue],
-) -> Dict[str, AccountValue]:
-    d: Dict[str, AccountValue] = dict()
-    for s in account_summary:
-        d[s.tag] = s
-    return d
+    account_summary: list[AccountValue],
+) -> AccountSummary:
+    return account_summary_from_values(account_summary)
 
 
 def portfolio_positions_to_dict(
-    portfolio_positions: List[PortfolioItem],
-) -> Dict[str, List[PortfolioItem]]:
-    d: Dict[str, List[PortfolioItem]] = dict()
+    portfolio_positions: list[PortfolioItem],
+) -> dict[str, list[PortfolioItem]]:
+    d: dict[str, list[PortfolioItem]] = {}
     for p in portfolio_positions:
         symbol = p.contract.symbol
         if symbol not in d:
@@ -33,12 +44,15 @@ def portfolio_positions_to_dict(
 
 
 def position_pnl(position: ib_async.objects.PortfolioItem) -> float:
-    return position.unrealizedPNL / abs(position.averageCost * position.position)
+    denominator = position.averageCost * position.position
+    if denominator == 0:
+        return 0.0
+    return position.unrealizedPNL / abs(denominator)
 
 
 def get_short_positions(
-    positions: List[PortfolioItem], right: str
-) -> List[PortfolioItem]:
+    positions: list[PortfolioItem], right: str
+) -> list[PortfolioItem]:
     return [
         p
         for p in positions
@@ -49,8 +63,8 @@ def get_short_positions(
 
 
 def get_long_positions(
-    positions: List[PortfolioItem], right: str
-) -> List[PortfolioItem]:
+    positions: list[PortfolioItem], right: str
+) -> list[PortfolioItem]:
     return [
         p
         for p in positions
@@ -60,13 +74,13 @@ def get_long_positions(
     ]
 
 
-def count_short_option_positions(positions: List[PortfolioItem], right: str) -> int:
+def count_short_option_positions(positions: list[PortfolioItem], right: str) -> int:
     return math.floor(-sum([p.position for p in get_short_positions(positions, right)]))
 
 
 def weighted_avg_short_strike(
-    positions: List[PortfolioItem], right: str
-) -> Optional[float]:
+    positions: list[PortfolioItem], right: str
+) -> float | None:
     shorts = [
         (abs(p.position), p.contract.strike)
         for p in get_short_positions(positions, right)
@@ -78,8 +92,8 @@ def weighted_avg_short_strike(
 
 
 def weighted_avg_long_strike(
-    positions: List[PortfolioItem], right: str
-) -> Optional[float]:
+    positions: list[PortfolioItem], right: str
+) -> float | None:
     shorts = [
         (abs(p.position), p.contract.strike)
         for p in get_long_positions(positions, right)
@@ -90,24 +104,24 @@ def weighted_avg_long_strike(
         return num / den
 
 
-def count_long_option_positions(positions: List[PortfolioItem], right: str) -> int:
+def count_long_option_positions(positions: list[PortfolioItem], right: str) -> int:
     return math.floor(sum([p.position for p in get_long_positions(positions, right)]))
 
 
-def calculate_net_short_positions(positions: List[PortfolioItem], right: str) -> int:
-    shorts = [
+def calculate_net_short_positions(positions: list[PortfolioItem], right: str) -> int:
+    shorts: list[tuple[int, float, float]] = [
         (
             option_dte(p.contract.lastTradeDateOrContractMonth),
-            p.contract.strike,
-            p.position,
+            float(p.contract.strike),
+            float(p.position),
         )
         for p in get_short_positions(positions, right)
     ]
-    longs = [
+    longs: list[tuple[int, float, float]] = [
         (
             option_dte(p.contract.lastTradeDateOrContractMonth),
-            p.contract.strike,
-            p.position,
+            float(p.contract.strike),
+            float(p.position),
         )
         for p in get_long_positions(positions, right)
     ]
@@ -122,18 +136,17 @@ def calculate_net_short_positions(positions: List[PortfolioItem], right: str) ->
             if long_position < 1:
                 # ignore empty long positions
                 continue
-            if long_dte >= short_dte:
-                if (
-                    math.isclose(short_strike, long_strike)
-                    or (right.upper().startswith("P") and long_strike >= short_strike)
-                    or (right.upper().startswith("C") and long_strike <= short_strike)
-                ):
-                    if short_position + long_position > 0:
-                        long_position = short_position + long_position
-                        short_position = 0
-                    else:
-                        short_position += long_position
-                        long_position = 0
+            if long_dte >= short_dte and (
+                math.isclose(short_strike, long_strike)
+                or (right.upper().startswith("P") and long_strike >= short_strike)
+                or (right.upper().startswith("C") and long_strike <= short_strike)
+            ):
+                if short_position + long_position > 0:
+                    long_position = short_position + long_position
+                    short_position = 0
+                else:
+                    short_position += long_position
+                    long_position = 0
             longs[i] = (long_dte, long_strike, long_position)
         return min([0.0, short_position])
 
@@ -144,9 +157,9 @@ def calculate_net_short_positions(positions: List[PortfolioItem], right: str) ->
 
 def net_option_positions(
     symbol: str,
-    portfolio_positions: Dict[str, List[PortfolioItem]],
+    portfolio_positions: dict[str, list[PortfolioItem]],
     right: str,
-    ignore_dte: Optional[int] = None,
+    ignore_dte: int | None = None,
 ) -> int:
     if symbol in portfolio_positions:
         return math.floor(
@@ -223,7 +236,9 @@ def get_target_calls(
 def would_increase_spread(order: Order, updated_price: float) -> bool:
     return (
         order.action == "BUY"
+        and order.lmtPrice is not None
         and updated_price < order.lmtPrice
         or order.action == "SELL"
+        and order.lmtPrice is not None
         and updated_price > order.lmtPrice
     )

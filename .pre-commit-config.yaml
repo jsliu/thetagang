@@ -1,31 +1,40 @@
 repos:
   - repo: https://github.com/pre-commit/pre-commit-hooks
-    rev: v2.3.0
+    rev: v6.0.0
     hooks:
       - id: check-yaml
       - id: end-of-file-fixer
       - id: trailing-whitespace
   - repo: https://github.com/astral-sh/ruff-pre-commit
     # Ruff version.
-    rev: v0.9.1
+    rev: v0.14.4
     hooks:
       # Run the linter.
-      - id: ruff
+      - id: ruff-check
         args: [--fix]
         # Reorder imports.
-      - id: ruff
-        args: [check, --select, I, --fix]
+      - id: ruff-check
+        args: [--select, I, --fix]
       # Run the formatter.
       - id: ruff-format
   - repo: https://github.com/astral-sh/uv-pre-commit
     # uv version.
-    rev: 0.5.18
+    rev: 0.9.8
     hooks:
       - id: uv-sync
         args: ["--locked", "--all-packages"]
   - repo: https://github.com/astral-sh/uv-pre-commit
     # uv version.
-    rev: 0.5.18
+    rev: 0.9.8
     hooks:
       # Update the uv lockfile
       - id: uv-lock
+  - repo: local
+    hooks:
+      - id: ty-check
+        name: ty check
+        entry: uvx ty check
+        language: system
+        types: [python]
+        pass_filenames: false
+        require_serial: true
