@@ -1,30 +1,63 @@
 import asyncio
+import math
+from collections.abc import Awaitable, Callable, Coroutine, Iterator
+from contextlib import contextmanager
 from enum import Enum
-from typing import Any, Awaitable, Callable, List, Optional
+from typing import Any, cast
 
 from ib_async import (
     IB,
     AccountValue,
     BarDataList,
     Contract,
+    ExecutionFilter,
+    Fill,
+    Index,
     OptionChain,
     Order,
     PortfolioItem,
+    Position,
     Stock,
     Ticker,
     Trade,
     util,
 )
+from ib_async.wrapper import RequestError
 from rich.console import Console
 
 from thetagang import log
+from thetagang.accounting import AccountingError, AccountMetric, select_account_value
+from thetagang.db import DataStore
 
 console = Console()
+
+MAX_CONCURRENT_MARKET_DATA_STREAMS = 50
+ROUTINE_UNSCOPED_ERROR_CODES = frozenset(
+    {
+        1100,
+        1101,
+        1102,
+        1300,
+        2100,
+        2101,
+        2102,
+        2103,
+        2104,
+        2105,
+        2106,
+        2107,
+        2108,
+        2110,
+        2158,
+    }
+)
 
 
 class TickerField(Enum):
     MIDPOINT = "midpoint"
     MARKET_PRICE = "market_price"
+    BID = "bid"
+    ASK = "ask"
     GREEKS = "greeks"
     OPEN_INTEREST = "open_interest"
 
@@ -37,25 +70,71 @@ class RequiredFieldValidationError(Exception):
 
 class IBKR:
     def __init__(
-        self, ib: IB, api_response_wait_time: int, default_order_exchange: str
+        self,
+        ib: IB,
+        api_response_wait_time: int,
+        default_order_exchange: str,
+        data_store: DataStore | None = None,
+        dry_run: bool = False,
     ) -> None:
         self.ib = ib
+        self.data_store = data_store
         self.ib.orderStatusEvent += self.orderStatusEvent
+        self.ib.errorEvent += self._on_error
+        self.ib.execDetailsEvent += self._on_exec_details
         self.api_response_wait_time = api_response_wait_time
         self.default_order_exchange = default_order_exchange
+        self.dry_run = dry_run
+        self.__order_errors: dict[int, tuple[int, str]] = {}
+        self.__supervised_trades: Callable[[], list[Trade]] | None = None
+        self.__market_data_semaphore = asyncio.Semaphore(
+            MAX_CONCURRENT_MARKET_DATA_STREAMS
+        )
+        self.__market_data_contract_locks: dict[int, asyncio.Lock] = {}
 
-    def portfolio(self, account: str) -> List[PortfolioItem]:
+    def portfolio(self, account: str) -> list[PortfolioItem]:
         return self.ib.portfolio(account)
 
-    async def account_summary(self, account: str) -> List[AccountValue]:
+    def cached_net_liquidation(self, account: str) -> float:
+        """Read NLV from a newly materialized synchronized account-value cache."""
+        net_liquidation = self.cached_account_value(
+            account, AccountMetric.NET_LIQUIDATION.value
+        )
+        if net_liquidation > 0:
+            return net_liquidation
+        raise RuntimeError("Net liquidation value is unavailable")
+
+    def cached_account_value(self, account: str, tag: str) -> float:
+        """Read one finite value from ib_async's synchronized account cache."""
+        try:
+            return select_account_value(self.ib.accountValues(account), tag)
+        except AccountingError as exc:
+            raise RuntimeError(str(exc)) from exc
+
+    async def account_summary(self, account: str) -> list[AccountValue]:
         return await self.ib.accountSummaryAsync(account)
+
+    async def refresh_account(self, account: str) -> None:
+        """Restart account updates and wait for a fresh full snapshot."""
+        self.ib.client.reqAccountUpdates(False, account)
+        await self.ib.reqAccountUpdatesAsync(account)
+        for value in self.ib.accountValues(account):
+            if str(getattr(value, "tag", "")).lower() == "accountready" and str(
+                getattr(value, "value", "")
+            ).lower() in {"false", "0"}:
+                raise RuntimeError("IBKR account snapshot is not ready")
 
     async def request_historical_data(
         self,
         contract: Contract,
         duration: str,
+        *,
+        cache_symbol: str | None = None,
     ) -> BarDataList:
-        return await self.ib.reqHistoricalDataAsync(
+        amount, unit = duration.split()
+        if unit == "D" and int(amount) > 365:
+            duration = f"{(int(amount) + 364) // 365} Y"
+        bars = await self.ib.reqHistoricalDataAsync(
             contract,
             "",
             duration,
@@ -63,6 +142,20 @@ class IBKR:
             "TRADES",
             True,
         )
+        if self.data_store:
+            self.data_store.record_historical_bars(
+                cache_symbol or contract.symbol, "1 day", bars
+            )
+        return bars
+
+    async def request_executions(
+        self,
+        exec_filter: ExecutionFilter | None = None,
+    ) -> list[Fill]:
+        fills = await self.ib.reqExecutionsAsync(exec_filter)
+        if self.data_store:
+            self.data_store.record_executions(fills)
+        return fills
 
     def set_market_data_type(
         self,
@@ -70,56 +163,106 @@ class IBKR:
     ) -> None:
         self.ib.reqMarketDataType(data_type)
 
-    def open_trades(self) -> List[Trade]:
+    def open_trades(self) -> list[Trade]:
         return self.ib.openTrades()
+
+    def trades(self) -> list[Trade]:
+        """Return open and completed trades loaded for this broker session."""
+        return self.ib.trades()
 
     def place_order(self, contract: Contract, order: Order) -> Trade:
         return self.ib.placeOrder(contract, order)
 
     def cancel_order(self, order: Order) -> None:
+        if self.dry_run:
+            log.warning("Dry run enabled, skipping broker order cancellation.")
+            return
         self.ib.cancelOrder(order)
 
-    async def get_chains_for_contract(self, contract: Contract) -> List[OptionChain]:
+    def positions(self, account: str) -> list[Position]:
+        return self.ib.positions(account)
+
+    async def get_chains_for_contract(self, contract: Contract) -> list[OptionChain]:
         return await self.ib.reqSecDefOptParamsAsync(
             contract.symbol, "", contract.secType, contract.conId
         )
 
-    async def qualify_contracts(self, *contracts: Contract) -> List[Contract]:
-        return await self.ib.qualifyContractsAsync(*contracts)
+    async def qualify_contracts(self, *contracts: Contract) -> list[Contract]:
+        results = await asyncio.gather(
+            *(self.ib.qualifyContractsAsync(contract) for contract in contracts),
+            return_exceptions=True,
+        )
+        qualified: list[Contract] = []
+        for requested_contract, result in zip(contracts, results):
+            if isinstance(result, RequestError):
+                if result.code != 200:
+                    raise result
+                log.warning(
+                    f"Skipping invalid contract {requested_contract}: {result.message}"
+                )
+                continue
+            if isinstance(result, BaseException):
+                raise result
+            qualified.extend(
+                cast(Contract, contract) for contract in result if contract is not None
+            )
+        return qualified
 
     async def get_ticker_for_stock(
         self,
         symbol: str,
         primary_exchange: str,
-        order_exchange: Optional[str] = None,
+        order_exchange: str | None = None,
         generic_tick_list: str = "",
-        required_fields: List[TickerField] = [TickerField.MARKET_PRICE],
-        optional_fields: List[TickerField] = [TickerField.MIDPOINT],
+        required_fields: list[TickerField] | None = None,
+        optional_fields: list[TickerField] | None = None,
     ) -> Ticker:
+        if optional_fields is None:
+            optional_fields = [TickerField.MIDPOINT]
+        if required_fields is None:
+            required_fields = [TickerField.MARKET_PRICE]
         stock = Stock(
             symbol,
             order_exchange or self.default_order_exchange,
             currency="USD",
             primaryExchange=primary_exchange,
         )
+        qualified = await self.qualify_contracts(stock)
+        contract: Contract = qualified[0] if qualified else stock
+
+        if not contract.conId:
+            # Some underlyings (e.g. SPX) are indices, not stocks.
+            index_exchange = primary_exchange or "CBOE"
+            index_contract = Index(symbol, index_exchange, "USD")
+            qualified_index = await self.qualify_contracts(index_contract)
+            if qualified_index:
+                contract = qualified_index[0]
+
         return await self.get_ticker_for_contract(
-            stock, generic_tick_list, required_fields, optional_fields
+            contract, generic_tick_list, required_fields, optional_fields
         )
 
     async def get_tickers_for_contracts(
         self,
         underlying_symbol: str,
-        contracts: List[Contract],
+        contracts: list[Contract],
         generic_tick_list: str = "",
-        required_fields: List[TickerField] = [TickerField.MARKET_PRICE],
-        optional_fields: List[TickerField] = [TickerField.MIDPOINT],
-    ) -> List[Ticker]:
+        required_fields: list[TickerField] | None = None,
+        optional_fields: list[TickerField] | None = None,
+    ) -> list[Ticker]:
+        if optional_fields is None:
+            optional_fields = [TickerField.MIDPOINT]
+        if required_fields is None:
+            required_fields = [TickerField.MARKET_PRICE]
+
         async def get_ticker_task(contract: Contract) -> Ticker:
             return await self.get_ticker_for_contract(
                 contract, generic_tick_list, required_fields, optional_fields
             )
 
-        tasks = [get_ticker_task(contract) for contract in contracts]
+        tasks: list[Coroutine[Any, Any, Ticker]] = [
+            get_ticker_task(contract) for contract in contracts
+        ]
         tickers = await log.track_async(
             tasks,
             description=f"{underlying_symbol}: Gathering tickers, waiting for required & optional fields...",
@@ -130,9 +273,13 @@ class IBKR:
         self,
         contract: Contract,
         generic_tick_list: str = "",
-        required_fields: List[TickerField] = [TickerField.MARKET_PRICE],
-        optional_fields: List[TickerField] = [TickerField.MIDPOINT],
+        required_fields: list[TickerField] | None = None,
+        optional_fields: list[TickerField] | None = None,
     ) -> Ticker:
+        if optional_fields is None:
+            optional_fields = [TickerField.MIDPOINT]
+        if required_fields is None:
+            required_fields = [TickerField.MARKET_PRICE]
         required_handlers = [
             (field, self.__ticker_field_handler__(field)) for field in required_fields
         ]
@@ -194,13 +341,42 @@ class IBKR:
             self.api_response_wait_time,
         )
 
+    @staticmethod
+    def __valid_execution_quote__(ticker: Ticker, price: Any) -> bool:
+        try:
+            value = float(price)
+        except (TypeError, ValueError):
+            return False
+        if not math.isfinite(value):
+            return False
+        contract = getattr(ticker, "contract", None)
+        if getattr(contract, "secType", None) == "BAG":
+            return not math.isclose(value, 0.0, abs_tol=1e-12)
+        return value > 0.0
+
+    async def __wait_for_bid__(self, ticker: Ticker) -> bool:
+        return await self.__ticker_wait_for_condition__(
+            ticker,
+            lambda t: self.__valid_execution_quote__(t, t.bid),
+            self.api_response_wait_time,
+        )
+
+    async def __wait_for_ask__(self, ticker: Ticker) -> bool:
+        return await self.__ticker_wait_for_condition__(
+            ticker,
+            lambda t: self.__valid_execution_quote__(t, t.ask),
+            self.api_response_wait_time,
+        )
+
     async def __wait_for_greeks__(self, ticker: Ticker) -> bool:
         return await self.__ticker_wait_for_condition__(
             ticker,
-            lambda t: not (
-                t.modelGreeks is None
-                or t.modelGreeks.delta is None
-                or util.isNan(t.modelGreeks.delta)
+            lambda t: (
+                not (
+                    t.modelGreeks is None
+                    or t.modelGreeks.delta is None
+                    or util.isNan(t.modelGreeks.delta)
+                )
             ),
             self.api_response_wait_time,
         )
@@ -220,6 +396,24 @@ class IBKR:
             self.api_response_wait_time,
         )
 
+    @contextmanager
+    def supervise_order_errors(
+        self,
+        trades: Callable[[], list[Trade]],
+    ) -> Iterator[None]:
+        """Capture unmatched order errors only for this live submission batch."""
+        previous = self.__supervised_trades
+        self.__supervised_trades = trades
+        try:
+            yield
+        finally:
+            self.__supervised_trades = previous
+
+    def _on_exec_details(self, _trade: Trade, fill: Fill) -> None:
+        """Persist each execution as IBKR reports it."""
+        if self.data_store:
+            self.data_store.record_executions([fill])
+
     def orderStatusEvent(self, trade: Trade) -> None:
         if "Filled" in trade.orderStatus.status:
             log.info(f"{trade.contract.symbol}: Order filled")
@@ -233,6 +427,142 @@ class IBKR:
             log.info(
                 f"{trade.contract.symbol}: Order updated with status={trade.orderStatus.status}"
             )
+        if self.data_store:
+            self.data_store.record_order_status(trade)
+
+    def _supervised_error_candidates(self) -> list[Trade]:
+        if self.__supervised_trades is None:
+            return []
+        try:
+            trades = self.__supervised_trades()
+        except Exception as exc:  # noqa: BLE001
+            log.warning(f"Unable to inspect supervised orders: {exc}")
+            return []
+        return [
+            trade
+            for trade in trades
+            if trade
+            and str(
+                getattr(getattr(trade, "orderStatus", None), "status", "")
+            ).casefold()
+            != "filled"
+        ]
+
+    @staticmethod
+    def _candidate_for_unscoped_error(
+        candidates: list[Trade],
+        contract: Contract | None,
+    ) -> Trade | None:
+        terminal = [
+            trade
+            for trade in candidates
+            if str(
+                getattr(getattr(trade, "orderStatus", None), "status", "")
+            ).casefold()
+            in {"inactive", "cancelled", "canceled", "apicancelled", "apicanceled"}
+        ]
+        if len(terminal) == 1:
+            return terminal[0]
+        symbol = getattr(contract, "symbol", None)
+        if symbol:
+            matching_symbol = [
+                trade
+                for trade in candidates
+                if getattr(getattr(trade, "contract", None), "symbol", None) == symbol
+            ]
+            if len(matching_symbol) == 1:
+                return matching_symbol[0]
+        return candidates[0] if len(candidates) == 1 else None
+
+    def _on_error(
+        self,
+        reqId: int,
+        code: int,
+        msg: str,
+        contract: Contract | None,
+    ) -> None:
+        """Capture broker errors that can be attributed to supervised orders."""
+        trade = self._trade_for_error_req_id(reqId)
+        matched = trade is not None
+        candidates: list[Trade] = []
+        if trade is None:
+            candidates = self._supervised_error_candidates()
+            if reqId > 0:
+                trade = next(
+                    (
+                        candidate
+                        for candidate in candidates
+                        if getattr(getattr(candidate, "order", None), "orderId", None)
+                        == reqId
+                    ),
+                    None,
+                )
+                if trade is None:
+                    return
+            elif candidates and code not in ROUTINE_UNSCOPED_ERROR_CODES:
+                trade = self._candidate_for_unscoped_error(candidates, contract)
+            else:
+                return
+            if trade is None and not candidates:
+                return
+
+        symbol = getattr(getattr(trade, "contract", None), "symbol", None)
+        order = getattr(trade, "order", None)
+        order_id = getattr(order, "orderId", None)
+        action = getattr(order, "action", None)
+        if trade is not None and order_id is not None:
+            self.__order_errors[int(order_id)] = (int(code), str(msg))
+
+        if matched:
+            log.warning(f"{symbol}: Broker error {code}: {msg}")
+        else:
+            prefix = f"{symbol}: " if symbol else ""
+            log.warning(
+                f"{prefix}Unmatched broker error reqId={reqId}, code={code}: {msg}"
+            )
+        if self.data_store:
+            payload: dict[str, Any] = {
+                "symbol": symbol,
+                "order_id": order_id,
+                "action": action,
+                "code": int(code),
+                "message": str(msg),
+            }
+            if not matched:
+                payload.update(
+                    {
+                        "request_id": reqId,
+                        "matched": False,
+                        "candidate_order_ids": [
+                            getattr(getattr(candidate, "order", None), "orderId", None)
+                            for candidate in candidates
+                        ],
+                    }
+                )
+            self.data_store.record_event("order_error", payload, symbol=symbol)
+
+    def _trade_for_error_req_id(self, reqId: int) -> Trade | None:
+        """Find this session's trade for an order-bound error reqId.
+
+        Mirrors ib_async's own lookup in wrapper.error(): the
+        (clientId, reqId) key only matches orders this API client placed, so
+        a request id from this client's counter can never be attributed to an
+        imported order from another client whose orderId happens to collide
+        with it (ib.trades() includes those imported orders).
+        """
+        if not isinstance(reqId, int) or reqId <= 0:
+            # -1 marks non-order errors.
+            return None
+        return self.ib.wrapper.trades.get((self.ib.wrapper.clientId, reqId))
+
+    def order_error(self, order_id: int | None) -> tuple[int, str] | None:
+        """Return the most recent broker error (code, message) for an order id."""
+        if order_id is None:
+            return None
+        try:
+            return self.__order_errors.get(int(order_id))
+        except (TypeError, ValueError):
+            return None
 
     async def __market_data_streaming_handler__(
         self,
@@ -255,10 +585,55 @@ class IBKR:
         Returns:
             Ticker: The market data ticker for the given contract.
         """
-        await self.ib.qualifyContractsAsync(contract)
-        ticker = self.ib.reqMktData(contract, genericTickList=generic_tick_list)
-        await handler(ticker)
-        return ticker
+        if not contract.conId:
+            qualified = await self.qualify_contracts(contract)
+            if qualified:
+                contract = qualified[0]
+        if not contract.conId:
+            raise ValueError(
+                f"Contract {contract} can't be qualified because no 'conId' value exists."
+            )
+
+        def active_ticker() -> Ticker | None:
+            ticker = self.ib.ticker(contract)
+            if ticker is None:
+                return None
+
+            request_id = self.ib.wrapper.ticker2ReqId.get("mktData", {}).get(ticker)
+            return ticker if request_id is not None else None
+
+        # Serialize same-contract access so a helper-owned stream cannot be reused
+        # by another caller and then canceled while that caller is still handling it.
+        contract_lock = self.__market_data_contract_locks.setdefault(
+            contract.conId,
+            asyncio.Lock(),
+        )
+        async with contract_lock:
+            # Reuse a subscription owned elsewhere without canceling it. ib_async
+            # keeps canceled tickers in its cache, so the request-id mapping is the
+            # source of truth for whether a cached ticker still has an active stream.
+            ticker = active_ticker()
+            if ticker is not None:
+                await handler(ticker)
+                return ticker
+
+            async with self.__market_data_semaphore:
+                # Another contract may have freed stream capacity while this task
+                # waited. Recheck in case an external owner subscribed meanwhile.
+                ticker = active_ticker()
+                if ticker is not None:
+                    await handler(ticker)
+                    return ticker
+
+                ticker = self.ib.reqMktData(
+                    contract,
+                    genericTickList=generic_tick_list,
+                )
+                try:
+                    await handler(ticker)
+                    return ticker
+                finally:
+                    self.ib.cancelMktData(contract)
 
     async def __ticker_wait_for_condition__(
         self, ticker: Ticker, condition: Callable[[Ticker], bool], timeout: float
@@ -269,23 +644,27 @@ class IBKR:
             if condition(ticker):
                 event.set()
 
-        ticker.updateEvent += onTicker  # type: ignore
+        update_event = ticker.updateEvent
+        if update_event is None:
+            raise RuntimeError("Ticker update event is unavailable")
+        update_event += onTicker
         try:
             await asyncio.wait_for(event.wait(), timeout=timeout)
             return True
-        except asyncio.TimeoutError:
+        except TimeoutError:
             return False
         finally:
-            ticker.updateEvent -= onTicker
+            update_event -= onTicker
 
     async def wait_for_submitting_orders(
-        self, trades: List[Trade], timetout: int = 60
+        self, trades: list[Trade], timetout: int = 60
     ) -> None:
-        tasks = [
+        tasks: list[Coroutine[Any, Any, bool]] = [
             self.__trade_wait_for_condition__(
                 trade,
-                lambda trade: trade.orderStatus.status
-                not in ["PendingSubmit", "PreSubmitted"],
+                lambda trade: (
+                    trade.orderStatus.status not in ["PendingSubmit", "PreSubmitted"]
+                ),
                 timetout,
             )
             for trade in trades
@@ -302,9 +681,9 @@ class IBKR:
             )
 
     async def wait_for_orders_complete(
-        self, trades: List[Trade], timetout: int = 60
-    ) -> None:
-        tasks = [
+        self, trades: list[Trade], timetout: float = 60
+    ) -> list[Trade]:
+        tasks: list[Coroutine[Any, Any, bool]] = [
             self.__trade_wait_for_condition__(
                 trade,
                 lambda trade: trade.isDone(),
@@ -317,13 +696,27 @@ class IBKR:
         )
         if not all(results):
             incomplete_trades = [
-                f"{trade.contract.symbol} (OrderId: {trade.order.orderId})"
-                for i, trade in enumerate(trades)
-                if not results[i]
+                trade for i, trade in enumerate(trades) if not results[i]
             ]
-            log.warning(
-                f"Timeout waiting for orders to complete: {', '.join(incomplete_trades)}"
+            incomplete_order_status = ", ".join(
+                self._trade_progress_snapshot(trade) for trade in incomplete_trades
             )
+            log.info(
+                "Timeout waiting for orders to complete; "
+                f"orders still working at broker: {incomplete_order_status}"
+            )
+            return incomplete_trades
+
+        return []
+
+    @staticmethod
+    def _trade_progress_snapshot(trade: Trade) -> str:
+        return (
+            f"{trade.contract.symbol} (OrderId: {trade.order.orderId}, "
+            f"status={getattr(trade.orderStatus, 'status', 'UNKNOWN')}, "
+            f"filled={getattr(trade.orderStatus, 'filled', '?')}, "
+            f"remaining={getattr(trade.orderStatus, 'remaining', '?')})"
+        )
 
     async def __trade_wait_for_condition__(
         self, trade: Trade, condition: Callable[[Trade], bool], timeout: float
@@ -343,7 +736,7 @@ class IBKR:
         try:
             await asyncio.wait_for(event.wait(), timeout=timeout)
             return True
-        except asyncio.TimeoutError:
+        except TimeoutError:
             return False
         finally:
             trade.statusEvent -= onStatusEvent
@@ -355,6 +748,10 @@ class IBKR:
             return self.__wait_for_midpoint_price__
         if ticker_field == TickerField.MARKET_PRICE:
             return self.__wait_for_market_price__
+        if ticker_field == TickerField.BID:
+            return self.__wait_for_bid__
+        if ticker_field == TickerField.ASK:
+            return self.__wait_for_ask__
         if ticker_field == TickerField.GREEKS:
             return self.__wait_for_greeks__
         if ticker_field == TickerField.OPEN_INTEREST:

@@ -1,47 +1,91 @@
+import asyncio
+import copy
 import logging
 import math
 import random
-import sys
 from asyncio import Future
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from collections import Counter
+from collections.abc import Coroutine
+from datetime import datetime
+from typing import Any, cast
 
 import numpy as np
 from ib_async import (
     AccountValue,
     PortfolioItem,
-    TagValue,
     Ticker,
     util,
 )
-from ib_async.contract import ComboLeg, Contract, Index, Option, Stock
+from ib_async.contract import Contract, Option, Stock
 from ib_async.ib import IB
 from ib_async.order import LimitOrder
-from rich.console import Group
 from rich.panel import Panel
 from rich.table import Table
 
 from thetagang import log
-from thetagang.config import Config
+from thetagang.accounting import (
+    AccountMetric,
+    AccountSummary,
+    BrokerAccountSnapshot,
+    CapitalBaseKind,
+    PortfolioAccounting,
+)
+from thetagang.config import (
+    CANONICAL_STAGE_ORDER,
+    DEFAULT_RUN_STRATEGIES,
+    Config,
+    RunConfig,
+    enabled_stage_ids_from_run,
+    stage_enabled_map_from_run,
+)
+from thetagang.db import DataStore
+from thetagang.external_decisions import ExternalDecisionProviders
 from thetagang.fmt import dfmt, ffmt, ifmt, pfmt
-from thetagang.ibkr import IBKR, RequiredFieldValidationError, TickerField
+from thetagang.ibkr import IBKR
+from thetagang.order_execution import OrderExecutionManager
 from thetagang.orders import Orders
+from thetagang.strategies import (
+    EquityStrategyDeps,
+    OptionsStrategyDeps,
+    PostStrategyDeps,
+    run_equity_rebalance_stages,
+    run_option_management_stages,
+    run_option_write_stages,
+    run_post_stages,
+)
+from thetagang.strategies.equity import EquityRebalanceService, RegimeRebalanceService
+from thetagang.strategies.equity_engine import EquityRebalanceEngine
+from thetagang.strategies.options import OptionsManageService, OptionsWriteService
+from thetagang.strategies.options_engine import OptionsStrategyEngine
+from thetagang.strategies.post_engine import PostStrategyEngine
+from thetagang.strategies.regime_engine import (
+    ABSOLUTE_TREND_STATE_EVENT,
+    RegimeRebalanceEngine,
+)
+from thetagang.strategies.runtime_services import (
+    EquityRuntimeServiceAdapter,
+    OptionsRuntimeServiceAdapter,
+)
+from thetagang.strategies.tail_hedge_state import (
+    TAIL_HEDGE_CLOSE_ORDER_REF,
+    TAIL_HEDGE_ENTRY_ORDER_REF,
+    TAIL_HEDGE_HARVEST_ORDER_REF_PREFIX,
+    TailHedgeStateStore,
+    is_tail_order_ref,
+    is_tail_reduction_ref,
+)
+from thetagang.target_weight_policy import TARGET_WEIGHT_POLICY_STATE_EVENT
 from thetagang.trades import Trades
+from thetagang.trading_operations import (
+    OptionChainScanner,
+    OrderOperations,
+)
 from thetagang.util import (
     account_summary_to_dict,
-    calculate_net_short_positions,
-    count_long_option_positions,
-    count_short_option_positions,
-    get_higher_price,
-    get_lower_price,
-    get_short_positions,
-    get_target_calls,
     midpoint_or_market_price,
-    net_option_positions,
     portfolio_positions_to_dict,
     position_pnl,
-    weighted_avg_long_strike,
-    weighted_avg_short_strike,
-    would_increase_spread,
+    working_stock_order_symbols,
 )
 
 from .options import option_dte
@@ -50,11 +94,13 @@ from .options import option_dte
 logging.getLogger("ib_async.ib").setLevel(logging.ERROR)
 logging.getLogger("ib_async.wrapper").setLevel(logging.CRITICAL)
 
-
-class NoValidContractsError(Exception):
-    def __init__(self, message: str) -> None:
-        self.message = message
-        super().__init__(self.message)
+TAIL_HARVEST_FILL_TIMEOUT_SECONDS = 5 * 60
+REGIME_PLANNING_STATE_EVENTS = {
+    ABSOLUTE_TREND_STATE_EVENT,
+    TARGET_WEIGHT_POLICY_STATE_EVENT,
+    "regime_rebalance_state",
+    "volatility_weight_state",
+}
 
 
 class PortfolioManager:
@@ -72,343 +118,418 @@ class PortfolioManager:
         ib: IB,
         completion_future: Future[bool],
         dry_run: bool,
+        data_store: DataStore | None = None,
+        run_stage_flags: dict[str, bool] | None = None,
+        run_stage_order: list[str] | None = None,
     ) -> None:
-        self.account_number = config.account.number
+        self.account_number = config.runtime.account.number
         self.config = config
+        self.data_store = data_store
+        external_decision_config = getattr(
+            self.config.runtime, "external_decisions", None
+        )
+        self.external_decisions = ExternalDecisionProviders(
+            getattr(external_decision_config, "providers", {})
+        )
         self.ibkr = IBKR(
             ib,
-            config.ib_async.api_response_wait_time,
-            config.orders.exchange,
+            config.runtime.ib_async.api_response_wait_time,
+            config.runtime.orders.exchange,
+            data_store=data_store,
+            dry_run=dry_run,
         )
         self.completion_future = completion_future
         self.has_excess_calls: set[str] = set()
         self.has_excess_puts: set[str] = set()
         self.orders: Orders = Orders()
-        self.trades: Trades = Trades(self.ibkr)
-        self.target_quantities: Dict[str, int] = {}
-        self.qualified_contracts: Dict[int, Contract] = {}
+        self.trades: Trades = Trades(self.ibkr, data_store=data_store)
+        self.execution_manager = OrderExecutionManager(
+            config=self.config,
+            ibkr=self.ibkr,
+            data_store=self.data_store,
+        )
+        self.target_quantities: dict[str, int] = {}
+        self.qualified_contracts: dict[int, Contract] = {}
         self.dry_run = dry_run
+        self.last_untracked_positions: dict[str, list[PortfolioItem]] = {}
+        self._reserved_cash_for_post_management = 0.0
+        self.order_ops = OrderOperations(
+            config=self.config,
+            account_number=self.account_number,
+            orders=self.orders,
+            data_store=self.data_store,
+        )
+        self.options_runtime_services = OptionsRuntimeServiceAdapter(
+            get_symbols_fn=lambda: self.get_symbols(),
+            get_primary_exchange_fn=lambda symbol: self.get_primary_exchange(symbol),
+            get_buying_power_fn=lambda account_summary: self.get_buying_power(
+                account_summary
+            ),
+            get_maximum_new_contracts_for_fn=(
+                lambda symbol, primary_exchange, account_summary: (
+                    self.get_maximum_new_contracts_for(
+                        symbol, primary_exchange, account_summary
+                    )
+                )
+            ),
+            get_write_threshold_fn=lambda ticker, right: self.get_write_threshold(
+                ticker, right
+            ),
+            get_close_price_fn=lambda ticker: self.get_close_price(ticker),
+        )
+        self.equity_runtime_services = EquityRuntimeServiceAdapter(
+            get_primary_exchange_fn=lambda symbol: self.get_primary_exchange(symbol),
+            get_buying_power_fn=lambda account_summary: self.get_buying_power(
+                account_summary
+            ),
+            midpoint_or_market_price_fn=lambda ticker: self.midpoint_or_market_price(
+                ticker
+            ),
+        )
+        self.option_scanner = OptionChainScanner(
+            config=self.config, ibkr=self.ibkr, order_ops=self.order_ops
+        )
+        self.options_engine = OptionsStrategyEngine(
+            config=self.config,
+            ibkr=self.ibkr,
+            option_scanner=self.option_scanner,
+            order_ops=self.order_ops,
+            services=self.options_runtime_services,
+            target_quantities=self.target_quantities,
+            has_excess_puts=self.has_excess_puts,
+            has_excess_calls=self.has_excess_calls,
+            qualified_contracts=self.qualified_contracts,
+            data_store=self.data_store,
+        )
+        self.regime_engine = RegimeRebalanceEngine(
+            config=self.config,
+            ibkr=self.ibkr,
+            order_ops=self.order_ops,
+            data_store=self.data_store,
+            external_decisions=self.external_decisions,
+            dry_run=self.dry_run,
+            get_primary_exchange=self.get_primary_exchange,
+            now_provider=lambda: datetime.now(),  # noqa: DTZ005
+            tail_hedge_stage_enabled=lambda: self.stage_enabled("post_tail_hedge"),
+            set_reserved_cash_for_post_management=(
+                self.set_reserved_cash_for_post_management
+            ),
+        )
+        self.equity_engine = EquityRebalanceEngine(
+            config=self.config,
+            ibkr=self.ibkr,
+            order_ops=self.order_ops,
+            services=self.equity_runtime_services,
+            regime_engine=self.regime_engine,
+        )
+        self.post_engine = PostStrategyEngine(
+            config=self.config,
+            ibkr=self.ibkr,
+            order_ops=self.order_ops,
+            option_scanner=self.option_scanner,
+            orders=self.orders,
+            qualified_contracts=self.qualified_contracts,
+            data_store=self.data_store,
+            get_reserved_cash_for_post_management=(
+                self.get_reserved_cash_for_post_management
+            ),
+        )
+        if run_stage_flags is None:
+            default_run = RunConfig(strategies=DEFAULT_RUN_STRATEGIES)
+            self.run_stage_flags = stage_enabled_map_from_run(default_run)
+            self.run_stage_order = enabled_stage_ids_from_run(default_run)
+        else:
+            self.run_stage_flags = dict(run_stage_flags)
+            self.run_stage_order = [
+                stage_id
+                for stage_id in CANONICAL_STAGE_ORDER
+                if self.run_stage_flags.get(stage_id, False)
+            ]
+        if run_stage_order is not None:
+            self.run_stage_order = list(run_stage_order)
+            enabled_set = set(self.run_stage_order)
+            self.run_stage_flags = {
+                stage_id: (stage_id in enabled_set)
+                for stage_id in CANONICAL_STAGE_ORDER
+            }
 
-    def get_short_calls(
-        self, portfolio_positions: Dict[str, List[PortfolioItem]]
-    ) -> List[PortfolioItem]:
-        return self.get_short_contracts(portfolio_positions, "C")
+    def stage_enabled(self, stage_id: str) -> bool:
+        return bool(self.run_stage_flags.get(stage_id, False))
 
-    def get_short_puts(
-        self, portfolio_positions: Dict[str, List[PortfolioItem]]
-    ) -> List[PortfolioItem]:
-        return self.get_short_contracts(portfolio_positions, "P")
+    def _options_strategy_deps(self, enabled_stages: set[str]) -> OptionsStrategyDeps:
+        return OptionsStrategyDeps(
+            enabled_stages=enabled_stages,
+            write_service=cast(OptionsWriteService, self.options_engine),
+            manage_service=cast(OptionsManageService, self.options_engine),
+        )
 
-    def get_short_contracts(
-        self, portfolio_positions: Dict[str, List[PortfolioItem]], right: str
-    ) -> List[PortfolioItem]:
-        ret: List[PortfolioItem] = []
-        for symbol in portfolio_positions:
-            ret = ret + get_short_positions(portfolio_positions[symbol], right)
-        return ret
+    def _equity_strategy_deps(self, enabled_stages: set[str]) -> EquityStrategyDeps:
+        return EquityStrategyDeps(
+            enabled_stages=enabled_stages,
+            regime_rebalance_enabled=bool(
+                self.config.strategies.regime_rebalance.enabled
+            ),
+            regime_service=cast(RegimeRebalanceService, self.equity_engine),
+            rebalance_service=cast(EquityRebalanceService, self.equity_engine),
+        )
+
+    def _post_strategy_deps(self, enabled_stages: set[str]) -> PostStrategyDeps:
+        return PostStrategyDeps(
+            enabled_stages=enabled_stages,
+            service=self.post_engine,
+        )
+
+    def set_reserved_cash_for_post_management(self, amount: float) -> None:
+        self._reserved_cash_for_post_management = max(0.0, amount)
+
+    def get_reserved_cash_for_post_management(self) -> float:
+        return self._reserved_cash_for_post_management
 
     async def put_is_itm(self, contract: Contract) -> bool:
-        ticker = await self.ibkr.get_ticker_for_stock(
-            contract.symbol, contract.primaryExchange
-        )
-        return contract.strike >= ticker.marketPrice()
-
-    def position_can_be_closed(self, position: PortfolioItem, table: Table) -> bool:
-        if not self.config.trading_is_allowed(position.contract.symbol):
-            return False
-
-        close_at_pnl = self.config.roll_when.close_at_pnl
-        if close_at_pnl:
-            pnl = position_pnl(position)
-
-            if pnl > close_at_pnl:
-                table.add_row(
-                    f"{position.contract.localSymbol}",
-                    "[deep_sky_blue1]Close",
-                    f"[deep_sky_blue1]Will be closed because P&L of {pfmt(pnl, 1)} is > {pfmt(close_at_pnl, 1)}",
-                )
-                return True
-
-        return False
-
-    def put_can_be_closed(self, put: PortfolioItem, table: Table) -> bool:
-        return self.position_can_be_closed(put, table)
-
-    async def put_can_be_rolled(self, put: PortfolioItem, table: Table) -> bool:
-        # Ignore long positions, we only roll shorts
-        if put.position > 0:
-            return False
-
-        if not self.config.trading_is_allowed(put.contract.symbol):
-            return False
-
-        try:
-            itm = await self.put_is_itm(put.contract)
-        except RequiredFieldValidationError:
-            log.error(
-                f"Checking rollable puts failed for #{put.contract.symbol}. Continuing anyway..."
-            )
-            return False
-
-        if (
-            isinstance(put.contract, Option)
-            and itm
-            and self.config.roll_when.puts.always_when_itm
-        ):
-            table.add_row(
-                f"{put.contract.localSymbol}",
-                "[blue]Roll",
-                f"[blue]Will be rolled because put is ITM "
-                f"and always_when_itm={self.config.roll_when.puts.always_when_itm}",
-            )
-            return True
-
-        # Check if this put is ITM, and if it's o.k. to roll
-        if (
-            not self.config.roll_when.puts.itm
-            and isinstance(put.contract, Option)
-            and itm
-        ):
-            return False
-
-        # Don't roll if there are excess puts and we're configured not to roll
-        if (
-            put.contract.symbol in self.has_excess_puts
-            and not self.config.roll_when.puts.has_excess
-        ):
-            table.add_row(
-                f"{put.contract.localSymbol}",
-                "[cyan1]None",
-                "[cyan1]Won't be rolled because there are excess puts",
-            )
-            return False
-
-        dte = option_dte(put.contract.lastTradeDateOrContractMonth)
-        pnl = position_pnl(put)
-
-        roll_when_dte = self.config.roll_when.dte
-        roll_when_pnl = self.config.roll_when.pnl
-        roll_when_min_pnl = self.config.roll_when.min_pnl
-
-        if self.config.roll_when.max_dte and dte > self.config.roll_when.max_dte:
-            return False
-
-        if dte <= roll_when_dte:
-            if pnl >= roll_when_min_pnl:
-                table.add_row(
-                    f"{put.contract.localSymbol}",
-                    "[blue]Roll",
-                    f"[blue]Can be rolled because DTE of {dte} is <= {self.config.roll_when.dte} and P&L of {pfmt(pnl, 1)} is >= {pfmt(roll_when_min_pnl, 1)}",
-                )
-                return True
-            table.add_row(
-                f"{put.contract.localSymbol}",
-                "[cyan1]None",
-                f"[cyan1]Can't be rolled because P&L of {pfmt(pnl, 1)} is < {pfmt(roll_when_min_pnl, 1)}",
-            )
-
-        if pnl >= roll_when_pnl:
-            if self.config.roll_when.max_dte is not None:
-                table.add_row(
-                    f"{put.contract.localSymbol}",
-                    "[blue]Roll",
-                    f"[blue]Can be rolled because DTE of {dte} is <= {self.config.roll_when.max_dte} and P&L of {pfmt(pnl, 1)} is >= {pfmt(roll_when_pnl, 1)}",
-                )
-            else:
-                table.add_row(
-                    f"{put.contract.localSymbol}",
-                    "[blue]Roll",
-                    f"[blue]Can be rolled because P&L of {pfmt(pnl, 1)} is >= {pfmt(roll_when_pnl, 1)}",
-                )
-            return True
-
-        return False
+        return await self.options_engine.put_is_itm(contract)
 
     async def call_is_itm(self, contract: Contract) -> bool:
-        # Special case for handling VIX
-        if contract.symbol == "VIX":
-            vix_contract = Index("VIX", "CBOE", "USD")
-            ticker = await self.ibkr.get_ticker_for_contract(vix_contract)
-        else:
-            ticker = await self.ibkr.get_ticker_for_stock(
-                contract.symbol, contract.primaryExchange
-            )
-        return contract.strike <= ticker.marketPrice()
+        return await self.options_engine.call_is_itm(contract)
 
-    def call_can_be_closed(self, call: PortfolioItem, table: Table) -> bool:
-        return self.position_can_be_closed(call, table)
+    def get_symbols(self) -> list[str]:
+        return list(self.config.portfolio.symbols.keys())
 
-    async def call_can_be_rolled(self, call: PortfolioItem, table: Table) -> bool:
-        # Ignore long positions, we only roll shorts
-        if call.position > 0:
-            return False
-
-        if not self.config.trading_is_allowed(call.contract.symbol):
-            return False
-
-        if (
-            isinstance(call.contract, Option)
-            and await self.call_is_itm(call.contract)
-            and self.config.roll_when.calls.always_when_itm
-        ):
-            table.add_row(
-                f"{call.contract.localSymbol}",
-                "[blue]Roll",
-                f"[blue]Will be rolled because call is ITM "
-                f"and always_when_itm={self.config.roll_when.calls.always_when_itm}",
-            )
-            return True
-
-        # Check if this call is ITM, and it's o.k. to roll
-        if (
-            not self.config.roll_when.calls.itm
-            and isinstance(call.contract, Option)
-            and await self.call_is_itm(call.contract)
-        ):
-            return False
-
-        # Don't roll if there are excess CCs and we're configured not to roll
-        if (
-            call.contract.symbol in self.has_excess_calls
-            and not self.config.roll_when.calls.has_excess
-        ):
-            table.add_row(
-                f"{call.contract.localSymbol}",
-                "[cyan1]None",
-                f"[cyan1]Won't be rolled because there are excess calls for {call.contract.symbol}",
-            )
-            return False
-
-        dte = option_dte(call.contract.lastTradeDateOrContractMonth)
-        pnl = position_pnl(call)
-
-        roll_when_dte = self.config.roll_when.dte
-        roll_when_pnl = self.config.roll_when.pnl
-        roll_when_min_pnl = self.config.roll_when.min_pnl
-
-        if self.config.roll_when.max_dte and dte > self.config.roll_when.max_dte:
-            return False
-
-        if dte <= roll_when_dte:
-            if pnl >= roll_when_min_pnl:
-                table.add_row(
-                    f"{call.contract.localSymbol}",
-                    "[blue]Roll",
-                    f"[blue]Can be rolled because DTE of {dte} is <= {self.config.roll_when.dte}"
-                    f" and P&L of {pfmt(pnl, 1)} is >= {pfmt(roll_when_min_pnl, 1)}",
-                )
-                return True
-            table.add_row(
-                f"{call.contract.localSymbol}",
-                "[cyan1]None",
-                f"[cyan1]Can't be rolled because P&L of {pfmt(pnl, 1)} is < {pfmt(roll_when_min_pnl, 1)}",
-            )
-
-        if pnl >= roll_when_pnl:
-            if self.config.roll_when.max_dte:
-                table.add_row(
-                    f"{call.contract.localSymbol}",
-                    "[blue]Roll",
-                    f"[blue]Can be rolled because DTE of {dte} is <= {self.config.roll_when.max_dte}"
-                    f" and P&L of {pfmt(pnl, 1)} is >= {pfmt(roll_when_pnl, 1)}",
-                )
-            else:
-                table.add_row(
-                    f"{call.contract.localSymbol}",
-                    "[blue]Roll",
-                    f"[blue]Can be rolled because P&L of {pfmt(pnl, 1)} is >= {pfmt(roll_when_pnl, 1)}",
-                )
-            return True
-
-        return False
-
-    def get_symbols(self) -> List[str]:
-        return list(self.config.symbols.keys())
-
-    def filter_positions(
-        self, portfolio_positions: List[PortfolioItem]
-    ) -> List[PortfolioItem]:
+    def partition_positions(
+        self, portfolio_positions: list[PortfolioItem]
+    ) -> tuple[list[PortfolioItem], list[PortfolioItem]]:
         symbols = self.get_symbols()
-        return [
-            item
-            for item in portfolio_positions
-            if item.account == self.account_number
-            and (
+        tracked_positions: list[PortfolioItem] = []
+        untracked_positions: list[PortfolioItem] = []
+        for item in portfolio_positions:
+            if item.account != self.account_number or item.position == 0:
+                continue
+            if (
                 item.contract.symbol in symbols
                 or item.contract.symbol == "VIX"
-                or item.contract.symbol == self.config.cash_management.cash_fund
-            )
-            and item.position != 0
-            and item.averageCost != 0
-        ]
+                or item.contract.symbol
+                == self.config.strategies.cash_management.cash_fund
+            ):
+                tracked_positions.append(item)
+            else:
+                untracked_positions.append(item)
+        return (tracked_positions, untracked_positions)
 
-    def get_portfolio_positions(self) -> Dict[str, List[PortfolioItem]]:
+    @staticmethod
+    def combine_position_maps(
+        *position_maps: dict[str, list[PortfolioItem]],
+    ) -> dict[str, list[PortfolioItem]]:
+        combined: dict[str, list[PortfolioItem]] = {}
+        for position_map in position_maps:
+            for symbol, positions in position_map.items():
+                combined.setdefault(symbol, []).extend(positions)
+        return combined
+
+    def _tail_hedge_owned_con_ids_for_snapshot(self) -> set[int]:
+        if self.data_store is None:
+            return set()
+        ownership_required = bool(
+            self.stage_enabled("post_tail_hedge")
+            and self.config.strategies.tail_hedge.enabled
+        )
+        try:
+            return (
+                TailHedgeStateStore(
+                    self.data_store,
+                    self.account_number,
+                )
+                .load(raise_on_error=ownership_required)
+                .owned_con_ids
+            )
+        except RuntimeError:
+            if ownership_required:
+                raise
+            return set()
+
+    def get_portfolio_positions(self) -> dict[str, list[PortfolioItem]]:
+        """Materialize the account's current ib_async portfolio cache."""
         portfolio_positions = self.ibkr.portfolio(account=self.account_number)
-        return portfolio_positions_to_dict(self.filter_positions(portfolio_positions))
+        filtered_positions, untracked_positions = self.partition_positions(
+            portfolio_positions
+        )
+        self.last_untracked_positions = portfolio_positions_to_dict(untracked_positions)
+        return portfolio_positions_to_dict(filtered_positions)
+
+    async def load_initial_portfolio_positions(
+        self,
+    ) -> dict[str, list[PortfolioItem]]:
+        """Validate the synchronized startup caches before trading."""
+        attempts = 3
+        symbols = set(self.get_symbols())
+        tail_hedge_con_ids = self._tail_hedge_owned_con_ids_for_snapshot()
+
+        for attempt in range(1, attempts + 1):
+            portfolio_by_symbol = self.get_portfolio_positions()
+            all_portfolio_positions = self.combine_position_maps(
+                portfolio_by_symbol,
+                self.last_untracked_positions,
+            )
+            portfolio_conids = {
+                item.contract.conId
+                for positions in all_portfolio_positions.values()
+                for item in positions
+            }
+            protected_positions = [
+                pos
+                for pos in self.ibkr.positions(self.account_number)
+                if pos.account == self.account_number
+                and (
+                    pos.contract.symbol in symbols
+                    or pos.contract.symbol == "VIX"
+                    or pos.contract.symbol
+                    == self.config.strategies.cash_management.cash_fund
+                    or pos.contract.conId in tail_hedge_con_ids
+                )
+                and pos.position != 0
+            ]
+            missing_positions = [
+                pos
+                for pos in protected_positions
+                if pos.contract.conId not in portfolio_conids
+            ]
+
+            if not missing_positions:
+                return portfolio_by_symbol
+
+            missing_symbols = ", ".join(
+                sorted({pos.contract.symbol for pos in missing_positions})
+            )
+            log.warning(
+                f"Attempt {attempt}/{attempts}: Portfolio snapshot is missing "
+                f"{len(missing_positions)} of {len(protected_positions)} tracked "
+                f"or tail-hedge-owned positions (symbols: {missing_symbols}). "
+                "Waiting briefly before retrying..."
+            )
+            await asyncio.sleep(1)
+
+        raise RuntimeError(
+            "Failed to load IBKR portfolio positions after multiple attempts. "
+            "Aborting run to avoid trading on incomplete data."
+        )
+
+    def _is_startup_cancel_candidate(self, trade: Any) -> bool:
+        order = getattr(trade, "order", None)
+        contract = getattr(trade, "contract", None)
+        symbol = getattr(contract, "symbol", None)
+        return bool(
+            order is not None
+            and contract is not None
+            and not trade.isDone()
+            and getattr(order, "account", "") == self.account_number
+            and (
+                symbol in self.get_symbols()
+                or (self.config.strategies.vix_call_hedge.enabled and symbol == "VIX")
+                or (
+                    self.config.strategies.cash_management.enabled
+                    and symbol == self.config.strategies.cash_management.cash_fund
+                )
+            )
+        )
 
     def initialize_account(self) -> None:
-        self.ibkr.set_market_data_type(self.config.account.market_data_type)
+        self.ibkr.set_market_data_type(self.config.runtime.account.market_data_type)
 
-        if self.config.account.cancel_orders:
-            # Cancel any existing orders
-            open_trades = self.ibkr.open_trades()
-            for trade in open_trades:
-                if not trade.isDone() and (
-                    trade.contract.symbol in self.get_symbols()
-                    or (
-                        self.config.vix_call_hedge.enabled
-                        and trade.contract.symbol == "VIX"
-                    )
-                    or (
-                        self.config.cash_management.enabled
-                        and trade.contract.symbol
-                        == self.config.cash_management.cash_fund
-                    )
-                ):
-                    log.warning(
-                        f"{trade.contract.symbol}: Canceling order {trade.order}"
-                    )
-                    self.ibkr.cancel_order(trade.order)
+        open_trades = self.ibkr.open_trades()
+        for trade in open_trades:
+            order = getattr(trade, "order", None)
+            if (
+                order is None
+                or trade.isDone()
+                or getattr(order, "account", None) != self.account_number
+                or getattr(order, "orderRef", None) != TAIL_HEDGE_ENTRY_ORDER_REF
+            ):
+                continue
+            if self.dry_run:
+                log.warning(
+                    f"{trade.contract.symbol}: Dry run, would cancel stale tail entry "
+                    f"{order}"
+                )
+            else:
+                log.warning(
+                    f"{trade.contract.symbol}: Canceling stale tail entry {order}"
+                )
+                self.ibkr.cancel_order(order)
+
+        if not self.config.runtime.account.cancel_orders:
+            return
+
+        for trade in open_trades:
+            if not self._is_startup_cancel_candidate(trade):
+                continue
+            order_ref = getattr(trade.order, "orderRef", None)
+            if order_ref == TAIL_HEDGE_ENTRY_ORDER_REF:
+                continue
+            if is_tail_order_ref(order_ref):
+                log.info(
+                    f"{trade.contract.symbol}: Preserving tail order {trade.order}"
+                )
+                continue
+            if self.dry_run:
+                log.warning(
+                    f"{trade.contract.symbol}: Dry run, would cancel order "
+                    f"{trade.order}"
+                )
+                continue
+            log.warning(f"{trade.contract.symbol}: Canceling order {trade.order}")
+            self.ibkr.cancel_order(trade.order)
 
     async def summarize_account(
         self,
-    ) -> Tuple[
-        Dict[str, AccountValue],
-        Dict[str, List[PortfolioItem]],
+    ) -> tuple[
+        AccountSummary,
+        dict[str, list[PortfolioItem]],
     ]:
         account_summary = await self.ibkr.account_summary(self.account_number)
         account_summary = account_summary_to_dict(account_summary)
 
-        if "NetLiquidation" not in account_summary:
+        if AccountMetric.NET_LIQUIDATION.value not in account_summary:
             raise RuntimeError(
-                f"Account number {self.config.account.number} appears invalid (no account data returned)"
+                f"Account number {self.config.runtime.account.number} appears invalid (no account data returned)"
             )
+
+        account = BrokerAccountSnapshot(account_summary)
 
         table = Table(title="Account summary")
         table.add_column("Item")
         table.add_column("Value", justify="right")
+        table.add_row("Net liquidation", dfmt(account.net_liquidation, 0))
         table.add_row(
-            "Net liquidation", dfmt(account_summary["NetLiquidation"].value, 0)
+            "Excess liquidity", dfmt(account.value(AccountMetric.EXCESS_LIQUIDITY), 0)
         )
         table.add_row(
-            "Excess liquidity", dfmt(account_summary["ExcessLiquidity"].value, 0)
+            "Initial margin", dfmt(account.value(AccountMetric.INITIAL_MARGIN), 0)
         )
-        table.add_row("Initial margin", dfmt(account_summary["InitMarginReq"].value, 0))
         table.add_row(
-            "Maintenance margin", dfmt(account_summary["FullMaintMarginReq"].value, 0)
+            "Maintenance margin",
+            dfmt(account.value(AccountMetric.MAINTENANCE_MARGIN), 0),
         )
-        table.add_row("Buying power", dfmt(account_summary["BuyingPower"].value, 0))
-        table.add_row("Total cash", dfmt(account_summary["TotalCashValue"].value, 0))
-        table.add_row("Cushion", pfmt(account_summary["Cushion"].value, 0))
+        table.add_row(
+            "Buying power", dfmt(account.value(AccountMetric.BROKER_BUYING_POWER), 0)
+        )
+        table.add_row("Total cash", dfmt(account.total_cash, 0))
+        table.add_row("Cushion", pfmt(account.value(AccountMetric.CUSHION), 0))
         table.add_section()
         table.add_row(
             "Target buying power usage", dfmt(self.get_buying_power(account_summary), 0)
         )
         log.print(Panel(table))
 
-        portfolio_positions = self.get_portfolio_positions()
+        portfolio_positions = await self.load_initial_portfolio_positions()
+        untracked_positions = self.last_untracked_positions
+        if self.data_store:
+            self.data_store.record_account_snapshot(account_summary)
+            self.data_store.record_positions_snapshot(
+                self.combine_position_maps(
+                    portfolio_positions,
+                    untracked_positions,
+                )
+            )
 
-        position_values: Dict[int, Dict[str, str]] = {}
+        position_values: dict[int, dict[str, str]] = {}
 
         async def is_itm(pos: PortfolioItem) -> str:
             if isinstance(pos.contract, Option):
@@ -423,12 +544,13 @@ class PortfolioManager:
             return ""
 
         async def load_position_task(pos: PortfolioItem) -> None:
+            qty = pos.position
+            if isinstance(qty, float):
+                qty_display = ifmt(int(qty)) if qty.is_integer() else ffmt(qty, 4)
+            else:
+                qty_display = ifmt(int(qty))
             position_values[pos.contract.conId] = {
-                "qty": (
-                    ifmt(int(pos.position))
-                    if pos.position.is_integer()
-                    else ffmt(pos.position, 4)
-                ),
+                "qty": qty_display,
                 "mktprice": dfmt(pos.marketPrice),
                 "avgprice": dfmt(pos.averageCost),
                 "value": dfmt(pos.marketValue, 0),
@@ -451,11 +573,13 @@ class PortfolioManager:
                     pos.contract.lastTradeDateOrContractMonth
                 )
 
-        tasks = [
-            load_position_task(position)
-            for _, positions in portfolio_positions.items()
-            for position in positions
-        ]
+        tasks: list[Coroutine[Any, Any, None]] = []
+        for positions in portfolio_positions.values():
+            for position in positions:
+                tasks.append(load_position_task(position))
+        for positions in untracked_positions.values():
+            for position in positions:
+                tasks.append(load_position_task(position))
         await log.track_async(tasks, "Loading portfolio positions...")
 
         table = Table(
@@ -475,23 +599,20 @@ class PortfolioManager:
         table.add_column("Exp", justify="right")
         table.add_column("DTE", justify="right")
         table.add_column("ITM?")
-        first = True
-        for symbol, position in portfolio_positions.items():
-            if not first:
-                table.add_section()
-            first = False
+
+        def getval(col: str, conId: int) -> str:
+            return position_values[conId][col]
+
+        def add_symbol_positions(symbol: str, positions: list[PortfolioItem]) -> None:
             table.add_row(symbol)
             sorted_positions = sorted(
-                position,
+                positions,
                 key=lambda p: (
                     option_dte(p.contract.lastTradeDateOrContractMonth)
                     if isinstance(p.contract, Option)
                     else -1
                 ),  # Keep stonks on top
             )
-
-            def getval(col: str, conId: int) -> str:
-                return position_values[conId][col]
 
             for pos in sorted_positions:
                 conId = pos.contract.conId
@@ -524,1712 +645,784 @@ class PortfolioManager:
                         getval("itm?", conId),
                     )
 
+        first = True
+        for symbol, position in portfolio_positions.items():
+            if not first:
+                table.add_section()
+            first = False
+            add_symbol_positions(symbol, position)
+
+        if untracked_positions:
+            table.add_section()
+            table.add_row("Not tracked")
+            table.add_section()
+            first_untracked = True
+            for symbol, position in untracked_positions.items():
+                if not first_untracked:
+                    table.add_section()
+                first_untracked = False
+                add_symbol_positions(symbol, position)
+
         log.print(table)
 
         return (account_summary, portfolio_positions)
 
+    @staticmethod
+    def _is_tail_harvest_record(
+        record: tuple[Contract, LimitOrder, int | None],
+    ) -> bool:
+        order_ref = getattr(record[1], "orderRef", None)
+        return isinstance(order_ref, str) and order_ref.startswith(
+            f"{TAIL_HEDGE_HARVEST_ORDER_REF_PREFIX}:"
+        )
+
+    async def _refresh_account_state(
+        self,
+    ) -> tuple[AccountSummary, dict[str, list[PortfolioItem]]]:
+        await asyncio.wait_for(
+            self.ibkr.refresh_account(self.account_number),
+            timeout=self.config.runtime.ib_async.api_response_wait_time,
+        )
+        account_summary = account_summary_to_dict(
+            await self.ibkr.account_summary(self.account_number)
+        )
+        for tag in (
+            AccountMetric.NET_LIQUIDATION.value,
+            AccountMetric.TOTAL_CASH.value,
+        ):
+            value = self.ibkr.cached_account_value(self.account_number, tag)
+            account_summary[tag] = AccountValue(
+                self.account_number,
+                tag,
+                str(value),
+                "BASE",
+                "",
+            )
+        return account_summary, self.get_portfolio_positions()
+
+    def _discard_current_regime_planning_state(self) -> None:
+        if self.data_store:
+            self.data_store.discard_current_run_events(REGIME_PLANNING_STATE_EVENTS)
+
+    async def _plan_regime_rebalance(
+        self,
+        account_summary: AccountSummary,
+        portfolio_positions: dict[str, list[PortfolioItem]],
+        *,
+        exclude_current_run_state: bool = False,
+    ) -> list[tuple[str, str, int]]:
+        table, orders = await self.equity_engine.check_regime_rebalance_positions(
+            account_summary,
+            self.combine_position_maps(
+                portfolio_positions,
+                self.last_untracked_positions,
+            ),
+            exclude_current_run_state=exclude_current_run_state,
+        )
+        if self.config.strategies.regime_rebalance.enabled:
+            log.print(table)
+        return orders
+
+    async def _run_regime_rebalance_stage(
+        self,
+        account_summary: AccountSummary,
+        portfolio_positions: dict[str, list[PortfolioItem]],
+    ) -> tuple[AccountSummary, dict[str, list[PortfolioItem]]]:
+        records_before = len(self.orders.records())
+        regime_orders = await self._plan_regime_rebalance(
+            account_summary,
+            portfolio_positions,
+        )
+        new_records = self.orders.records()[records_before:]
+        harvest_records = [
+            record for record in new_records if self._is_tail_harvest_record(record)
+        ]
+        if self.dry_run or not harvest_records:
+            if regime_orders:
+                await self.equity_engine.execute_regime_rebalance_orders(regime_orders)
+            return account_summary, portfolio_positions
+
+        self._discard_current_regime_planning_state()
+        self.orders.remove_records(harvest_records)
+        if not await self._execute_tail_harvest_phase(harvest_records):
+            raise RuntimeError("Tail-harvest execution did not fully fill")
+
+        account_summary, portfolio_positions = await self._refresh_account_state()
+        records_before = len(self.orders.records())
+        regime_orders = await self._plan_regime_rebalance(
+            account_summary,
+            portfolio_positions,
+            exclude_current_run_state=True,
+        )
+        extra_harvests = [
+            record
+            for record in self.orders.records()[records_before:]
+            if self._is_tail_harvest_record(record)
+        ]
+        if extra_harvests:
+            self.orders.remove_records(extra_harvests)
+            for contract, _order, _intent_id in extra_harvests:
+                con_id = getattr(contract, "conId", 0)
+                if type(con_id) is int and con_id > 0:
+                    self._update_tail_recovery_submission(con_id, None)
+            self._discard_current_regime_planning_state()
+            log.error(
+                "A second tail harvest was queued during post-fill replanning; "
+                "aborting remaining stages safely."
+            )
+            raise RuntimeError("Tail-harvest replanning did not serialize")
+
+        if regime_orders:
+            records_before = len(self.orders.records())
+            prepared = await self.equity_engine.execute_regime_rebalance_orders(
+                regime_orders
+            )
+            if prepared != len(regime_orders):
+                added_records = self.orders.records()[records_before:]
+                self.orders.remove_records(added_records)
+                self._discard_current_regime_planning_state()
+                log.error(
+                    "Post-harvest regime orders were not prepared completely; "
+                    "aborting before final submission."
+                )
+                raise RuntimeError("Post-harvest rebalance preparation was incomplete")
+        return account_summary, portfolio_positions
+
+    @staticmethod
+    def _incomplete_order_details(trade: Any) -> dict[str, Any]:
+        contract = getattr(trade, "contract", None)
+        order = getattr(trade, "order", None)
+        status = getattr(trade, "orderStatus", None)
+        return {
+            "symbol": getattr(contract, "symbol", None),
+            "order_id": getattr(order, "orderId", None),
+            "action": getattr(order, "action", None),
+            "quantity": getattr(order, "totalQuantity", None),
+            "status": getattr(status, "status", None),
+            "filled": getattr(status, "filled", None),
+            "remaining": getattr(status, "remaining", None),
+            "why_held": getattr(status, "whyHeld", None) or None,
+        }
+
+    def _raise_for_incomplete_orders(self) -> None:
+        incomplete = [
+            self._incomplete_order_details(trade)
+            for trade in self.trades.records()
+            if trade and not self._trade_fully_filled(trade)
+        ]
+        if not incomplete:
+            return
+        summary = "; ".join(
+            (
+                f"{item['symbol']} {item['action']} quantity={item['quantity']} "
+                f"order_id={item['order_id']} status={item['status']} "
+                f"filled={item['filled']} remaining={item['remaining']} "
+                f"whyHeld={item['why_held'] or 'none'}"
+            )
+            for item in incomplete
+        )
+        log.error(f"ALERT: Run completed with rejected or unfilled orders: {summary}")
+        if self.data_store:
+            self.data_store.record_event(
+                "run_incomplete_orders",
+                {"orders": incomplete},
+            )
+        raise RuntimeError(
+            f"Run completed with {len(incomplete)} rejected or unfilled order(s)"
+        )
+
     async def manage(self) -> None:
+        had_error = False
         try:
+            self.regime_engine.begin_run()
+            self.set_reserved_cash_for_post_management(0.0)
+            if self.data_store:
+                self.data_store.record_event("run_start", {"dry_run": self.dry_run})
             self.initialize_account()
             (account_summary, portfolio_positions) = await self.summarize_account()
 
-            # Check if we have enough buying power to write some puts
-            (
-                positions_table,
-                put_actions_table,
-                puts_to_write,
-            ) = await self.check_if_can_write_puts(account_summary, portfolio_positions)
-            log.print(positions_table)
+            enabled_stages = set(self.run_stage_order)
+            stage_index = {
+                stage_id: idx for idx, stage_id in enumerate(self.run_stage_order)
+            }
+            close_stage_handled = False
+            positions_might_be_stale = False
 
-            # Look for lots of stock that don't have covered calls
-            (
-                call_actions_table,
-                calls_to_write,
-            ) = await self.check_for_uncovered_positions(
-                account_summary, portfolio_positions
-            )
+            write_stage_ids = {"options_write_puts", "options_write_calls"}
+            management_stage_ids = {"options_roll_positions", "options_close_positions"}
+            post_stage_ids = {
+                "post_vix_call_hedge",
+                "post_tail_hedge",
+                "post_cash_management",
+            }
+            rematerialize_before_stage_ids = management_stage_ids | post_stage_ids
+            pre_management_trade_stage_ids = {
+                "options_write_puts",
+                "options_write_calls",
+                "equity_regime_rebalance",
+                "equity_buy_rebalance",
+                "equity_sell_rebalance",
+            }
 
-            log.print(put_actions_table)
-            await self.write_puts(puts_to_write)
+            for stage_id in self.run_stage_order:
+                if (
+                    stage_id in rematerialize_before_stage_ids
+                    and positions_might_be_stale
+                ):
+                    portfolio_positions = self.get_portfolio_positions()
+                    positions_might_be_stale = False
 
-            log.print(call_actions_table)
-            await self.write_calls(calls_to_write)
+                if stage_id in write_stage_ids:
+                    await run_option_write_stages(
+                        self._options_strategy_deps({stage_id}),
+                        account_summary,
+                        portfolio_positions,
+                    )
+                elif stage_id == "options_roll_positions":
+                    if (
+                        "options_close_positions" in enabled_stages
+                        and stage_index[stage_id]
+                        < stage_index["options_close_positions"]
+                    ):
+                        await run_option_management_stages(
+                            self._options_strategy_deps(
+                                {"options_roll_positions", "options_close_positions"}
+                            ),
+                            account_summary,
+                            portfolio_positions,
+                        )
+                        close_stage_handled = True
+                    else:
+                        await run_option_management_stages(
+                            self._options_strategy_deps({"options_roll_positions"}),
+                            account_summary,
+                            portfolio_positions,
+                        )
+                elif stage_id == "options_close_positions":
+                    if close_stage_handled:
+                        continue
+                    await run_option_management_stages(
+                        self._options_strategy_deps({"options_close_positions"}),
+                        account_summary,
+                        portfolio_positions,
+                    )
+                elif stage_id == "equity_regime_rebalance":
+                    (
+                        account_summary,
+                        portfolio_positions,
+                    ) = await self._run_regime_rebalance_stage(
+                        account_summary,
+                        portfolio_positions,
+                    )
+                elif stage_id in {
+                    "equity_buy_rebalance",
+                    "equity_sell_rebalance",
+                }:
+                    await run_equity_rebalance_stages(
+                        self._equity_strategy_deps({stage_id}),
+                        account_summary,
+                        portfolio_positions,
+                    )
+                elif stage_id in post_stage_ids:
+                    post_positions = portfolio_positions
+                    if stage_id == "post_tail_hedge":
+                        post_positions = self.combine_position_maps(
+                            portfolio_positions,
+                            self.last_untracked_positions,
+                        )
+                    await run_post_stages(
+                        self._post_strategy_deps({stage_id}),
+                        account_summary,
+                        post_positions,
+                    )
 
-            # Refresh positions, in case anything changed from the orders above
-            portfolio_positions = self.get_portfolio_positions()
+                if stage_id in pre_management_trade_stage_ids:
+                    positions_might_be_stale = True
 
-            (rollable_puts, closeable_puts, group1) = await self.check_puts(
-                portfolio_positions
-            )
-            (rollable_calls, closeable_calls, group2) = await self.check_calls(
-                portfolio_positions
-            )
-            log.print(Panel(Group(group1, group2)))
-
-            await self.close_puts(
-                closeable_puts + await self.roll_puts(rollable_puts, account_summary)
-            )
-            await self.close_calls(
-                closeable_calls
-                + await self.roll_calls(
-                    rollable_calls, account_summary, portfolio_positions
-                )
-            )
-
-            # check if we should do VIX call hedging
-            await self.do_vix_hedging(account_summary, portfolio_positions)
-
-            # manage dat cash
-            await self.do_cashman(account_summary, portfolio_positions)
+            await self.execution_manager.prepare_orders(self.orders.records())
 
             if self.dry_run:
                 log.warning("Dry run enabled, no trades will be executed.")
 
                 self.orders.print_summary()
             else:
-                self.submit_orders()
+                with self.ibkr.supervise_order_errors(self.trades.records):
+                    self.submit_orders()
 
-                try:
-                    await self.ibkr.wait_for_submitting_orders(self.trades.records())
-                except RuntimeError:
-                    log.error("Submitting orders failed. Continuing anyway..")
-                    pass
+                    try:
+                        await self.ibkr.wait_for_submitting_orders(
+                            self.trades.records()
+                        )
+                    except RuntimeError as exc:
+                        # DAY orders can remain working at the broker after
+                        # submission. Continue through execution supervision,
+                        # then fail the run if they remain incomplete.
+                        log.warning(f"Order submission wait timed out: {exc}")
 
-                await self.adjust_prices()
+                    await self.adjust_prices()
 
-                await self.ibkr.wait_for_submitting_orders(self.trades.records())
+                    try:
+                        await self.ibkr.wait_for_submitting_orders(
+                            self.trades.records()
+                        )
+                    except RuntimeError as exc:
+                        log.warning(
+                            f"Post-adjust order submission wait timed out: {exc}"
+                        )
+                    self._raise_for_incomplete_orders()
 
             log.info("ThetaGang is done, shutting down! Cya next time. :sparkles:")
-        except:
+        except Exception as exc:
+            had_error = True
             log.error("ThetaGang terminated with error...")
+            if not self.completion_future.done():
+                self.completion_future.set_exception(exc)
             raise
 
         finally:
-            # Shut it down
-            self.completion_future.set_result(True)
-
-    async def check_puts(
-        self, portfolio_positions: Dict[str, List[PortfolioItem]]
-    ) -> Tuple[List[Any], List[Any], Group]:
-        # Check for puts which may be rolled to the next expiration or a better price
-        puts = self.get_short_puts(portfolio_positions)
-        # Filter out an VIX positions
-        puts = [put for put in puts if put.contract.symbol != "VIX"]
-
-        # find puts eligible to be rolled or closed
-        rollable_puts: List[PortfolioItem] = []
-        closeable_puts: List[PortfolioItem] = []
-
-        table = Table(title="Rollable & closeable puts")
-        table.add_column("Contract")
-        table.add_column("Action")
-        table.add_column("Detail")
-
-        async def check_put_can_be_rolled_task(
-            put: PortfolioItem, table: Table
-        ) -> None:
-            if await self.put_can_be_rolled(put, table):
-                rollable_puts.append(put)
-            elif self.put_can_be_closed(put, table):
-                closeable_puts.append(put)
-
-        tasks = [check_put_can_be_rolled_task(put, table) for put in puts]
-        await log.track_async(tasks, "Checking rollable/closeable puts...")
-
-        total_rollable_puts = math.floor(sum([abs(p.position) for p in rollable_puts]))
-        total_closeable_puts = math.floor(
-            sum([abs(p.position) for p in closeable_puts])
-        )
-
-        text1 = f"[magenta]{total_rollable_puts} puts can be rolled"
-        text2 = f"[magenta]{total_closeable_puts} puts can be closed"
-
-        if total_closeable_puts + total_rollable_puts > 0:
-            group = Group(text1, text2, table)
-        else:
-            group = Group(text1, text2)
-
-        return (rollable_puts, closeable_puts, group)
-
-    async def check_calls(
-        self, portfolio_positions: Dict[str, List[PortfolioItem]]
-    ) -> Tuple[List[Any], List[Any], Group]:
-        # Check for calls which may be rolled to the next expiration or a better price
-        calls = self.get_short_calls(portfolio_positions)
-        # Filter out an VIX positions
-        calls = [call for call in calls if call.contract.symbol != "VIX"]
-
-        # find calls eligible to be rolled
-        rollable_calls: List[PortfolioItem] = []
-        closeable_calls: List[PortfolioItem] = []
-
-        table = Table(title="Rollable & closeable calls")
-        table.add_column("Contract")
-        table.add_column("Action")
-        table.add_column("Detail")
-
-        for c in log.track(
-            calls, description="Checking rollable/closeable calls...", total=len(calls)
-        ):
-            if await self.call_can_be_rolled(c, table):
-                rollable_calls.append(c)
-            elif self.call_can_be_closed(c, table):
-                closeable_calls.append(c)
-
-        total_rollable_calls = math.floor(
-            sum([abs(p.position) for p in rollable_calls])
-        )
-        total_closeable_calls = math.floor(
-            sum([abs(p.position) for p in closeable_calls])
-        )
-
-        text1 = f"[magenta]{total_rollable_calls} calls can be rolled"
-        text2 = f"[magenta]{total_closeable_calls} calls can be closed"
-
-        if total_closeable_calls + total_rollable_calls > 0:
-            group = Group(text1, text2, table)
-        else:
-            group = Group(text1, text2)
-
-        return (rollable_calls, closeable_calls, group)
+            if self.data_store:
+                self.data_store.record_event("run_end", {"success": not had_error})
+            if not had_error and not self.completion_future.done():
+                self.completion_future.set_result(True)
 
     async def get_maximum_new_contracts_for(
         self,
         symbol: str,
         primary_exchange: str,
-        account_summary: Dict[str, AccountValue],
+        account_summary: AccountSummary,
     ) -> int:
         total_buying_power = self.get_buying_power(account_summary)
         max_buying_power = (
-            self.config.target.maximum_new_contracts_percent * total_buying_power
+            self.config.strategies.wheel.defaults.target.maximum_new_contracts_percent
+            * total_buying_power
         )
         ticker = await self.ibkr.get_ticker_for_stock(
             symbol,
             primary_exchange,
         )
         price = midpoint_or_market_price(ticker)
-
         return max([1, round((max_buying_power / price) // 100)])
 
-    async def check_for_uncovered_positions(
-        self,
-        account_summary: Dict[str, AccountValue],
-        portfolio_positions: Dict[str, List[PortfolioItem]],
-    ) -> Tuple[Table, List[Tuple[str, str, int, int]]]:
-        call_actions_table = Table(title="Call writing summary")
-        call_actions_table.add_column("Symbol")
-        call_actions_table.add_column("Action")
-        call_actions_table.add_column("Detail")
-        calculate_net_contracts = self.config.write_when.calculate_net_contracts
-
-        to_write: List[Tuple[str, str, int, int]] = []
-        symbols = set(self.get_symbols())
-
-        async def update_to_write_task(symbol: str) -> None:
-            if symbol not in symbols:
-                # skip positions we don't care about
-                return
-            short_call_count = (
-                calculate_net_short_positions(portfolio_positions[symbol], "C")
-                if calculate_net_contracts
-                else count_short_option_positions(portfolio_positions[symbol], "C")
-            )
-            stock_count = math.floor(
-                sum(
-                    [
-                        p.position
-                        for p in portfolio_positions[symbol]
-                        if isinstance(p.contract, Stock)
-                    ]
-                )
-            )
-            strike_limit = math.ceil(
-                max(
-                    [
-                        self.config.get_strike_limit(symbol, "C") or 0,
-                    ]
-                    + [
-                        p.averageCost or 0
-                        for p in portfolio_positions[symbol]
-                        if isinstance(p.contract, Stock)
-                    ]
-                )
-            )
-
-            target_short_calls = get_target_calls(
-                self.config, symbol, stock_count, self.target_quantities[symbol]
-            )
-            new_contracts_needed = target_short_calls - short_call_count
-            excess_calls = short_call_count - target_short_calls
-
-            if excess_calls > 0:
-                self.has_excess_calls.add(symbol)
-                call_actions_table.add_row(
-                    symbol,
-                    "[yellow]None",
-                    f"[yellow]Warning: excess_calls={excess_calls} stock_count={stock_count},"
-                    f" short_call_count={short_call_count}, target_short_calls={target_short_calls}",
-                )
-
-            maximum_new_contracts = await self.get_maximum_new_contracts_for(
-                symbol,
-                self.get_primary_exchange(symbol),
-                account_summary,
-            )
-            calls_to_write = max(
-                [0, min([new_contracts_needed, maximum_new_contracts])]
-            )
-
-            ticker = await self.ibkr.get_ticker_for_stock(
-                symbol, self.get_primary_exchange(symbol)
-            )
-
-            (write_threshold, absolute_daily_change) = (None, None)
-
-            async def is_ok_to_write_calls(
-                symbol: str,
-                ticker: Optional[Ticker],
-                calls_to_write: int,
-            ) -> bool:
-                nonlocal write_threshold, absolute_daily_change
-                if (
-                    not ticker
-                    or calls_to_write <= 0
-                    or not self.config.trading_is_allowed(symbol)
-                ):
-                    return False
-
-                (can_write_when_green, can_write_when_red) = self.config.can_write_when(
-                    symbol, "C"
-                )
-
-                close_price = self.get_close_price(ticker)
-                if not can_write_when_green and ticker.marketPrice() > close_price:
-                    call_actions_table.add_row(
-                        symbol,
-                        "[cyan1]None",
-                        f"[cyan1]Skipping because can_write_when_green={can_write_when_green} and marketPrice={ticker.marketPrice():.2f} > close={close_price}",
-                    )
-                    return False
-                if not can_write_when_red and ticker.marketPrice() < close_price:
-                    call_actions_table.add_row(
-                        symbol,
-                        "[cyan1]None",
-                        f"[cyan1]Skipping because can_write_when_red={can_write_when_red} and marketPrice={ticker.marketPrice():.2f} < close={close_price}",
-                    )
-                    return False
-
-                (
-                    write_threshold,
-                    absolute_daily_change,
-                ) = await self.get_write_threshold(ticker, "C")
-                if absolute_daily_change < write_threshold:
-                    call_actions_table.add_row(
-                        symbol,
-                        "[cyan1]None",
-                        f"[cyan1]Need to write {calls_to_write} calls, "
-                        f"but skipping because absolute_daily_change={absolute_daily_change:.2f}"
-                        f" less than write_threshold={write_threshold:.2f}",
-                    )
-                    return False
-                return True
-
-            ok_to_write = await is_ok_to_write_calls(symbol, ticker, calls_to_write)
-            strike_limit = math.ceil(max([strike_limit, ticker.marketPrice()]))
-
-            if calls_to_write > 0 and ok_to_write:
-                call_actions_table.add_row(
-                    symbol,
-                    "[green]Write",
-                    f"[green]Will write {calls_to_write} calls, {new_contracts_needed} needed, "
-                    f"limited to {maximum_new_contracts} new contracts, at or above strike {dfmt(strike_limit)}"
-                    f" (target_short_calls={target_short_calls} short_call_count={short_call_count} "
-                    f"absolute_daily_change={absolute_daily_change:.2f} write_threshold={write_threshold:.2f})",
-                )
-                to_write.append(
-                    (
-                        symbol,
-                        self.get_primary_exchange(symbol),
-                        calls_to_write,
-                        strike_limit,
-                    )
-                )
-
-        tasks = [update_to_write_task(symbol) for symbol in portfolio_positions]
-        await log.track_async(tasks, description="Checking for uncovered positions...")
-
-        return (call_actions_table, to_write)
-
-    async def write_calls(self, calls: List[Any]) -> None:
-        for symbol, primary_exchange, quantity, strike_limit in calls:
-            try:
-                sell_ticker = await self.find_eligible_contracts(
-                    Stock(
-                        symbol,
-                        self.get_order_exchange(),
-                        currency="USD",
-                        primaryExchange=primary_exchange,
-                    ),
-                    "C",
-                    strike_limit,
-                    minimum_price=lambda: self.config.orders.minimum_credit,
-                )
-            except (RuntimeError, NoValidContractsError):
-                log.error(
-                    f"{symbol}: Finding eligible contracts failed. Continuing anyway..."
-                )
-                continue
-
-            # Create order
-            order = LimitOrder(
-                "SELL",
-                quantity,
-                round(get_higher_price(sell_ticker), 2),
-                algoStrategy=self.get_algo_strategy(),
-                algoParams=self.get_algo_params(),
-                tif="DAY",
-                account=self.account_number,
-            )
-
-            # Enqueue order
-            self.enqueue_order(sell_ticker.contract, order)
-
-    async def write_puts(
-        self, puts: List[Tuple[str, str, int, Optional[float]]]
-    ) -> None:
-        for symbol, primary_exchange, quantity, strike_limit in puts:
-            try:
-                sell_ticker = await self.find_eligible_contracts(
-                    Stock(
-                        symbol,
-                        self.get_order_exchange(),
-                        currency="USD",
-                        primaryExchange=primary_exchange,
-                    ),
-                    "P",
-                    strike_limit,
-                    minimum_price=lambda: self.config.orders.minimum_credit,
-                )
-            except (RuntimeError, NoValidContractsError):
-                log.error(
-                    f"{symbol}: Finding eligible contracts failed. Continuing anyway..."
-                )
-                continue
-
-            # Create order
-            order = LimitOrder(
-                "SELL",
-                quantity,
-                round(get_higher_price(sell_ticker), 2),
-                algoStrategy=self.get_algo_strategy(),
-                algoParams=self.get_algo_params(),
-                tif="DAY",
-                account=self.account_number,
-            )
-
-            # Enqueue order
-            self.enqueue_order(sell_ticker.contract, order)
-
     def get_primary_exchange(self, symbol: str) -> str:
-        return self.config.symbols[symbol].primary_exchange
+        return self.config.portfolio.symbols[symbol].primary_exchange
 
-    def get_buying_power(self, account_summary: Dict[str, AccountValue]) -> int:
-        return math.floor(
-            float(account_summary["NetLiquidation"].value)
-            * self.config.account.margin_usage
+    def get_wheel_buying_power(self, account_summary: AccountSummary) -> int:
+        accounting = PortfolioAccounting.build(
+            config=self.config,
+            account_summary=account_summary,
         )
+        return int(accounting.capital_base(CapitalBaseKind.WHEEL_BUYING_POWER).value)
 
-    async def check_if_can_write_puts(
-        self,
-        account_summary: Dict[str, AccountValue],
-        portfolio_positions: Dict[str, List[PortfolioItem]],
-    ) -> Tuple[Table, Table, List[Tuple[str, str, int, Optional[float]]]]:
-        # Get stock positions
-        stock_positions = [
-            position
-            for symbol in portfolio_positions
-            for position in portfolio_positions[symbol]
-            if isinstance(position.contract, Stock)
-        ]
+    def get_buying_power(self, account_summary: AccountSummary) -> int:
+        return self.get_wheel_buying_power(account_summary)
 
-        total_buying_power = self.get_buying_power(account_summary)
+    def midpoint_or_market_price(self, ticker: Ticker) -> float:
+        return float(midpoint_or_market_price(ticker))
 
-        stock_symbols: Dict[str, PortfolioItem] = dict()
-        for stock in stock_positions:
-            symbol = stock.contract.symbol
-            stock_symbols[symbol] = stock
-
-        targets: Dict[str, float] = dict()
-        target_additional_quantity: Dict[str, Dict[str, int | bool]] = dict()
-
-        calculate_net_contracts = self.config.write_when.calculate_net_contracts
-
-        positions_summary_table = Table(
-            title="Positions summary",
-            show_edge=False,
-        )
-        positions_summary_table.add_column("Symbol")
-        positions_summary_table.add_column("Shares", justify="right")
-        positions_summary_table.add_column("Short puts", justify="right")
-        positions_summary_table.add_column("Long puts", justify="right")
-        if calculate_net_contracts:
-            positions_summary_table.add_column("Net short puts", justify="right")
-        positions_summary_table.add_column("Short calls", justify="right")
-        positions_summary_table.add_column("Long calls", justify="right")
-        if calculate_net_contracts:
-            positions_summary_table.add_column("Net short calls", justify="right")
-        positions_summary_table.add_column("Target value", justify="right")
-        positions_summary_table.add_column("Target share qty", justify="right")
-        positions_summary_table.add_column("Net target shares", justify="right")
-        positions_summary_table.add_column("Net target contracts", justify="right")
-
-        put_actions_table = Table(title="Put writing summary")
-        put_actions_table.add_column("Symbol")
-        put_actions_table.add_column("Action")
-        put_actions_table.add_column("Detail")
-
-        async def calculate_target_position_task(symbol: str) -> None:
-            ticker = await self.ibkr.get_ticker_for_stock(
-                symbol, self.get_primary_exchange(symbol)
-            )
-
-            current_position = math.floor(
-                stock_symbols[symbol].position if symbol in stock_symbols else 0
-            )
-
-            targets[symbol] = round(
-                self.config.symbols[symbol].weight * total_buying_power, 2
-            )
-            market_price = ticker.marketPrice()
+    def _working_option_commitments(
+        self, open_trades: list[Any]
+    ) -> Counter[tuple[int, str]]:
+        commitments: Counter[tuple[int, str]] = Counter()
+        for trade in open_trades:
+            contract = getattr(trade, "contract", None)
+            order = getattr(trade, "order", None)
             if (
-                not market_price
-                or math.isnan(market_price)
-                or math.isclose(market_price, 0)
+                contract is None
+                or order is None
+                or trade.isDone()
+                or getattr(order, "account", None) != self.account_number
+                or getattr(contract, "secType", None) != "OPT"
             ):
-                log.error(
-                    f"Invalid market price for {symbol} (market_price={market_price}), skipping for now"
-                )
-                return
-            self.target_quantities[symbol] = math.floor(targets[symbol] / market_price)
-
-            if symbol in portfolio_positions:
-                # Current number of puts
-                net_short_put_count = short_put_count = count_short_option_positions(
-                    portfolio_positions[symbol], "P"
-                )
-                short_put_avg_strike = weighted_avg_short_strike(
-                    portfolio_positions[symbol], "P"
-                )
-                long_put_count = count_long_option_positions(
-                    portfolio_positions[symbol], "P"
-                )
-                long_put_avg_strike = weighted_avg_long_strike(
-                    portfolio_positions[symbol], "P"
-                )
-                # Current number of calls
-                net_short_call_count = short_call_count = count_short_option_positions(
-                    portfolio_positions[symbol], "C"
-                )
-                short_call_avg_strike = weighted_avg_short_strike(
-                    portfolio_positions[symbol], "C"
-                )
-                long_call_count = count_long_option_positions(
-                    portfolio_positions[symbol], "C"
-                )
-                long_call_avg_strike = weighted_avg_long_strike(
-                    portfolio_positions[symbol], "C"
-                )
-
-                if calculate_net_contracts:
-                    net_short_put_count = calculate_net_short_positions(
-                        portfolio_positions[symbol], "P"
-                    )
-                    net_short_call_count = calculate_net_short_positions(
-                        portfolio_positions[symbol], "C"
-                    )
-            else:
-                net_short_put_count = short_put_count = long_put_count = 0
-                short_put_avg_strike = long_put_avg_strike = None
-                net_short_call_count = short_call_count = long_call_count = 0
-                short_call_avg_strike = long_call_avg_strike = None
-
-            qty_to_write = math.floor(
-                self.target_quantities[symbol]
-                - current_position
-                - 100 * net_short_put_count
-            )
-            net_target_shares = qty_to_write
-            net_target_puts = net_target_shares // 100
-
-            if calculate_net_contracts:
-                positions_summary_table.add_row(
-                    symbol,
-                    ifmt(current_position),
-                    ifmt(short_put_count),
-                    ifmt(long_put_count),
-                    ifmt(net_short_put_count),
-                    ifmt(short_call_count),
-                    ifmt(long_call_count),
-                    ifmt(net_short_call_count),
-                    dfmt(targets[symbol]),
-                    ifmt(self.target_quantities[symbol]),
-                    ifmt(net_target_shares),
-                    ifmt(net_target_puts),
-                )
-                positions_summary_table.add_row(
-                    "",
-                    "",
-                    dfmt(short_put_avg_strike),
-                    dfmt(long_put_avg_strike),
-                    "",
-                    dfmt(short_call_avg_strike),
-                    dfmt(long_call_avg_strike),
-                )
-            else:
-                positions_summary_table.add_row(
-                    symbol,
-                    ifmt(current_position),
-                    ifmt(short_put_count),
-                    ifmt(long_put_count),
-                    ifmt(short_call_count),
-                    ifmt(long_call_count),
-                    dfmt(targets[symbol]),
-                    ifmt(self.target_quantities[symbol]),
-                    ifmt(net_target_shares),
-                    ifmt(net_target_puts),
-                )
-                positions_summary_table.add_row(
-                    "",
-                    "",
-                    dfmt(short_put_avg_strike),
-                    dfmt(long_put_avg_strike),
-                    dfmt(short_call_avg_strike),
-                    dfmt(long_call_avg_strike),
-                )
-            positions_summary_table.add_section()
-
-            async def is_ok_to_write_puts(
-                symbol: str,
-                ticker: Ticker,
-                puts_to_write: int,
-            ) -> bool:
-                if puts_to_write <= 0 or not self.config.trading_is_allowed(symbol):
-                    return False
-
-                (can_write_when_green, can_write_when_red) = self.config.can_write_when(
-                    symbol, "P"
-                )
-
-                close_price = self.get_close_price(ticker)
-                if not can_write_when_green and ticker.marketPrice() > close_price:
-                    put_actions_table.add_row(
-                        symbol,
-                        "[cyan1]None",
-                        f"[cyan1]Skipping because can_write_when_green={can_write_when_green} and marketPrice={ticker.marketPrice():.2f} > close={close_price}",
-                    )
-                    return False
-                if not can_write_when_red and ticker.marketPrice() < close_price:
-                    put_actions_table.add_row(
-                        symbol,
-                        "[cyan1]None",
-                        f"[cyan1]Skipping because can_write_when_red={can_write_when_red} and marketPrice={ticker.marketPrice():.2f} < close={close_price}",
-                    )
-                    return False
-
-                (
-                    write_threshold,
-                    absolute_daily_change,
-                ) = await self.get_write_threshold(ticker, "P")
-                if absolute_daily_change < write_threshold:
-                    put_actions_table.add_row(
-                        symbol,
-                        "[cyan1]None",
-                        f"[cyan1]Need to write {puts_to_write} puts, but skipping because absolute_daily_change={absolute_daily_change:.2f} less than write_threshold={write_threshold:.2f}[/cyan1]",
-                    )
-                    return False
-                return True
-
-            ok_to_write = await is_ok_to_write_puts(symbol, ticker, net_target_puts)
-
-            target_additional_quantity[symbol] = {
-                "qty": net_target_puts,
-                "ok_to_write": ok_to_write,
-            }
-
-        tasks = [
-            calculate_target_position_task(symbol)
-            for symbol in self.config.symbols.keys()
-        ]
-        await log.track_async(tasks, description="Calculating target positions...")
-
-        to_write: List[Tuple[str, str, int, Optional[float]]] = []
-
-        async def update_to_write_task(
-            symbol: str, target: Dict[str, int | bool]
-        ) -> None:
-            ok_to_write = target["ok_to_write"]
-            additional_quantity = target["qty"]
-            # NOTE: it's possible there are non-standard option contract sizes,
-            # like with futures, but we don't bother handling those cases.
-            # Please don't use this code with futures.
-            if additional_quantity >= 1 and ok_to_write:
-                maximum_new_contracts = await self.get_maximum_new_contracts_for(
-                    symbol,
-                    self.get_primary_exchange(symbol),
-                    account_summary,
-                )
-                puts_to_write = min([additional_quantity, maximum_new_contracts])
-                if puts_to_write > 0:
-                    strike_limit = self.config.get_strike_limit(symbol, "P")
-                    if strike_limit:
-                        put_actions_table.add_row(
-                            symbol,
-                            "[green]Write",
-                            f"[green]Will write {puts_to_write} puts, {additional_quantity}"
-                            f" needed, capped at {maximum_new_contracts}, at or below strike ${strike_limit}",
-                        )
-                    else:
-                        put_actions_table.add_row(
-                            symbol,
-                            "[green]Write",
-                            f"[green]Will write {puts_to_write} puts, {additional_quantity}"
-                            f" needed, capped at {maximum_new_contracts}",
-                        )
-                    to_write.append(
-                        (
-                            symbol,
-                            self.get_primary_exchange(symbol),
-                            puts_to_write,
-                            strike_limit,
-                        )
-                    )
-            elif additional_quantity < 0:
-                self.has_excess_puts.add(symbol)
-                put_actions_table.add_row(
-                    symbol,
-                    "[yellow]None",
-                    "[yellow]Warning: excess positions based "
-                    "on net liquidation and target margin usage",
-                )
-
-        tasks = [
-            update_to_write_task(symbol, target)
-            for symbol, target in target_additional_quantity.items()
-        ]
-        await log.track_async(tasks, description="Generating positions summary...")
-
-        return (positions_summary_table, put_actions_table, to_write)
-
-    async def close_puts(self, puts: List[PortfolioItem]) -> None:
-        return await self.close_positions("P", puts)
-
-    async def roll_puts(
-        self,
-        puts: List[PortfolioItem],
-        account_summary: Dict[str, AccountValue],
-    ) -> List[PortfolioItem]:
-        return await self.roll_positions(puts, "P", account_summary)
-
-    async def close_calls(self, calls: List[PortfolioItem]) -> None:
-        return await self.close_positions("C", calls)
-
-    async def roll_calls(
-        self,
-        calls: List[PortfolioItem],
-        account_summary: Dict[str, AccountValue],
-        portfolio_positions: Dict[str, List[PortfolioItem]],
-    ) -> List[PortfolioItem]:
-        return await self.roll_positions(
-            calls, "C", account_summary, portfolio_positions
-        )
-
-    async def close_positions(self, right: str, positions: List[PortfolioItem]) -> None:
-        log.notice(f"Close {right} positions...")
-        for position in positions:
-            try:
-                position.contract.exchange = self.get_order_exchange()
-                price = None
-                ticker = await self.ibkr.get_ticker_for_contract(
-                    position.contract,
-                    required_fields=[],
-                    optional_fields=[TickerField.MIDPOINT, TickerField.MARKET_PRICE],
-                )
-                is_short = position.position < 0
-                price = (
-                    round(get_lower_price(ticker), 2)
-                    if is_short
-                    else round(get_higher_price(ticker), 2)
-                )
-                if not price or util.isNan(price) or math.isnan(price):
-                    # if the price is near zero or NaN, use the minimum price
-                    log.warning(
-                        f"Market price data unavailable for {position.contract.localSymbol}, using ticker.minTick={ticker.minTick}"
-                    )
-                    price = ticker.minTick
-
-                # Round VIX prices according to contract specifications
-                if position.contract.symbol == "VIX":
-                    price = self.round_vix_price(price)
-
-                qty = abs(position.position)
-                order = LimitOrder(
-                    "BUY" if is_short else "SELL",
-                    qty,
-                    price,
-                    algoStrategy=self.get_algo_strategy(),
-                    algoParams=self.get_algo_params(),
-                    tif="DAY",
-                    account=self.account_number,
-                )
-
-                self.enqueue_order(ticker.contract, order)
-            except RuntimeError:
-                log.error(
-                    "Error occurred when trying to close position. Continuing anyway..."
-                )
                 continue
-
-    async def roll_positions(
-        self,
-        positions: List[PortfolioItem],
-        right: str,
-        account_summary: Dict[str, AccountValue],
-        portfolio_positions: Optional[Dict[str, List[PortfolioItem]]] = None,
-    ) -> List[PortfolioItem]:
-        closeable_positions: List[PortfolioItem] = []
-
-        log.notice(f"Rolling {right} positions...")
-
-        for position in positions:
-            try:
-                symbol = position.contract.symbol
-
-                position.contract.exchange = self.get_order_exchange()
-                buy_ticker = await self.ibkr.get_ticker_for_contract(
-                    position.contract,
-                    required_fields=[],
-                    optional_fields=[TickerField.MIDPOINT, TickerField.MARKET_PRICE],
+            con_id = getattr(contract, "conId", 0)
+            action = str(getattr(order, "action", "")).upper()
+            if type(con_id) is int and con_id > 0 and action in {"BUY", "SELL"}:
+                commitments[(con_id, action)] += math.ceil(
+                    max(0, float(order.totalQuantity))
                 )
+        return commitments
 
-                strike_limit = self.config.get_strike_limit(symbol, right)
-                if right.startswith("C"):
-                    average_cost = (
-                        [
-                            p.averageCost
-                            for p in portfolio_positions[symbol]
-                            if isinstance(p.contract, Stock)
-                        ]
-                        if portfolio_positions and symbol in portfolio_positions
-                        else [0]
-                    )
-                    strike_limit = round(
-                        max([strike_limit or 0] + average_cost),
-                        2,
-                    )
-                    if self.config.maintain_high_water_mark(symbol):
-                        strike_limit = max([strike_limit, position.contract.strike])
+    def _live_position(self, con_id: int) -> float:
+        try:
+            position = sum(
+                float(item.position)
+                for item in self.ibkr.portfolio(account=self.account_number)
+                if getattr(item, "account", None) == self.account_number
+                and getattr(getattr(item, "contract", None), "conId", None) == con_id
+            )
+        except (TypeError, ValueError):
+            return 0.0
+        return position if math.isfinite(position) else 0.0
 
-                elif right.startswith("P"):
-                    strike_limit = round(
-                        min(
-                            [strike_limit or sys.float_info.max]
-                            + [
-                                max(
-                                    [
-                                        position.contract.strike,
-                                        position.contract.strike
-                                        + (
-                                            position.averageCost
-                                            / float(position.contract.multiplier)
-                                        )
-                                        - midpoint_or_market_price(buy_ticker),
-                                    ]
-                                )
-                            ]
-                        ),
-                        2,
-                    )
-                    # special case: if we're rolling a put that's ITM, we want to roll to an equal or lower strike, not higher
-                    if isinstance(position.contract, Option) and await self.put_is_itm(
-                        position.contract
-                    ):
-                        strike_limit = min([strike_limit, position.contract.strike])
+    def _has_live_stock(self, symbol: str) -> bool:
+        try:
+            shares = sum(
+                float(item.position)
+                for item in self.ibkr.portfolio(account=self.account_number)
+                if getattr(item, "account", None) == self.account_number
+                and isinstance(getattr(item, "contract", None), Stock)
+                and item.contract.symbol == symbol
+            )
+        except (TypeError, ValueError):
+            return False
+        return math.isfinite(shares) and shares > 0
 
-                kind = "calls" if right.startswith("C") else "puts"
-
-                minimum_price = (
-                    (lambda: self.config.orders.minimum_credit)
-                    if not getattr(self.config.roll_when, kind).credit_only
-                    else (
-                        lambda: midpoint_or_market_price(buy_ticker)
-                        + self.config.orders.minimum_credit
-                    )
-                )
-
-                def fallback_minimum_price() -> float:
-                    return midpoint_or_market_price(buy_ticker)
-
-                sell_ticker = await self.find_eligible_contracts(
-                    Stock(
-                        symbol,
-                        self.get_order_exchange(),
-                        "USD",
-                        primaryExchange=self.get_primary_exchange(symbol),
-                    ),
-                    right,
-                    strike_limit,
-                    exclude_expirations_before=position.contract.lastTradeDateOrContractMonth,
-                    exclude_exp_strike=(
-                        position.contract.strike,
-                        position.contract.lastTradeDateOrContractMonth,
-                    ),
-                    minimum_price=minimum_price,
-                    fallback_minimum_price=fallback_minimum_price,
-                )
-                if not sell_ticker.contract:
-                    raise RuntimeError(f"Invalid ticker (no contract): {sell_ticker}")
-
-                qty_to_roll = math.floor(abs(position.position))
-                maximum_new_contracts = await self.get_maximum_new_contracts_for(
-                    symbol,
-                    self.get_primary_exchange(symbol),
-                    account_summary,
-                )
-                from_dte = option_dte(position.contract.lastTradeDateOrContractMonth)
-                roll_when_dte = self.config.roll_when.dte
-                if from_dte > roll_when_dte:
-                    qty_to_roll = min([qty_to_roll, maximum_new_contracts])
-
-                price = midpoint_or_market_price(buy_ticker) - midpoint_or_market_price(
-                    sell_ticker
-                )
-                # a buy order should be at most the minimum price, when we expect a credit
-                price = (
-                    min([price, -self.config.orders.minimum_credit])
-                    if getattr(self.config.roll_when, kind).credit_only
-                    else price
-                )
-
-                # Round VIX prices according to contract specifications
-                if position.contract.symbol == "VIX":
-                    price = self.round_vix_price(price)
-
-                # store a copy of the contracts so we can retrieve them later by conId
-                self.qualified_contracts[position.contract.conId] = position.contract
-                self.qualified_contracts[sell_ticker.contract.conId] = (
-                    sell_ticker.contract
-                )
-
-                # Create combo legs
-                comboLegs = [
-                    ComboLeg(
-                        conId=position.contract.conId,
-                        ratio=1,
-                        exchange=self.get_order_exchange(),
-                        action="BUY",
-                    ),
-                    ComboLeg(
-                        conId=sell_ticker.contract.conId,
-                        ratio=1,
-                        exchange=self.get_order_exchange(),
-                        action="SELL",
-                    ),
-                ]
-
-                # Create contract
-                combo = Contract(
-                    secType="BAG",
-                    symbol=symbol,
-                    currency="USD",
-                    exchange=self.get_order_exchange(),
-                    comboLegs=comboLegs,
-                )
-
-                # Create order
-                order = LimitOrder(
-                    "BUY",
-                    qty_to_roll,
-                    round(price, 2),
-                    tif="DAY",
-                    account=self.account_number,
-                )
-
-                to_dte = option_dte(sell_ticker.contract.lastTradeDateOrContractMonth)
-                from_strike = position.contract.strike
-                to_strike = sell_ticker.contract.strike
-                log.info(
-                    f"{symbol}: Rolling from_strike={from_strike} to_strike={to_strike} from_dte={from_dte} to_dte={to_dte} price={dfmt(price, 3)} qty_to_roll={qty_to_roll}"
-                )
-
-                # Enqueue order
-                self.enqueue_order(combo, order)
-            except NoValidContractsError:
-                dte = option_dte(position.contract.lastTradeDateOrContractMonth)
+    def _has_live_contract(self, con_id: int) -> bool:
+        """Fail closed when an entry contract's live occupancy is ambiguous."""
+        try:
+            for item in self.ibkr.portfolio(account=self.account_number):
                 if (
-                    self.config.close_if_unable_to_roll(position.contract.symbol)
-                    and self.config.roll_when.max_dte
-                    and dte <= self.config.roll_when.max_dte
-                    and position_pnl(position) > 0
+                    getattr(item, "account", None) != self.account_number
+                    or getattr(getattr(item, "contract", None), "conId", None) != con_id
                 ):
-                    log.warning(
-                        f"{position.contract.symbol}: Unable to find a suitable contract to roll to for {position.contract.localSymbol}. Closing position instead..."
-                    )
-                    closeable_positions.append(position)
                     continue
-                else:
-                    log.error(
-                        f"{position.contract.symbol}: Error occurred when trying to roll position. Continuing anyway..."
-                    )
-            except RuntimeError:
-                log.error(
-                    f"{position.contract.symbol}: Error occurred when trying to roll position. Continuing anyway..."
-                )
+                quantity = float(item.position)
+                if not math.isfinite(quantity) or not math.isclose(quantity, 0.0):
+                    return True
+        except (AttributeError, TypeError, ValueError):
+            return True
+        return False
+
+    def _update_tail_recovery_submission(
+        self,
+        con_id: int,
+        quantity: int | None,
+        *,
+        live_quantity: int | None = None,
+    ) -> bool:
+        if self.data_store is None:
+            log.error("Cannot submit a tail reduction without durable state.")
+            return False
+        try:
+            updated = TailHedgeStateStore(
+                self.data_store,
+                self.account_number,
+            ).update_recovery_submission(
+                con_id,
+                quantity,
+                live_quantity=live_quantity,
+            )
+        except RuntimeError as exc:
+            log.error(f"Failed to update tail-reduction state: {exc}")
+            return False
+        if not updated:
+            log.error(f"No pending tail-reduction state found for conId {con_id}.")
+        return updated
+
+    def _release_tail_entry_submission(self, con_id: int) -> bool:
+        if self.data_store is None:
+            log.error("Cannot release a skipped tail entry without durable state.")
+            return False
+        try:
+            released = TailHedgeStateStore(
+                self.data_store,
+                self.account_number,
+            ).release_entry_submission(con_id)
+        except RuntimeError as exc:
+            log.error(f"Failed to release skipped tail-entry state: {exc}")
+            return False
+        if not released:
+            log.error(f"No pending tail-entry state found for conId {con_id}.")
+        return released
+
+    @staticmethod
+    def _trade_fully_filled(trade: Any) -> bool:
+        return OrderExecutionManager.trade_fully_filled(trade)
+
+    async def _cancel_incomplete_trades(self, trades: list[Any]) -> None:
+        canceled_trades = []
+        for trade in trades:
+            if self._trade_fully_filled(trade) or trade.isDone():
                 continue
+            log.warning(
+                f"{trade.contract.symbol}: Canceling incomplete tail harvest "
+                f"after bounded fill attempt."
+            )
+            self.ibkr.cancel_order(trade.order)
+            canceled_trades.append(trade)
+        if not canceled_trades:
+            return
+        still_working = await self.ibkr.wait_for_orders_complete(
+            canceled_trades,
+            max(
+                1,
+                min(60, self.config.runtime.ib_async.api_response_wait_time),
+            ),
+        )
+        if still_working:
+            log.error(
+                "Tail-harvest cancellation was not confirmed before shutdown; "
+                "no dependent orders will be submitted."
+            )
 
-        return closeable_positions
-
-    async def find_eligible_contracts(
+    async def _execute_tail_harvest_phase(
         self,
-        underlying: Contract,
-        right: str,
-        strike_limit: Optional[float],
-        minimum_price: Callable[[], float],
-        exclude_expirations_before: Optional[str] = None,
-        exclude_exp_strike: Optional[Tuple[float, str]] = None,
-        fallback_minimum_price: Optional[Callable[[], float]] = None,
-        target_dte: Optional[int] = None,
-        target_delta: Optional[float] = None,
-    ) -> Ticker:
-        contract_target_dte: int = (
-            target_dte if target_dte else self.config.get_target_dte(underlying.symbol)
-        )
-        contract_target_delta: float = (
-            target_delta
-            if target_delta
-            else self.config.get_target_delta(underlying.symbol, right)
-        )
-        contract_max_dte = self.config.get_max_dte_for(
-            underlying.symbol,
-        )
+        order_records: list[tuple[Contract, LimitOrder, int | None]],
+        timeout: int = TAIL_HARVEST_FILL_TIMEOUT_SECONDS,
+    ) -> bool:
+        if not order_records:
+            return True
 
-        log.notice(
-            f"{underlying.symbol}: Searching option chain for "
-            f"right={right} strike_limit={strike_limit} minimum_price={dfmt(minimum_price(), 3)} "
-            f"fallback_minimum_price={dfmt(fallback_minimum_price() if fallback_minimum_price else 0, 3)} "
-            f"contract_target_dte={contract_target_dte} contract_max_dte={contract_max_dte} "
-            f"contract_target_delta={contract_target_delta}, "
-            "this can take a while...",
-        )
-
-        underlying_ticker = await self.ibkr.get_ticker_for_contract(underlying)
-
-        underlying_price = midpoint_or_market_price(underlying_ticker)
-
-        chains = await self.ibkr.get_chains_for_contract(underlying)
-
-        chain = next(c for c in chains if c.exchange == underlying.exchange)
-
-        def valid_strike(strike: float) -> bool:
-            if right.startswith("P") and strike_limit:
-                return strike <= strike_limit
-            elif right.startswith("P"):
-                return strike <= underlying_price + 0.05 * underlying_price
-            elif right.startswith("C") and strike_limit:
-                return strike >= strike_limit
-            elif right.startswith("C"):
-                return strike >= underlying_price - 0.05 * underlying_price
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + timeout
+        trade_start = len(self.trades.records())
+        self.submit_orders(order_records)
+        trade_indices = list(range(trade_start, len(self.trades.records())))
+        phase_trades = [self.trades.records()[idx] for idx in trade_indices]
+        if len(phase_trades) != len(order_records):
+            await self._cancel_incomplete_trades(phase_trades)
+            log.error("Unable to submit every tail-harvest order; aborting safely.")
             return False
 
-        chain_expirations = self.config.option_chains.expirations
-        min_dte = (
-            option_dte(exclude_expirations_before) if exclude_expirations_before else 0
-        )
-        strikes = sorted(strike for strike in chain.strikes if valid_strike(strike))
-        expirations = sorted(
-            exp
-            for exp in chain.expirations
-            if option_dte(exp) >= contract_target_dte
-            and option_dte(exp) >= min_dte
-            and (not contract_max_dte or option_dte(exp) <= contract_max_dte)
-        )[:chain_expirations]
-        if len(expirations) < 1:
-            raise NoValidContractsError(
-                f"No valid contract expirations found for {underlying.symbol}. Continuing anyway...",
-            )
-        rights = [right]
-
-        def nearest_strikes(strikes: List[float]) -> List[float]:
-            chain_strikes = self.config.option_chains.strikes
-            if right.startswith("P"):
-                return strikes[-chain_strikes:]
-            return strikes[:chain_strikes]
-
-        strikes = nearest_strikes(strikes)
-        if len(strikes) < 1:
-            raise NoValidContractsError(
-                f"No valid contract strikes found for {underlying.symbol}. Continuing anyway...",
-            )
-        log.info(
-            f"{underlying.symbol}: Scanning between strikes {strikes[0]} and {strikes[-1]},"
-            f" from expirations {expirations[0]} to {expirations[-1]}"
-        )
-
-        contracts = [
-            Option(
-                underlying.symbol,
-                expiration,
-                strike,
-                right,
-                self.get_order_exchange(),
-                # tradingClass=chain.tradingClass,
-            )
-            for right in rights
-            for expiration in expirations
-            for strike in strikes
-        ]
-
-        contracts = await self.ibkr.qualify_contracts(*contracts)
-
-        # Filter out None values
-        contracts = [c for c in contracts if c is not None]
-
-        # exclude strike, but only for the first exp
-        if exclude_exp_strike:
-            contracts = [
-                c
-                for c in contracts
-                if (
-                    c.lastTradeDateOrContractMonth != exclude_exp_strike[1]
-                    or c.strike != exclude_exp_strike[0]
-                )
-            ]
-
-        tickers = await self.ibkr.get_tickers_for_contracts(
-            underlying.symbol,
-            contracts,
-            generic_tick_list="101",
-            required_fields=[],
-            optional_fields=[
-                TickerField.MARKET_PRICE,
-                TickerField.GREEKS,
-                TickerField.OPEN_INTEREST,
-                TickerField.MIDPOINT,
-            ],
-        )
-
-        def open_interest_is_valid(ticker: Ticker, minimum_open_interest: int) -> bool:
-            # The open interest value is never present when using historical
-            # data, so just ignore it when the value is None
-            if right.startswith("P"):
-                return ticker.putOpenInterest >= minimum_open_interest
-            if right.startswith("C"):
-                return ticker.callOpenInterest >= minimum_open_interest
+        remaining = deadline - loop.time()
+        if remaining <= 0:
+            await self._cancel_incomplete_trades(phase_trades)
+            log.error("Tail-harvest fill deadline expired; aborting safely.")
             return False
-
-        def delta_is_valid(ticker: Ticker) -> bool:
-            return (
-                ticker.modelGreeks is not None
-                and ticker.modelGreeks
-                and ticker.modelGreeks.delta is not None
-                and not util.isNan(ticker.modelGreeks.delta)
-                and abs(ticker.modelGreeks.delta) <= contract_target_delta
+        submit_timeout = max(1, math.ceil(min(60.0, remaining)))
+        try:
+            await self.ibkr.wait_for_submitting_orders(
+                phase_trades,
+                submit_timeout,
             )
-
-        def price_is_valid(ticker: Ticker) -> bool:
-            def cost_doesnt_exceed_market_price(ticker: Ticker) -> bool:
-                # when writing puts, we need to be sure that the strike +
-                # credit is less than or equal to the current market price, so
-                # that we don't exceed the target capital allocation for this
-                # position
-                return (
-                    right.startswith("C")
-                    or isinstance(ticker.contract, Option)
-                    and ticker.contract.strike
-                    <= midpoint_or_market_price(ticker) + underlying_price
-                )
-
-            return midpoint_or_market_price(
-                ticker
-            ) > minimum_price() and cost_doesnt_exceed_market_price(ticker)
-
-        # Filter out invalid price
-        tickers = [
-            ticker
-            for ticker in log.track(
-                tickers,
-                description=f"{underlying.symbol}: Filtering invalid prices...",
-                total=len(tickers),
-            )
-            if price_is_valid(ticker)
-        ]
-
-        # Filter out invalid greeks
-        new_tickers = []
-        delta_reject_tickers = []
-        for ticker in log.track(
-            tickers,
-            description=f"{underlying.symbol}: Filtering invalid deltas...",
-            total=len(tickers),
-        ):
-            if delta_is_valid(ticker):
-                new_tickers.append(ticker)
-            else:
-                delta_reject_tickers.append(ticker)
-        tickers = new_tickers
-
-        def filter_remaining_tickers(
-            tickers: List[Ticker], delta_ord_desc: bool
-        ) -> List[Ticker]:
-            minimum_open_interest = self.config.target.minimum_open_interest
-
-            if minimum_open_interest > 0:
-                tickers = [
-                    ticker
-                    for ticker in log.track(
-                        tickers,
-                        description=f"{underlying.symbol}: Filtering by open interest with delta_ord_desc={delta_ord_desc}...",
-                        total=len(tickers),
-                    )
-                    if open_interest_is_valid(ticker, minimum_open_interest)
-                ]
-
-            # Sort by delta first, then expiry date
-            tickers = sorted(
-                sorted(
-                    tickers,
-                    key=lambda t: (
-                        abs(t.modelGreeks.delta)
-                        if t.modelGreeks and t.modelGreeks.delta
-                        else 0
-                    ),
-                    reverse=delta_ord_desc,
-                ),
-                key=lambda t: (
-                    option_dte(t.contract.lastTradeDateOrContractMonth)
-                    if t.contract
-                    else 0
-                ),
-            )
-
-            return tickers
-
-        tickers = filter_remaining_tickers(list(tickers), True)
-
-        the_chosen_ticker = None
-
-        if len(tickers) == 0:
-            if not math.isclose(minimum_price(), 0.0):
-                # if we arrive here, it means that 1) we expect to roll for a
-                # credit only, but 2) we didn't find any suitable contracts,
-                # most likely because we can't roll out and up/down to the
-                # target delta
-                #
-                # because of this, we'll allow rolling to a less-than-optimal
-                # strike, provided it's still a credit
-                tickers = filter_remaining_tickers(list(delta_reject_tickers), False)
-            if len(tickers) < 1:
-                # if there are _still_ no tickers remaining, there's nothing
-                # more we can do
-                raise NoValidContractsError(
-                    f"No valid contracts found for {underlying.symbol}. Continuing anyway...",
-                )
-        elif fallback_minimum_price is not None:
-            # if there's a fallback minimum price specified, try to find
-            # contracts that are at least that price first
-            for ticker in tickers:
-                if midpoint_or_market_price(ticker) > fallback_minimum_price():
-                    the_chosen_ticker = ticker
-                    break
-            if the_chosen_ticker is None:
-                # uh of, if we make it here then all of these options are
-                # net debits, so let's at least choose the ticker that will
-                # result in the smallest debit (i.e., minimize the max loss)
-                tickers = sorted(tickers, key=midpoint_or_market_price, reverse=True)
-
-        if the_chosen_ticker is None:
-            # fall back to the first suitable result
-            the_chosen_ticker = tickers[0]
-
-        if not the_chosen_ticker or not the_chosen_ticker.contract:
-            raise RuntimeError(
-                f"{underlying.symbol}: Something went wrong, the_chosen_ticker={the_chosen_ticker}"
-            )
-
-        log.notice(
-            f"{underlying.symbol}: Found suitable contract at "
-            f"strike={the_chosen_ticker.contract.strike} "
-            f"dte={option_dte(the_chosen_ticker.contract.lastTradeDateOrContractMonth)} "
-            f"price={dfmt(midpoint_or_market_price(the_chosen_ticker), 3)}"
-        )
-
-        return the_chosen_ticker
-
-    def get_algo_strategy(self) -> str:
-        return self.config.orders.algo.strategy
-
-    def algo_params_from(self, params: List[List[str]]) -> List[TagValue]:
-        from ib_async import TagValue
-
-        return [TagValue(p[0], p[1]) for p in params]
-
-    def get_algo_params(self) -> List[TagValue]:
-        return self.algo_params_from(self.config.orders.algo.params)
-
-    def get_order_exchange(self) -> str:
-        return self.config.orders.exchange
-
-    def round_vix_price(self, price: float) -> float:
-        """
-        Rounds a VIX price according to contract specifications:
-        - For prices below $3: round to nearest $0.01
-        - For prices $3 and above: round to nearest $0.05
-        """
-        if price >= 3.0:
-            return round(price * 20) / 20  # Round to nearest $0.05
-        else:
-            return round(price * 100) / 100  # Round to nearest $0.01
-
-    async def do_vix_hedging(
-        self,
-        account_summary: Dict[str, AccountValue],
-        portfolio_positions: Dict[str, List[PortfolioItem]],
-    ) -> None:
-        log.notice("VIX: Checking on our VIX call hedge...")
-
-        async def inner_handler() -> None:
-            if not self.config.vix_call_hedge.enabled:
-                log.warning("🛑 VIX call hedging not enabled, skipping...")
-                return None
-
-            async def vix_calls_should_be_closed() -> tuple[
-                bool, Optional[Ticker], Optional[float]
-            ]:
-                if self.config.vix_call_hedge.close_hedges_when_vix_exceeds:
-                    vix_contract = Index("VIX", "CBOE", "USD")
-                    vix_ticker = await self.ibkr.get_ticker_for_contract(vix_contract)
-                    close_hedges_when_vix_exceeds = (
-                        self.config.vix_call_hedge.close_hedges_when_vix_exceeds
-                    )
-                    if vix_ticker.marketPrice() > close_hedges_when_vix_exceeds:
-                        return (True, vix_ticker, close_hedges_when_vix_exceeds)
-                    return (False, vix_ticker, close_hedges_when_vix_exceeds)
-                return (False, None, None)
-
-            ignore_dte = self.config.vix_call_hedge.ignore_dte
-
-            net_vix_call_count = net_option_positions(
-                "VIX", portfolio_positions, "C", ignore_dte=ignore_dte
-            )
-            if net_vix_call_count > 0:
-                log.info(
-                    f"[bold blue_violet]VIX: net_vix_call_count={net_vix_call_count} "
-                    f"(DTE <= {ignore_dte} contracts ignored), "
-                    "checking if we need to close positions...",
-                )
-                (
-                    close_vix_calls,
-                    vix_ticker,
-                    close_hedges_when_vix_exceeds,
-                ) = await vix_calls_should_be_closed()
-                if close_vix_calls and vix_ticker and close_hedges_when_vix_exceeds:
-                    log.info(
-                        f"VIX: VIX={vix_ticker.marketPrice():.2f}, which exceeds "
-                        f"vix_call_hedge.close_hedges_when_vix_exceeds={close_hedges_when_vix_exceeds}, "
-                        "checking if we need to close positions...",
-                    )
-                    for position in portfolio_positions["VIX"]:
-                        if (
-                            position.contract.right.startswith("C")
-                            and position.position < 0
-                        ):
-                            # only applies to long calls
-                            continue
-                        log.notice(
-                            f"Creating closing order for {position.contract.localSymbol}..."
-                        )
-                        position.contract.exchange = self.get_order_exchange()
-                        sell_ticker = await self.ibkr.get_ticker_for_contract(
-                            position.contract
-                        )
-                        price = round(get_lower_price(sell_ticker), 2)
-                        # Round VIX price according to contract specifications
-                        price = self.round_vix_price(price)
-                        qty = abs(position.position)
-                        order = LimitOrder(
-                            "SELL",
-                            qty,
-                            price,
-                            algoStrategy=self.get_algo_strategy(),
-                            algoParams=self.get_algo_params(),
-                            tif="DAY",
-                            account=self.account_number,
-                        )
-
-                        self.enqueue_order(sell_ticker.contract, order)
-
-                log.info(
-                    f"VIX: net_vix_call_count={net_vix_call_count}, no action is needed at this time",
-                )
-                return
-
-            log.info(
-                f"VIX: net_vix_call_count={net_vix_call_count}, checking if we should open new positions...",
-            )
-
-            (
-                close_vix_calls,
-                vix_ticker,
-                close_hedges_when_vix_exceeds,
-            ) = await vix_calls_should_be_closed()
-            # we never want to write calls if we're simultaneously ready to close calls
-            if not close_vix_calls:
-                try:
-                    vixmo_contract = Index("VIXMO", "CBOE", "USD")
-                    vixmo_ticker = await self.ibkr.get_ticker_for_contract(
-                        vixmo_contract
-                    )
-
-                    weight = 0.0
-
-                    for allocation in self.config.vix_call_hedge.allocation:
-                        if (
-                            allocation.lower_bound
-                            and allocation.upper_bound
-                            and allocation.lower_bound
-                            <= vixmo_ticker.marketPrice()
-                            < allocation.upper_bound
-                        ):
-                            weight = allocation.weight
-                            break
-                        elif (
-                            allocation.lower_bound
-                            and allocation.lower_bound <= vixmo_ticker.marketPrice()
-                        ):
-                            weight = allocation.weight
-                            break
-                        elif (
-                            allocation.upper_bound
-                            and vixmo_ticker.marketPrice() < allocation.upper_bound
-                        ):
-                            weight = allocation.weight
-                            break
-
-                    log.info(
-                        f"VIX: VIXMO={vixmo_ticker.marketPrice():.2f}, target call hedge weight={weight}",
-                    )
-
-                    allocation_amount = (
-                        float(account_summary["NetLiquidation"].value) * weight
-                    )
-                    delta = self.config.vix_call_hedge.delta
-                    target_dte = self.config.vix_call_hedge.target_dte
-                    if weight > 0:
-                        log.notice(
-                            f"VIX: Current VIXMO spot price prescribes an allocation of up to "
-                            f"${allocation_amount:.2f} for purchasing VIX calls, "
-                            f"at or above delta={delta} with a DTE >= {target_dte}",
-                        )
-                    else:
-                        log.info(
-                            "VIX: Based on current VIXMO value and rules, no action is needed",
-                        )
-                        return
-
-                    log.info(
-                        "VIX: Scanning option chain for eligible contracts...",
-                    )
-                    vix_contract = Index("VIX", "CBOE", "USD")
-                    buy_ticker = await self.find_eligible_contracts(
-                        vix_contract,
-                        "C",
-                        0,
-                        target_delta=delta,
-                        target_dte=target_dte,
-                        minimum_price=lambda: self.config.orders.minimum_credit,
-                    )
-                    if not isinstance(buy_ticker.contract, Option):
-                        raise RuntimeError(
-                            f"Something went wrong, buy_ticker={buy_ticker}"
-                        )
-                    price = round(get_lower_price(buy_ticker), 2)
-                    # Round VIX price according to contract specifications
-                    price = self.round_vix_price(price)
-                    qty = math.floor(
-                        allocation_amount
-                        / price
-                        / float(buy_ticker.contract.multiplier)
-                    )
-
-                    order = LimitOrder(
-                        "BUY",
-                        qty,
-                        price,
-                        algoStrategy=self.get_algo_strategy(),
-                        algoParams=self.get_algo_params(),
-                        tif="DAY",
-                        account=self.account_number,
-                        transmit=True,
-                    )
-
-                    self.enqueue_order(buy_ticker.contract, order)
-                except (RuntimeError, NoValidContractsError):
-                    log.error(
-                        "VIX: Error occurred when VIX call hedging. Continuing anyway..."
-                    )
-
-        await inner_handler()
-
-    def calc_pending_cash_balance(self) -> float:
-        def get_multiplier(contract: Contract) -> float:
-            if contract.secType == "BAG":
-                # with combos/bag orders we'll use the _first_ multiplier, for
-                # simplicity, because we only create combos with equal legs
-                return float(
-                    self.qualified_contracts[contract.comboLegs[0].conId].multiplier
-                )
-            return float(contract.multiplier)
-
-        return sum(
-            [
-                order.lmtPrice * order.totalQuantity * get_multiplier(contract)
-                for (contract, order) in self.orders.records()
-                if order.action == "SELL"
-            ]
-        ) - sum(
-            [
-                order.lmtPrice * order.totalQuantity * get_multiplier(contract)
-                for (contract, order) in self.orders.records()
-                if order.action == "BUY"
-            ]
-        )
-
-    async def do_cashman(
-        self,
-        account_summary: Dict[str, AccountValue],
-        portfolio_positions: Dict[str, List[PortfolioItem]],
-    ) -> None:
-        log.notice("Cash management...")
-
-        async def inner_handler() -> None:
-            if not self.config.cash_management.enabled:
-                log.warning(
-                    "🛑 Cash management not enabled, skipping",
-                )
-                return None
-
-            target_cash_balance = self.config.cash_management.target_cash_balance
-            buy_threshold = self.config.cash_management.buy_threshold
-            sell_threshold = self.config.cash_management.sell_threshold
-            cash_balance = math.floor(float(account_summary["TotalCashValue"].value))
-            pending_balance = self.calc_pending_cash_balance()
-
-            try:
-
-                async def make_order() -> tuple[Optional[Ticker], Optional[LimitOrder]]:
-                    symbol = self.config.cash_management.cash_fund
-                    primary_exchange = self.config.cash_management.primary_exchange
-                    order_exchange = self.config.cash_management.orders.exchange
-
-                    ticker = await self.ibkr.get_ticker_for_stock(
-                        symbol, primary_exchange, order_exchange
-                    )
-
-                    algo = (
-                        self.config.cash_management.orders.algo
-                        if self.config.cash_management.orders
-                        else self.config.orders.algo
-                    )
-
-                    amount = cash_balance + pending_balance - target_cash_balance
-                    price = ticker.ask if amount > 0 else ticker.bid
-                    qty = amount // price
-
-                    if util.isNan(qty):
-                        raise RuntimeError("ERROR: qty is NaN")
-
-                    if qty > 0:
-                        log.notice(
-                            f"cash_balance={dfmt(cash_balance)} which exceeds "
-                            f"(target_cash_balance + pending_balance + buy_threshold)="
-                            f"{(dfmt(target_cash_balance + pending_balance + buy_threshold))} "
-                            f"with pending_balance={dfmt(pending_balance)}"
-                        )
-                        log.notice(
-                            f"Will buy {symbol} with qty={qty} shares at price={price}"
-                        )
-
-                    # make sure qty does not exceed balance if it's a negative value
-                    if qty < 0:
-                        # subtract 1 to keep cash balance above target
-                        qty -= 1
-                        log.notice(
-                            f"(cash_balance + pending_balance)={dfmt(cash_balance + pending_balance)} which is less than "
-                            f"(target_cash_balance + pending_balance - sell_threshold)="
-                            f"{(dfmt(target_cash_balance - sell_threshold))} "
-                            f"with pending_balance={dfmt(pending_balance)}"
-                        )
-                        if symbol not in portfolio_positions:
-                            # we don't have any positions to sell
-                            # we don't have any positions to sell
-                            log.warning(
-                                f"Will sell {symbol} with qty={-qty} at"
-                                f" price={price}, but we have no position to sell"
-                            )
-                            return (None, None)
-                        positions = [
-                            p.position
-                            for p in portfolio_positions[symbol]
-                            if isinstance(p.contract, Stock)
-                        ]
-                        position = positions[0] if len(positions) > 0 else 0
-                        qty = min([max([-math.floor(position), qty]), 0])
-                        # if for some reason the qty is zero, do nothing
-                        if qty == 0:
-                            log.warning(
-                                f"Will sell {symbol} with qty={-qty} at price={price}, but we don't have any shares to sell"
-                            )
-                            return (None, None)
-                        log.notice(
-                            f"Will sell {symbol} with qty={-qty} at price={price}"
-                        )
-
-                    order = LimitOrder(
-                        "BUY" if qty > 0 else "SELL",
-                        abs(qty),
-                        round(price, 2),
-                        algoStrategy=algo.strategy,
-                        algoParams=self.algo_params_from(algo.params),
-                        tif="DAY",
-                        account=self.account_number,
-                        transmit=True,
-                    )
-
-                    return (ticker, order)
-
-                if (
-                    cash_balance + pending_balance > target_cash_balance + buy_threshold
-                    or cash_balance + pending_balance
-                    < target_cash_balance - sell_threshold
-                ):
-                    (ticker, order) = await make_order()
-                    if ticker and ticker.contract and order:
-                        self.enqueue_order(ticker.contract, order)
-                else:
-                    log.notice(
-                        "All good, nothing to do here. "
-                        f"cash_balance={dfmt(cash_balance)} pending_balance={dfmt(pending_balance)}"
-                    )
-
-            except RuntimeError:
-                log.error("Error occurred when cash hedging. Continuing anyway...")
-
-        await inner_handler()
-
-    def enqueue_order(self, contract: Optional[Contract], order: LimitOrder) -> None:
-        if not contract:
-            return
-        self.orders.add_order(contract, order)
-
-    def submit_orders(self) -> None:
-        for contract, order in self.orders.records():
-            self.trades.submit_order(contract, order)
-        self.trades.print_summary()
-
-    async def adjust_prices(self) -> None:
-        if (
-            all(
-                [
-                    not self.config.symbols[symbol].adjust_price_after_delay
-                    for symbol in self.config.symbols
-                ]
-            )
-            or self.trades.is_empty()
-        ):
-            log.warning("Skipping order price adjustments...")
-            return
+        except RuntimeError as exc:
+            await self._cancel_incomplete_trades(phase_trades)
+            log.error(f"Tail-harvest submission did not settle: {exc}")
+            return False
 
         delay = random.randrange(
-            self.config.orders.price_update_delay[0],
-            self.config.orders.price_update_delay[1],
+            self.config.runtime.orders.price_update_delay[0],
+            self.config.runtime.orders.price_update_delay[1],
+        )
+        remaining = deadline - loop.time()
+        if remaining <= 0:
+            await self._cancel_incomplete_trades(phase_trades)
+            log.error("Tail-harvest fill deadline expired; aborting safely.")
+            return False
+        first_wait = max(1, math.ceil(min(float(delay), remaining)))
+        incomplete = await self.ibkr.wait_for_orders_complete(
+            phase_trades,
+            first_wait,
         )
 
-        await self.ibkr.wait_for_orders_complete(self.trades.records(), delay)
+        if incomplete and loop.time() < deadline:
+            incomplete_ids = {id(trade) for trade in incomplete}
+            for idx in trade_indices:
+                trade = self.trades.records()[idx]
+                if id(trade) in incomplete_ids:
+                    remaining = deadline - loop.time()
+                    if remaining <= 0:
+                        break
+                    await self._reprice_trade(idx, trade, timeout=remaining)
 
-        unfilled = [
-            (idx, trade)
-            for idx, trade in enumerate(self.trades.records())
-            if trade
-            and trade.contract.symbol in self.config.symbols
-            and self.config.symbols[trade.contract.symbol].adjust_price_after_delay
-            and not trade.isDone()
+        phase_trades = [self.trades.records()[idx] for idx in trade_indices]
+        incomplete = [
+            trade for trade in phase_trades if not self._trade_fully_filled(trade)
         ]
+        remaining = deadline - loop.time()
+        if incomplete and remaining > 0:
+            await self.ibkr.wait_for_orders_complete(
+                incomplete,
+                max(1, math.ceil(remaining)),
+            )
 
-        for idx, trade in unfilled:
-            try:
-                ticker = await self.ibkr.get_ticker_for_contract(
-                    trade.contract,
-                    required_fields=[TickerField.MIDPOINT],
-                    optional_fields=[TickerField.MARKET_PRICE],
+        phase_trades = [self.trades.records()[idx] for idx in trade_indices]
+        if all(self._trade_fully_filled(trade) for trade in phase_trades):
+            log.notice("Tail-harvest orders filled; recalculating regime rebalance.")
+            return True
+
+        await self._cancel_incomplete_trades(phase_trades)
+        log.error(
+            f"Tail-harvest orders did not fully fill within {timeout} seconds; "
+            "aborting remaining stages safely."
+        )
+        return False
+
+    def submit_orders(
+        self,
+        order_records: list[tuple[Contract, LimitOrder, int | None]] | None = None,
+    ) -> None:
+        open_trades = self.ibkr.open_trades()
+        commitments = self._working_option_commitments(open_trades)
+        working_option_con_ids = {con_id for con_id, _action in commitments}
+        working_tail_entry_con_ids = {
+            int(trade.contract.conId)
+            for trade in open_trades
+            if not trade.isDone()
+            and getattr(getattr(trade, "order", None), "account", None)
+            == self.account_number
+            and getattr(getattr(trade, "order", None), "orderRef", None)
+            == TAIL_HEDGE_ENTRY_ORDER_REF
+            and str(getattr(getattr(trade, "order", None), "action", "")).upper()
+            == "BUY"
+            and getattr(getattr(trade, "contract", None), "secType", None) == "OPT"
+            and type(getattr(trade.contract, "conId", None)) is int
+            and trade.contract.conId > 0
+        }
+        queued_records = self.orders.records()
+        if order_records is None:
+            order_records = queued_records
+        working_stock_symbols = working_stock_order_symbols(
+            open_trades,
+            self.account_number,
+        )
+        working_stock_symbols |= {
+            contract.symbol
+            for contract, order, _intent_id in queued_records
+            if isinstance(contract, Stock)
+            and getattr(order, "account", None) == self.account_number
+            and str(getattr(order, "action", "")).upper() in {"BUY", "SELL"}
+        }
+        submitted_tail_sells: set[int] = set()
+        submitted_tail_entries: set[int] = set()
+        for contract, order, intent_id in order_records:
+            order_ref = getattr(order, "orderRef", None)
+            submitted_order = order
+            reduction_con_id: int | None = None
+
+            if order_ref == TAIL_HEDGE_ENTRY_ORDER_REF:
+                entry_con_id = getattr(contract, "conId", 0)
+                entry_submitted_this_batch = (
+                    type(entry_con_id) is int and entry_con_id in submitted_tail_entries
                 )
-
-                (contract, order) = (trade.contract, trade.order)
-                updated_price = np.sign(order.lmtPrice) * max(
-                    [
-                        (
-                            self.config.orders.minimum_credit
-                            if order.action == "BUY" and order.lmtPrice <= 0.0
-                            else 0.0
-                        ),
-                        math.fabs(round((order.lmtPrice + ticker.midpoint()) / 2.0, 2)),
-                    ]
+                entry_owned_by_working_order = (
+                    type(entry_con_id) is int
+                    and entry_con_id in working_tail_entry_con_ids
                 )
-
-                if trade.contract.symbol == "VIX":
-                    # Round VIX prices according to contract specifications
-                    updated_price = self.round_vix_price(updated_price)
-
-                # We only want to tighten spreads, not widen them. If the
-                # resulting price change would increase the spread, we'll
-                # skip it.
-                if would_increase_spread(order, updated_price):
+                entry_is_valid = not (
+                    getattr(order, "account", None) != self.account_number
+                    or str(getattr(order, "action", "")).upper() != "BUY"
+                    or getattr(contract, "secType", None) != "OPT"
+                    or type(entry_con_id) is not int
+                    or entry_con_id <= 0
+                )
+                entry_is_occupied = entry_is_valid and (
+                    entry_con_id in working_option_con_ids
+                    or entry_submitted_this_batch
+                    or self._has_live_contract(entry_con_id)
+                )
+                if (
+                    not entry_is_valid
+                    or not self._has_live_stock(contract.symbol)
+                    or contract.symbol in working_stock_symbols
+                    or entry_is_occupied
+                ):
+                    reason = (
+                        "selected put contract is already occupied"
+                        if entry_is_occupied
+                        else "live underlying ownership is unstable"
+                    )
                     log.warning(
-                        f"Skipping order for {contract.symbol}"
-                        f" with old lmtPrice={dfmt(order.lmtPrice)} updated lmtPrice={dfmt(updated_price)}, because updated price would increase spread"
+                        f"{contract.symbol}: Skipping tail entry because {reason}."
                     )
-                    return
+                    # A same-batch duplicate or matching working entry shares
+                    # this reservation with an order that may already be live.
+                    # Every other skipped intent must release it so later
+                    # reconciliation cannot adopt a foreign position.
+                    if (
+                        type(entry_con_id) is int
+                        and entry_con_id > 0
+                        and not entry_submitted_this_batch
+                        and not entry_owned_by_working_order
+                    ):
+                        self._release_tail_entry_submission(entry_con_id)
+                    continue
 
-                # Check if the updated price is actually any different
-                # before proceeding, and make sure the signs match so we
-                # don't switch a credit to a debit or vice versa.
-                if order.lmtPrice != updated_price and np.sign(
-                    order.lmtPrice
-                ) == np.sign(updated_price):
-                    log.info(
-                        f"{contract.symbol}: Resubmitting {order.action} {contract.secType} order with old lmtPrice={dfmt(order.lmtPrice)} updated lmtPrice={dfmt(updated_price)}"
-                    )
-
-                    # For some reason, we need to create a new order object
-                    # and populate the fields rather than modifying the
-                    # existing order in-place (janky).
-                    order = LimitOrder(
-                        order.action,
-                        order.totalQuantity,
-                        float(updated_price),
-                        orderId=order.orderId,
-                        algoStrategy=order.algoStrategy,
-                        algoParams=order.algoParams,
-                    )
-
-                    # resubmit the order and it will be placed back to the
-                    # original position in the queue
-                    self.trades.submit_order(contract, order, idx)
-
-                    log.info(f"{contract.symbol}: Order updated, order={order}")
-            except (RuntimeError, RequiredFieldValidationError):
-                log.error(
-                    f"Couldn't generate midpoint price for {trade.contract}, skipping"
+            if is_tail_reduction_ref(order_ref):
+                con_id = getattr(contract, "conId", 0)
+                action = str(getattr(order, "action", "")).upper()
+                try:
+                    requested = float(order.totalQuantity)
+                except (TypeError, ValueError):
+                    requested = 0.0
+                valid_reduction = not (
+                    getattr(order, "account", None) != self.account_number
+                    or getattr(contract, "secType", None) != "OPT"
+                    or type(con_id) is not int
+                    or con_id <= 0
+                    or action not in {"BUY", "SELL"}
+                    or (order_ref != TAIL_HEDGE_CLOSE_ORDER_REF and action != "SELL")
+                    or not math.isfinite(requested)
+                    or requested <= 0
+                    or not requested.is_integer()
                 )
-                continue
+                live_capacity = 0
+                if not valid_reduction:
+                    capacity = 0
+                else:
+                    live_position = self._live_position(con_id)
+                    closable = live_position if action == "SELL" else -live_position
+                    live_capacity = max(0, math.floor(closable))
+                    capacity = max(
+                        0,
+                        live_capacity - commitments[(con_id, action)],
+                    )
+                if action == "SELL" and con_id in submitted_tail_sells:
+                    log.warning(
+                        f"{contract.symbol}: Skipping duplicate tail reduction."
+                    )
+                    continue
+                if capacity == 0:
+                    if valid_reduction and action == "SELL" and live_capacity == 0:
+                        self._update_tail_recovery_submission(con_id, None)
+                    log.warning(
+                        f"{contract.symbol}: Skipping tail close with no live capacity."
+                    )
+                    continue
+                quantity = min(int(requested), capacity)
+                if quantity != int(requested):
+                    submitted_order = copy.deepcopy(order)
+                    submitted_order.totalQuantity = quantity
+                    log.warning(
+                        f"{contract.symbol}: Resizing tail close to {quantity} contract(s)."
+                    )
+                if action == "SELL":
+                    if not self._update_tail_recovery_submission(
+                        con_id,
+                        quantity,
+                        live_quantity=math.floor(live_position),
+                    ):
+                        log.error(
+                            f"{contract.symbol}: Skipping tail reduction without "
+                            "synchronized durable state."
+                        )
+                        continue
+                    reduction_con_id = con_id
+
+            submitted = self.trades.submit_order(
+                contract,
+                submitted_order,
+                intent_id=intent_id,
+            )
+
+            if not submitted and reduction_con_id is not None:
+                self._update_tail_recovery_submission(reduction_con_id, None)
+
+            if submitted and is_tail_reduction_ref(order_ref):
+                key = (int(contract.conId), str(submitted_order.action).upper())
+                commitments[key] += int(float(submitted_order.totalQuantity))
+                if reduction_con_id is not None:
+                    submitted_tail_sells.add(reduction_con_id)
+            elif submitted and order_ref == TAIL_HEDGE_ENTRY_ORDER_REF:
+                submitted_tail_entries.add(int(contract.conId))
+        self.trades.print_summary()
+
+    async def _reprice_trade(
+        self,
+        idx: int,
+        trade: Any,
+        *,
+        timeout: float | None = None,
+    ) -> bool:
+        return await self.execution_manager.reprice_trade(
+            self.trades,
+            idx,
+            trade,
+            timeout=timeout,
+        )
+
+    async def adjust_prices(self) -> None:
+        await self.execution_manager.execute(self.trades)
 
     async def get_write_threshold(
         self, ticker: Ticker, right: str
@@ -2244,7 +1437,8 @@ class PortfolioManager:
         )
         if threshold_sigma:
             hist_prices = await self.ibkr.request_historical_data(
-                ticker.contract, self.config.constants.daily_stddev_window
+                ticker.contract,
+                self.config.strategies.wheel.defaults.constants.daily_stddev_window,
             )
             log_prices = np.log(np.array([p.close for p in hist_prices]))
             stddev = np.std(np.diff(log_prices), ddof=1)
@@ -2253,9 +1447,9 @@ class PortfolioManager:
                 close_price * (np.exp(stddev) - 1).astype(float) * threshold_sigma,
                 absolute_daily_change,
             )
-        else:
-            threshold_perc = self.config.get_write_threshold_perc(
-                ticker.contract.symbol,
-                right,
-            )
-            return (threshold_perc * close_price, absolute_daily_change)
+
+        threshold_perc = self.config.get_write_threshold_perc(
+            ticker.contract.symbol,
+            right,
+        )
+        return (threshold_perc * close_price, absolute_daily_change)

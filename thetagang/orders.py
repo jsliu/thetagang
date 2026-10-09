@@ -1,4 +1,4 @@
-from typing import List, Tuple
+from collections.abc import Iterable
 
 from ib_async import Contract, LimitOrder
 from rich import box
@@ -6,18 +6,53 @@ from rich.pretty import Pretty
 from rich.table import Table
 
 from thetagang import log
+from thetagang.accounting import (
+    PendingBuyCash,
+    PendingOrderCash,
+    order_cash_notional,
+    pending_buy_cash,
+    pending_order_cash,
+    queued_buy_cash,
+    queued_order_cash,
+    working_buy_cash,
+    working_order_cash,
+)
 from thetagang.fmt import dfmt, ifmt
+
+__all__ = [
+    "Orders",
+    "PendingBuyCash",
+    "PendingOrderCash",
+    "order_cash_notional",
+    "pending_buy_cash",
+    "pending_order_cash",
+    "queued_buy_cash",
+    "queued_order_cash",
+    "working_buy_cash",
+    "working_order_cash",
+]
 
 
 class Orders:
     def __init__(self) -> None:
-        self.__records: List[Tuple[Contract, LimitOrder]] = []
+        self.__records: list[tuple[Contract, LimitOrder, int | None]] = []
 
-    def add_order(self, contract: Contract, order: LimitOrder) -> None:
-        self.__records.append((contract, order))
+    def add_order(
+        self, contract: Contract, order: LimitOrder, intent_id: int | None
+    ) -> None:
+        self.__records.append((contract, order, intent_id))
 
-    def records(self) -> List[Tuple[Contract, LimitOrder]]:
+    def records(self) -> list[tuple[Contract, LimitOrder, int | None]]:
         return self.__records
+
+    def remove_records(
+        self,
+        records: Iterable[tuple[Contract, LimitOrder, int | None]],
+    ) -> None:
+        record_ids = {id(record) for record in records}
+        self.__records[:] = [
+            record for record in self.__records if id(record) not in record_ids
+        ]
 
     def print_summary(self) -> None:
         if not self.__records:
@@ -33,13 +68,13 @@ class Orders:
         table.add_column("Price")
         table.add_column("Qty")
 
-        for contract, order in self.__records:
+        for contract, order, _intent_id in self.__records:
             table.add_row(
                 contract.symbol,
                 contract.exchange,
                 Pretty(contract, indent_size=2),
                 order.action,
-                dfmt(order.lmtPrice),
+                dfmt(float(order.lmtPrice) if order.lmtPrice is not None else None),
                 ifmt(int(order.totalQuantity)),
             )
 

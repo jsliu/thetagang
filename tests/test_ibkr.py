@@ -1,0 +1,836 @@
+import asyncio
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
+
+import pytest
+from ib_async import (
+    IB,
+    AccountValue,
+    Contract,
+    Index,
+    Order,
+    OrderStatus,
+    Stock,
+    Ticker,
+    Trade,
+)
+from ib_async.wrapper import RequestError
+from sqlalchemy import select
+
+from thetagang import log
+from thetagang.db import DataStore, ExecutionRecord
+from thetagang.ibkr import (
+    IBKR,
+    MAX_CONCURRENT_MARKET_DATA_STREAMS,
+    RequiredFieldValidationError,
+    TickerField,
+)
+
+# Mark all tests in this module as asyncio
+pytestmark = pytest.mark.asyncio
+
+
+@pytest.fixture
+def mock_ib(mocker):
+    """Fixture to create a mock IB object."""
+    mock = mocker.Mock(spec=IB)
+    # Add the missing event attribute needed by IBKR.__init__
+    # Make it a simple mock that accepts the += operation.
+    mock.orderStatusEvent = mocker.Mock()
+    mock.orderStatusEvent.__iadd__ = mocker.Mock(
+        return_value=None
+    )  # Allow += operation
+    mock.errorEvent = mocker.Mock()
+    mock.errorEvent.__iadd__ = mocker.Mock(return_value=None)  # Allow += operation
+    mock.execDetailsEvent = mocker.Mock()
+    mock.execDetailsEvent.__iadd__ = mocker.Mock(return_value=None)
+    mock.client = mocker.Mock()
+    mock.wrapper = mocker.Mock()
+    mock.wrapper.accountValues = {}
+    mock.wrapper.trades = {}
+    mock.wrapper.ticker2ReqId = {"mktData": {}}
+    mock.ticker.return_value = None
+    mock.cancelMktData.return_value = True
+    return mock
+
+
+@pytest.fixture
+def ibkr(mock_ib):
+    """Fixture to create an IBKR instance with a mock IB."""
+    return IBKR(ib=mock_ib, api_response_wait_time=1, default_order_exchange="SMART")
+
+
+@pytest.fixture
+def mock_ticker(mocker):
+    """Fixture to create a mock Ticker object."""
+    ticker = mocker.Mock(spec=Ticker)
+    ticker.contract = mocker.Mock(spec=Contract)
+    ticker.contract.localSymbol = "TEST"
+    ticker.contract.symbol = "TEST"
+    return ticker
+
+
+@pytest.fixture
+def mock_trade(mocker):
+    """Fixture to create a mock Trade object."""
+    trade = mocker.Mock(spec=Trade)
+    trade.contract = mocker.Mock(spec=Contract)
+    trade.contract.symbol = "TEST"
+    trade.order = mocker.Mock(spec=Order)
+    trade.order.orderId = 123
+    trade.orderStatus = mocker.Mock(spec=OrderStatus)
+    return trade
+
+
+async def test_get_ticker_for_contract_success(ibkr, mock_ib, mock_ticker, mocker):
+    """Test get_ticker_for_contract when all waits succeed."""
+    mocker.patch.object(
+        ibkr, "__market_data_streaming_handler__", return_value=mock_ticker
+    )
+    # Mock the internal wait methods to return True (success)
+    mocker.patch.object(
+        ibkr, "__ticker_wait_for_condition__", return_value=asyncio.Future()
+    )
+    ibkr.__ticker_wait_for_condition__.return_value.set_result(True)
+
+    contract = Stock("TEST", "SMART", "USD")
+    result = await ibkr.get_ticker_for_contract(
+        contract,
+        required_fields=[TickerField.MARKET_PRICE],
+        optional_fields=[TickerField.MIDPOINT],
+    )
+
+    assert result == mock_ticker
+    # Check that the wait was attempted (indirectly, via the handler logic patch)
+    ibkr.__market_data_streaming_handler__.assert_awaited_once()
+
+
+async def test_cached_net_liquidation_materializes_account_values(ibkr, mock_ib):
+    value = AccountValue("ACC123", "NetLiquidation", "100000", "USD", "")
+    mock_ib.accountValues.return_value = [value]
+
+    assert ibkr.cached_net_liquidation("ACC123") == 100_000.0
+    mock_ib.accountValues.assert_called_once_with("ACC123")
+    mock_ib.accountSummaryAsync.assert_not_called()
+    mock_ib.reqPositionsAsync.assert_not_called()
+
+
+async def test_cached_account_value_prefers_finite_base_value(ibkr, mock_ib):
+    mock_ib.accountValues.return_value = [
+        AccountValue("ACC123", "TotalCashValue", "900", "USD", ""),
+        AccountValue("ACC123", "TotalCashValue", "1000", "BASE", ""),
+        AccountValue("ACC123", "TotalCashValue", "nan", "BASE", ""),
+    ]
+
+    assert ibkr.cached_account_value("ACC123", "TotalCashValue") == 1000.0
+    mock_ib.accountValues.assert_called_once_with("ACC123")
+    mock_ib.accountSummaryAsync.assert_not_called()
+
+
+async def test_refresh_account_restarts_full_snapshot_subscription(ibkr, mock_ib):
+    mock_ib.reqAccountUpdatesAsync = AsyncMock()
+    mock_ib.accountValues.return_value = []
+
+    await ibkr.refresh_account("ACC123")
+
+    mock_ib.client.reqAccountUpdates.assert_called_once_with(False, "ACC123")
+    mock_ib.reqAccountUpdatesAsync.assert_awaited_once_with("ACC123")
+
+
+async def test_refresh_account_rejects_not_ready_snapshot(ibkr, mock_ib):
+    mock_ib.reqAccountUpdatesAsync = AsyncMock()
+    mock_ib.accountValues.return_value = [
+        AccountValue("ACC123", "AccountReady", "false", "", "")
+    ]
+
+    with pytest.raises(RuntimeError, match="not ready"):
+        await ibkr.refresh_account("ACC123")
+
+
+async def test_cached_account_value_prefers_empty_model_base_aggregate(ibkr, mock_ib):
+    mock_ib.accountValues.return_value = [
+        AccountValue("ACC123", "TotalCashValue", "400", "BASE", "growth"),
+        AccountValue("ACC123", "TotalCashValue", "1000", "BASE", ""),
+        AccountValue("ACC123", "TotalCashValue", "600", "BASE", "income"),
+    ]
+
+    assert ibkr.cached_account_value("ACC123", "TotalCashValue") == 1000.0
+
+
+async def test_cached_account_value_rejects_ambiguous_model_base_values(ibkr, mock_ib):
+    mock_ib.accountValues.return_value = [
+        AccountValue("ACC123", "TotalCashValue", "400", "BASE", "growth"),
+        AccountValue("ACC123", "TotalCashValue", "600", "BASE", "income"),
+    ]
+
+    with pytest.raises(
+        RuntimeError, match="TotalCashValue account value is unavailable"
+    ):
+        ibkr.cached_account_value("ACC123", "TotalCashValue")
+
+
+async def test_qualify_contracts_isolates_request_errors(ibkr, mock_ib):
+    invalid = Stock("INVALID", "SMART", "USD")
+    first = Stock("FIRST", "SMART", "USD", conId=123)
+    unknown = Stock("UNKNOWN", "SMART", "USD")
+    second = Stock("SECOND", "SMART", "USD", conId=456)
+    mock_ib.qualifyContractsAsync.side_effect = [
+        RequestError(1, 200, "No security definition"),
+        [first],
+        [None],
+        [second],
+    ]
+
+    assert await ibkr.qualify_contracts(invalid, first, unknown, second) == [
+        first,
+        second,
+    ]
+    assert mock_ib.qualifyContractsAsync.call_count == 4
+
+
+async def test_qualify_contracts_propagates_systemic_request_errors(ibkr, mock_ib):
+    contract = Stock("TEST", "SMART", "USD")
+    error = RequestError(1, 420, "Invalid real-time query")
+    mock_ib.qualifyContractsAsync.side_effect = error
+
+    with pytest.raises(RequestError) as exc_info:
+        await ibkr.qualify_contracts(contract)
+
+    assert exc_info.value is error
+
+
+async def test_get_ticker_for_contract_required_timeout(
+    ibkr, mock_ib, mock_ticker, mocker
+):
+    """Test get_ticker_for_contract when a required field wait times out."""
+    # Mock ib methods called by __market_data_streaming_handler__
+    mock_ib.qualifyContractsAsync = mocker.AsyncMock()
+    mock_ib.reqMktData = mocker.Mock(return_value=mock_ticker)
+
+    # Mock __ticker_field_handler__ to return appropriate async functions
+    async def succeed_wait(ticker):
+        return True
+
+    async def fail_wait(ticker):
+        return False
+
+    def mock_handler_logic(field):
+        if field == TickerField.MARKET_PRICE:  # Required field
+            return fail_wait
+        elif field == TickerField.MIDPOINT:  # Optional field
+            return succeed_wait
+        else:
+            pytest.fail(f"Unexpected field: {field}")
+
+    mocker.patch.object(
+        ibkr, "__ticker_field_handler__", side_effect=mock_handler_logic
+    )
+
+    contract = Stock("TEST", "SMART", "USD")
+    contract.conId = 1
+    mocker.patch.object(
+        ibkr, "qualify_contracts", new=mocker.AsyncMock(return_value=[contract])
+    )
+    with pytest.raises(RequiredFieldValidationError) as excinfo:
+        await ibkr.get_ticker_for_contract(
+            contract,
+            required_fields=[TickerField.MARKET_PRICE],
+            optional_fields=[TickerField.MIDPOINT],
+        )
+
+    assert "Required fields timed out" in str(excinfo.value)
+    assert "MARKET_PRICE" in str(excinfo.value)
+    # Ensure the handler was called for both fields
+    assert ibkr.__ticker_field_handler__.call_count == 2
+
+
+async def test_get_ticker_for_contract_optional_timeout(
+    ibkr, mock_ib, mock_ticker, mocker
+):
+    """Test get_ticker_for_contract when an optional field wait times out."""
+    # Mock ib methods called by __market_data_streaming_handler__
+    mock_ib.qualifyContractsAsync = mocker.AsyncMock()
+    mock_ib.reqMktData = mocker.Mock(return_value=mock_ticker)
+    mock_log_warning = mocker.patch.object(log, "warning")
+
+    # Mock __ticker_field_handler__ to return appropriate async functions
+    async def succeed_wait(ticker):
+        return True
+
+    async def fail_wait(ticker):
+        return False
+
+    def mock_handler_logic(field):
+        if field == TickerField.MARKET_PRICE:  # Required field
+            return succeed_wait
+        elif field == TickerField.MIDPOINT:  # Optional field
+            return fail_wait
+        else:
+            pytest.fail(f"Unexpected field: {field}")
+
+    mocker.patch.object(
+        ibkr, "__ticker_field_handler__", side_effect=mock_handler_logic
+    )
+
+    contract = Stock("TEST", "SMART", "USD")
+    contract.conId = 1
+    mocker.patch.object(
+        ibkr, "qualify_contracts", new=mocker.AsyncMock(return_value=[contract])
+    )
+    result = await ibkr.get_ticker_for_contract(
+        contract,
+        required_fields=[TickerField.MARKET_PRICE],
+        optional_fields=[TickerField.MIDPOINT],
+    )
+
+    assert result == mock_ticker
+    # Ensure the handler was called for both fields
+    assert ibkr.__ticker_field_handler__.call_count == 2
+    mock_log_warning.assert_called_once()
+    assert "Optional fields timed out" in mock_log_warning.call_args[0][0]
+    assert "MIDPOINT" in mock_log_warning.call_args[0][0]
+
+
+async def test_get_ticker_for_stock_falls_back_to_index(ibkr, mock_ticker, mocker):
+    """Fallback to an index contract when stock qualification fails."""
+    index_contract = Index("SPX", "CBOE", "USD")
+    index_contract.conId = 123
+
+    qualify_contracts = mocker.AsyncMock(side_effect=[[], [index_contract]])
+    mocker.patch.object(ibkr, "qualify_contracts", new=qualify_contracts)
+    get_ticker = mocker.patch.object(
+        ibkr, "get_ticker_for_contract", new=mocker.AsyncMock(return_value=mock_ticker)
+    )
+
+    result = await ibkr.get_ticker_for_stock("SPX", "CBOE")
+
+    assert result == mock_ticker
+    assert get_ticker.await_count == 1
+    called_contract = get_ticker.await_args.args[0]
+    assert isinstance(called_contract, Index)
+    assert called_contract.symbol == "SPX"
+    assert called_contract.conId == 123
+
+
+async def test_request_executions_records_returned_fills(mock_ib, mocker):
+    fills = [SimpleNamespace(execution=SimpleNamespace(execId="exec-1"))]
+    mock_ib.reqExecutionsAsync = mocker.AsyncMock(return_value=fills)
+    data_store = mocker.Mock()
+    ibkr = IBKR(
+        ib=mock_ib,
+        api_response_wait_time=1,
+        default_order_exchange="SMART",
+        data_store=data_store,
+    )
+
+    assert await ibkr.request_executions() == fills
+    data_store.record_executions.assert_called_once_with(fills)
+
+
+async def test_exec_details_event_persists_each_fill(tmp_path):
+    ib = IB()
+    data_store = DataStore(
+        f"sqlite:///{tmp_path / 'state.db'}",
+        str(tmp_path / "thetagang.toml"),
+        dry_run=False,
+        config_text="test",
+    )
+    _ibkr = IBKR(
+        ib=ib,
+        api_response_wait_time=1,
+        default_order_exchange="SMART",
+        data_store=data_store,
+    )
+    fill = SimpleNamespace(
+        execution=SimpleNamespace(
+            execId="exec-1",
+            acctNumber="TEST123",
+            orderId=42,
+            orderRef="tg:test",
+            side="BOT",
+            shares=3,
+            price=25.5,
+            time="20260915 12:00:00",
+            exchange="NYSE",
+        ),
+        contract=SimpleNamespace(symbol="KMLM"),
+        time=None,
+    )
+
+    ib.execDetailsEvent.emit(None, fill)
+
+    with data_store.session_scope() as session:
+        execution = session.execute(select(ExecutionRecord)).scalar_one()
+        assert execution.exec_id == "exec-1"
+        assert execution.symbol == "KMLM"
+        assert execution.shares == 3
+
+
+async def test_market_data_streaming_handler_requires_conid(ibkr, mock_ib, mocker):
+    """Raise when contract can't be qualified to a conId."""
+    mocker.patch.object(
+        ibkr, "qualify_contracts", new=mocker.AsyncMock(return_value=[])
+    )
+    mock_ib.reqMktData = mocker.Mock()
+
+    contract = Stock("TEST", "SMART", "USD")
+    contract.conId = 0
+
+    async def handler(_ticker):
+        return None
+
+    with pytest.raises(ValueError) as excinfo:
+        await ibkr.__market_data_streaming_handler__(contract, "", handler)
+
+    assert "no 'conId' value exists" in str(excinfo.value)
+    mock_ib.reqMktData.assert_not_called()
+
+
+async def test_market_data_streaming_handler_cancels_owned_stream(
+    ibkr, mock_ib, mock_ticker, mocker
+):
+    contract = Stock("TEST", "SMART", "USD", conId=1)
+    # ib_async retains canceled tickers in its cache; without an active request-id
+    # mapping this ticker must be treated as stale and subscribed again.
+    mock_ib.ticker.return_value = mock_ticker
+    mock_ib.reqMktData.return_value = mock_ticker
+    handler = mocker.AsyncMock()
+
+    result = await ibkr.__market_data_streaming_handler__(contract, "101", handler)
+
+    assert result is mock_ticker
+    mock_ib.reqMktData.assert_called_once_with(contract, genericTickList="101")
+    handler.assert_awaited_once_with(mock_ticker)
+    mock_ib.cancelMktData.assert_called_once_with(contract)
+
+
+async def test_market_data_streaming_handler_cancels_owned_stream_on_error(
+    ibkr, mock_ib, mock_ticker, mocker
+):
+    contract = Stock("TEST", "SMART", "USD", conId=1)
+    mock_ib.reqMktData.return_value = mock_ticker
+    handler = mocker.AsyncMock(side_effect=RuntimeError("market data failed"))
+
+    with pytest.raises(RuntimeError, match="market data failed"):
+        await ibkr.__market_data_streaming_handler__(contract, "", handler)
+
+    mock_ib.cancelMktData.assert_called_once_with(contract)
+
+
+async def test_market_data_streaming_handler_preserves_shared_stream(
+    ibkr, mock_ib, mock_ticker, mocker
+):
+    contract = Stock("TEST", "SMART", "USD", conId=1)
+    mock_ib.ticker.return_value = mock_ticker
+    mock_ib.wrapper.ticker2ReqId = {"mktData": {mock_ticker: 123}}
+    handler = mocker.AsyncMock()
+
+    result = await ibkr.__market_data_streaming_handler__(contract, "", handler)
+
+    assert result is mock_ticker
+    handler.assert_awaited_once_with(mock_ticker)
+    mock_ib.reqMktData.assert_not_called()
+    mock_ib.cancelMktData.assert_not_called()
+
+
+async def test_market_data_streaming_handler_serializes_same_contract(
+    ibkr, mock_ib, mock_ticker
+):
+    contract = Stock("TEST", "SMART", "USD", conId=1)
+    first_handler_started = asyncio.Event()
+    release_first_handler = asyncio.Event()
+    second_handler_started = asyncio.Event()
+    handler_calls = 0
+
+    def request_market_data(_contract, **_kwargs):
+        mock_ib.ticker.return_value = mock_ticker
+        mock_ib.wrapper.ticker2ReqId["mktData"][mock_ticker] = 123
+        return mock_ticker
+
+    def cancel_market_data(_contract):
+        mock_ib.wrapper.ticker2ReqId["mktData"].pop(mock_ticker, None)
+
+    async def handler(_ticker):
+        nonlocal handler_calls
+        handler_calls += 1
+        if handler_calls == 1:
+            first_handler_started.set()
+            await release_first_handler.wait()
+        else:
+            second_handler_started.set()
+
+    mock_ib.reqMktData.side_effect = request_market_data
+    mock_ib.cancelMktData.side_effect = cancel_market_data
+
+    first_task = asyncio.create_task(
+        ibkr.__market_data_streaming_handler__(contract, "", handler)
+    )
+    await first_handler_started.wait()
+    second_task = asyncio.create_task(
+        ibkr.__market_data_streaming_handler__(contract, "", handler)
+    )
+    await asyncio.sleep(0)
+    second_started_before_release = second_handler_started.is_set()
+
+    release_first_handler.set()
+    await asyncio.gather(first_task, second_task)
+
+    assert not second_started_before_release
+    assert handler_calls == 2
+    assert mock_ib.reqMktData.call_count == 2
+    assert mock_ib.cancelMktData.call_count == 2
+
+
+async def test_market_data_streaming_handler_bounds_concurrent_streams(
+    ibkr, mock_ib, mocker
+):
+    active_streams = 0
+    max_active_streams = 0
+    capacity_reached = asyncio.Event()
+    release_streams = asyncio.Event()
+
+    def request_market_data(contract, **_kwargs):
+        ticker = mocker.Mock(spec=Ticker)
+        ticker.contract = contract
+        return ticker
+
+    async def handler(_ticker):
+        nonlocal active_streams, max_active_streams
+        active_streams += 1
+        max_active_streams = max(max_active_streams, active_streams)
+        if active_streams == MAX_CONCURRENT_MARKET_DATA_STREAMS:
+            capacity_reached.set()
+        try:
+            await release_streams.wait()
+        finally:
+            active_streams -= 1
+
+    mock_ib.reqMktData.side_effect = request_market_data
+    contracts = [
+        Stock(f"TEST{i}", "SMART", "USD", conId=i + 1)
+        for i in range(MAX_CONCURRENT_MARKET_DATA_STREAMS + 1)
+    ]
+    tasks = [
+        asyncio.create_task(
+            ibkr.__market_data_streaming_handler__(contract, "", handler)
+        )
+        for contract in contracts
+    ]
+
+    await asyncio.wait_for(capacity_reached.wait(), timeout=5)
+    await asyncio.sleep(0)
+    assert max_active_streams == MAX_CONCURRENT_MARKET_DATA_STREAMS
+    assert mock_ib.reqMktData.call_count == MAX_CONCURRENT_MARKET_DATA_STREAMS
+
+    release_streams.set()
+    await asyncio.gather(*tasks)
+    assert mock_ib.reqMktData.call_count == len(contracts)
+    assert mock_ib.cancelMktData.call_count == len(contracts)
+
+
+async def test_wait_for_submitting_orders_success(ibkr, mock_trade, mocker):
+    """Test wait_for_submitting_orders when all waits succeed."""
+    mocker.patch.object(
+        ibkr,
+        "__trade_wait_for_condition__",
+        new=mocker.AsyncMock(side_effect=[True, True]),
+    )
+
+    async def track_async_passthrough(tasks, *args, **kwargs):
+        return await asyncio.gather(*tasks)
+
+    mocker.patch.object(log, "track_async", side_effect=track_async_passthrough)
+
+    trades = [mock_trade, mock_trade]
+    await ibkr.wait_for_submitting_orders(trades)
+
+    assert ibkr.__trade_wait_for_condition__.call_count == 2
+
+
+async def test_wait_for_submitting_orders_timeout(ibkr, mock_trade, mocker):
+    """Test wait_for_submitting_orders when a wait times out."""
+    mocker.patch.object(
+        ibkr,
+        "__trade_wait_for_condition__",
+        new=mocker.AsyncMock(side_effect=[True, False]),
+    )
+
+    async def track_async_passthrough(tasks, *args, **kwargs):
+        return await asyncio.gather(*tasks)
+
+    mocker.patch.object(log, "track_async", side_effect=track_async_passthrough)
+
+    trades = [mocker.Mock(spec=Trade), mocker.Mock(spec=Trade)]
+    trades[0].contract = mocker.Mock(spec=Contract)
+    trades[0].contract.symbol = "PASS"
+    trades[0].order = mocker.Mock(spec=Order)
+    trades[0].order.orderId = 1
+    trades[1].contract = mocker.Mock(spec=Contract)
+    trades[1].contract.symbol = "FAIL"
+    trades[1].order = mocker.Mock(spec=Order)
+    trades[1].order.orderId = 2
+
+    with pytest.raises(RuntimeError) as excinfo:
+        await ibkr.wait_for_submitting_orders(trades)
+
+    assert "Timeout waiting for orders to submit" in str(excinfo.value)
+    assert "FAIL (OrderId: 2)" in str(excinfo.value)
+    assert "PASS (OrderId: 1)" not in str(excinfo.value)
+    assert ibkr.__trade_wait_for_condition__.call_count == 2
+
+
+async def test_wait_for_orders_complete_success(ibkr, mock_trade, mocker):
+    """Test wait_for_orders_complete when all waits succeed."""
+    mocker.patch.object(
+        ibkr,
+        "__trade_wait_for_condition__",
+        new=mocker.AsyncMock(side_effect=[True, True]),
+    )
+
+    async def track_async_passthrough(tasks, *args, **kwargs):
+        return await asyncio.gather(*tasks)
+
+    mocker.patch.object(log, "track_async", side_effect=track_async_passthrough)
+    mock_log_info = mocker.patch.object(log, "info")
+
+    trades = [mock_trade, mock_trade]
+    incomplete = await ibkr.wait_for_orders_complete(trades)
+
+    assert ibkr.__trade_wait_for_condition__.call_count == 2
+    assert incomplete == []
+    mock_log_info.assert_not_called()
+
+
+async def test_wait_for_orders_complete_timeout(ibkr, mock_trade, mocker):
+    """Test wait_for_orders_complete when a wait times out."""
+    mocker.patch.object(
+        ibkr,
+        "__trade_wait_for_condition__",
+        new=mocker.AsyncMock(side_effect=[True, False]),
+    )
+
+    async def track_async_passthrough(tasks, *args, **kwargs):
+        return await asyncio.gather(*tasks)
+
+    mocker.patch.object(log, "track_async", side_effect=track_async_passthrough)
+    mock_log_info = mocker.patch.object(log, "info")
+
+    trades = [mocker.Mock(spec=Trade), mocker.Mock(spec=Trade)]
+    trades[0].contract = mocker.Mock(spec=Contract)
+    trades[0].contract.symbol = "PASS"
+    trades[0].order = mocker.Mock(spec=Order)
+    trades[0].order.orderId = 1
+    trades[0].orderStatus = SimpleNamespace(status="Filled", filled=10.0, remaining=0.0)
+    trades[1].contract = mocker.Mock(spec=Contract)
+    trades[1].contract.symbol = "FAIL"
+    trades[1].order = mocker.Mock(spec=Order)
+    trades[1].order.orderId = 2
+    trades[1].orderStatus = SimpleNamespace(
+        status="Submitted", filled=5.0, remaining=3.0
+    )
+
+    incomplete = await ibkr.wait_for_orders_complete(trades)
+
+    assert ibkr.__trade_wait_for_condition__.call_count == 2
+    assert incomplete == [trades[1]]
+    mock_log_info.assert_called_once()
+    assert "Timeout waiting for orders to complete" in mock_log_info.call_args[0][0]
+    assert (
+        "FAIL (OrderId: 2, status=Submitted, filled=5.0, remaining=3.0)"
+        in (mock_log_info.call_args[0][0])
+    )
+    assert "PASS (OrderId: 1)" not in mock_log_info.call_args[0][0]
+
+
+async def test_cancel_order_is_blocked_in_dry_run(mock_ib):
+    ibkr = IBKR(
+        ib=mock_ib,
+        api_response_wait_time=1,
+        default_order_exchange="SMART",
+        dry_run=True,
+    )
+    order = Order()
+
+    ibkr.cancel_order(order)
+
+    mock_ib.cancelOrder.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    ("duration", "expected"),
+    [
+        ("364 D", "364 D"),
+        ("365 D", "365 D"),
+        ("366 D", "2 Y"),
+        ("730 D", "2 Y"),
+        ("731 D", "3 Y"),
+        ("2 Y", "2 Y"),
+    ],
+)
+async def test_historical_duration_boundaries(ibkr, mock_ib, duration, expected):
+    mock_ib.reqHistoricalDataAsync = AsyncMock(return_value=[])
+    await ibkr.request_historical_data(Stock("AAA", "SMART", "USD"), duration)
+    assert mock_ib.reqHistoricalDataAsync.await_args is not None
+    assert mock_ib.reqHistoricalDataAsync.await_args.args[2] == expected
+
+
+async def test_on_error_records_order_error_for_known_order(
+    ibkr, mock_ib, mock_trade, mocker
+):
+    mock_trade.order.action = "BUY"
+    data_store = mocker.Mock()
+    ibkr.data_store = data_store
+    mock_ib.wrapper.clientId = 0
+    mock_ib.wrapper.trades = {(0, 123): mock_trade}
+
+    ibkr._on_error(123, 431, "margin requirement is not met", None)
+
+    data_store.record_event.assert_called_once_with(
+        "order_error",
+        {
+            "symbol": "TEST",
+            "order_id": 123,
+            "action": "BUY",
+            "code": 431,
+            "message": "margin requirement is not met",
+        },
+        symbol="TEST",
+    )
+    assert ibkr.order_error(123) == (431, "margin requirement is not met")
+
+
+async def test_on_error_ignores_other_client_order_with_colliding_req_id(
+    ibkr, mock_ib, mock_trade, mocker
+):
+    """A data-request error must not match an imported other-client order
+    whose orderId equals the request id (ib.trades() includes those)."""
+    other_client_trade = mocker.Mock(spec=Trade)
+    other_client_trade.contract = mocker.Mock(spec=Contract)
+    other_client_trade.contract.symbol = "OTHER"
+    other_client_trade.order = mocker.Mock(spec=Order)
+    other_client_trade.order.orderId = 999
+    data_store = mocker.Mock()
+    ibkr.data_store = data_store
+    mock_ib.wrapper.clientId = 0
+    mock_ib.wrapper.trades = {
+        (0, 123): mock_trade,
+        (1, 999): other_client_trade,
+    }
+
+    mock_trade.orderStatus.status = "Submitted"
+    with ibkr.supervise_order_errors(lambda: [mock_trade]):
+        ibkr._on_error(999, 165, "Historical market data service query message", None)
+
+    data_store.record_event.assert_not_called()
+    assert ibkr.order_error(999) is None
+
+
+async def test_on_error_ignores_non_order_errors(ibkr, mock_ib, mock_trade, mocker):
+    data_store = mocker.Mock()
+    ibkr.data_store = data_store
+    mock_ib.wrapper.clientId = 0
+    mock_ib.wrapper.trades = {(0, 123): mock_trade}
+
+    mock_trade.orderStatus.status = "Submitted"
+    with ibkr.supervise_order_errors(lambda: [mock_trade]):
+        ibkr._on_error(-1, 2105, "Disconnecting...", None)
+
+    data_store.record_event.assert_not_called()
+    assert ibkr.order_error(None) is None
+
+
+@pytest.mark.parametrize(
+    ("request_id", "order_id", "code"),
+    [(-1, 123, 431), (999, 999, 201)],
+)
+async def test_on_error_correlates_unmatched_errors_during_order_supervision(
+    ibkr,
+    mock_trade,
+    mocker,
+    capsys,
+    request_id,
+    order_id,
+    code,
+):
+    data_store = mocker.Mock()
+    ibkr.data_store = data_store
+    mock_trade.contract.symbol = "TEST"
+    mock_trade.order.orderId = order_id
+    mock_trade.order.action = "BUY"
+    mock_trade.orderStatus.status = "Inactive"
+
+    with ibkr.supervise_order_errors(lambda: [mock_trade]):
+        ibkr._on_error(
+            request_id,
+            code,
+            "Order rejected - reason: buying power",
+            None,
+        )
+
+    data_store.record_event.assert_called_once_with(
+        "order_error",
+        {
+            "symbol": "TEST",
+            "order_id": order_id,
+            "action": "BUY",
+            "code": code,
+            "message": "Order rejected - reason: buying power",
+            "request_id": request_id,
+            "matched": False,
+            "candidate_order_ids": [order_id],
+        },
+        symbol="TEST",
+    )
+    assert f"Unmatched broker error reqId={request_id}, code={code}" in (
+        capsys.readouterr().out
+    )
+    assert ibkr.order_error(order_id) == (
+        code,
+        "Order rejected - reason: buying power",
+    )
+
+
+async def test_on_error_ignores_unscoped_order_error_without_supervised_orders(
+    ibkr,
+    mocker,
+):
+    data_store = mocker.Mock()
+    ibkr.data_store = data_store
+
+    with ibkr.supervise_order_errors(list):
+        ibkr._on_error(-1, 201, "Order rejected - reason: buying power", None)
+
+    data_store.record_event.assert_not_called()
+
+
+async def test_on_error_does_not_guess_between_supervised_orders(ibkr, mocker):
+    data_store = mocker.Mock()
+    ibkr.data_store = data_store
+    trades = [
+        SimpleNamespace(
+            contract=SimpleNamespace(symbol=symbol),
+            order=SimpleNamespace(orderId=order_id, action="BUY"),
+            orderStatus=SimpleNamespace(status="Inactive"),
+        )
+        for order_id, symbol in [(123, "AAA"), (124, "BBB")]
+    ]
+
+    with ibkr.supervise_order_errors(lambda: trades):
+        ibkr._on_error(-1, 201, "Order rejected - reason: buying power", None)
+
+    payload = data_store.record_event.call_args.args[1]
+    assert payload["order_id"] is None
+    assert payload["candidate_order_ids"] == [123, 124]
+    assert ibkr.order_error(123) is None
+    assert ibkr.order_error(124) is None
+
+
+async def test_on_error_records_latest_error_without_data_store(
+    ibkr, mock_ib, mock_trade
+):
+    mock_ib.wrapper.clientId = 0
+    mock_ib.wrapper.trades = {(0, 123): mock_trade}
+
+    ibkr._on_error(123, 202, "Order cancelled - Reason: ", None)
+
+    assert ibkr.order_error(123) == (202, "Order cancelled - Reason: ")
