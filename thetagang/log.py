@@ -1,5 +1,7 @@
 import asyncio
-from typing import Any, Coroutine, Iterable, Iterator, List, Union
+import sys
+from collections.abc import Coroutine, Iterable, Iterator
+from typing import Any
 
 from annotated_types import T
 from rich.console import Console
@@ -38,15 +40,16 @@ def warning(text: str) -> None:
 
 
 def error(text: str) -> None:
-    console.print_exception()
+    if sys.exc_info()[0] is not None:
+        console.print_exception()
     console.print(text, style="red")
 
 
-def print(content: Union[Panel, Table]) -> None:
+def print(content: Panel | Table) -> None:
     console.print(content)
 
 
-async def track_async(tasks: List[Coroutine[Any, Any, T]], description: str) -> List[T]:
+async def track_async(tasks: list[Coroutine[Any, Any, T]], description: str) -> list[T]:
     results = []
     total_tasks = len(tasks)
 
