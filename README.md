@@ -4,6 +4,17 @@
 
 # Θ ThetaGang Θ
 
+> **This branch (`manage-only-v2`) adds an options discretionary strategy.** Set
+> `run.strategies = ["discretionary"]` to manage the option positions already in
+> your IB account: it rolls or closes short options (standalone, or credit
+> verticals as whole spreads), closes long VIX hedges above a VIX threshold, and
+> prints SPX beta-weighted greeks and stress P&L. List new trades (long/short
+> calls or puts, verticals) in `[[strategies.discretionary.trades]]` and it sizes
+> them so the account's SPX delta goes to 0, without resizing what you hold.
+> Start from [`thetagang.discretionary.toml`](thetagang.discretionary.toml) and
+> read [`PORTFOLIO_RISK_GUIDE.md`](PORTFOLIO_RISK_GUIDE.md). The wheel strategy
+> described below works unchanged.
+
 _Beat the capitalists at their own game with ThetaGang 📈_
 
 ![Decay my sweet babies](thetagang.jpg)

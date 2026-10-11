@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import math
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from typing import Any
 
 from ib_async import TagValue, Ticker, util
@@ -9,13 +9,33 @@ from ib_async.contract import Contract, Option
 from ib_async.order import LimitOrder
 
 from thetagang import log
-from thetagang.config import Config
+from thetagang.config import Config, discretionary_mode_on
 from thetagang.db import DataStore
 from thetagang.fmt import dfmt
 from thetagang.ibkr import IBKR, TickerField
 from thetagang.options import option_dte
 from thetagang.orders import Orders
 from thetagang.util import midpoint_or_market_price
+
+
+def open_interest_ok(
+    ticker: Ticker, right: str, minimum: int, missing_ok: bool = False
+) -> bool:
+    """Open interest filter for option candidates. IB often sends no open interest
+    (historical/frozen data, outside market hours); ib_async leaves it NaN, which
+    fails every >= check. With missing_ok (the discretionary strategy, which only rolls
+    positions already held) missing counts as unknown and the contract is kept; the
+    wheel keeps the strict check for new contracts. Real low open interest is always
+    filtered."""
+    if right.startswith("P"):
+        oi = ticker.putOpenInterest
+    elif right.startswith("C"):
+        oi = ticker.callOpenInterest
+    else:
+        return False
+    if oi is None or util.isNan(oi):
+        return missing_ok
+    return oi >= minimum
 
 
 class NoValidContractsError(Exception):
@@ -135,6 +155,8 @@ class OptionChainScanner:
         target_dte: int | None = None,
         target_delta: float | None = None,
         exclude_con_ids: set[int] | None = None,
+        also_exclude: Sequence[tuple[float, str]] = (),
+        allow_missing_open_interest: bool | None = None,
     ) -> Ticker:
         contract_target_dte: int = (
             target_dte if target_dte else self.config.get_target_dte(underlying.symbol)
@@ -224,14 +246,15 @@ class OptionChainScanner:
         if exclude_con_ids:
             contracts = [c for c in contracts if c.conId not in exclude_con_ids]
 
+        # exclude specific (strike, expiry) contracts, e.g. legs of a spread being rolled
+        excluded = {(strike, expiry) for strike, expiry in also_exclude}
         if exclude_exp_strike:
+            excluded.add(exclude_exp_strike)
+        if excluded:
             contracts = [
                 c
                 for c in contracts
-                if (
-                    c.lastTradeDateOrContractMonth != exclude_exp_strike[1]
-                    or c.strike != exclude_exp_strike[0]
-                )
+                if (c.strike, c.lastTradeDateOrContractMonth) not in excluded
             ]
 
         tickers = await self.ibkr.get_tickers_for_contracts(
@@ -248,11 +271,18 @@ class OptionChainScanner:
         )
 
         def open_interest_is_valid(ticker: Ticker, minimum_open_interest: int) -> bool:
-            if right.startswith("P"):
-                return ticker.putOpenInterest >= minimum_open_interest
-            if right.startswith("C"):
-                return ticker.callOpenInterest >= minimum_open_interest
-            return False
+            return open_interest_ok(
+                ticker,
+                right,
+                minimum_open_interest,
+                # rolls of held positions in discretionary mode may accept a
+                # missing open interest; new positions never do
+                missing_ok=(
+                    discretionary_mode_on(self.config)
+                    if allow_missing_open_interest is None
+                    else allow_missing_open_interest
+                ),
+            )
 
         def delta_is_valid(ticker: Ticker) -> bool:
             model_greeks = ticker.modelGreeks

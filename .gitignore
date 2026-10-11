@@ -2,8 +2,10 @@
 ibc.log
 tws-installer.sh
 .idea/
-# local configuration
+# local configuration (personal settings, account numbers, logins)
 thetagang.local.toml
+thetagang.*.local.toml
+thetagang.local.*.toml
 
 # Ignore tws installer dir
 tws/
@@ -156,3 +158,9 @@ cython_debug/
 # Ignore local db for testing
 /thetagang.db
 data/thetagang.db
+
+# graphify knowledge-graph output (regenerate with /graphify .)
+graphify-out/
+
+# macOS
+.DS_Store

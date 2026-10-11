@@ -16,11 +16,12 @@ from thetagang.accounting import (
     BrokerAccountSnapshot,
     stock_market_value,
 )
-from thetagang.config import Config
+from thetagang.config import Config, discretionary_mode_on
 from thetagang.db import DataStore
 from thetagang.fmt import dfmt, ifmt, pfmt
 from thetagang.ibkr import IBKR, RequiredFieldValidationError, TickerField
 from thetagang.options import option_dte
+from thetagang.strategies.discretionary_engine import is_covered_call, roll_strike_limit
 from thetagang.strategies.runtime_services import resolve_symbol_configs
 from thetagang.strategies.tail_hedge_state import TailHedgeStateStore
 from thetagang.trading_operations import (
@@ -89,6 +90,9 @@ class OptionsStrategyEngine:
         self.has_excess_calls = has_excess_calls
         self.qualified_contracts = qualified_contracts
         self.data_store = data_store
+        # discretionary strategy (run.strategies = ["discretionary"]): skips spread
+        # legs in the standalone roll/close checks; set by PortfolioManager
+        self.discretionary: Any = None
 
     def _tail_hedge_owned_con_ids(self) -> set[int]:
         tail_config = self.config.strategies.tail_hedge
@@ -1009,6 +1013,8 @@ class OptionsStrategyEngine:
     ) -> tuple[list[Any], list[Any], Group]:
         puts = self.get_short_puts(portfolio_positions)
         puts = [put for put in puts if put.contract.symbol != "VIX"]
+        if self.discretionary is not None and discretionary_mode_on(self.config):
+            puts = self.discretionary.without_spread_legs(puts, portfolio_positions)
         rollable_puts: list[PortfolioItem] = []
         closeable_puts: list[PortfolioItem] = []
 
@@ -1048,6 +1054,8 @@ class OptionsStrategyEngine:
     ) -> tuple[list[Any], list[Any], Group]:
         calls = self.get_short_calls(portfolio_positions)
         calls = [call for call in calls if call.contract.symbol != "VIX"]
+        if self.discretionary is not None and discretionary_mode_on(self.config):
+            calls = self.discretionary.without_spread_legs(calls, portfolio_positions)
         rollable_calls: list[PortfolioItem] = []
         closeable_calls: list[PortfolioItem] = []
 
@@ -1178,7 +1186,27 @@ class OptionsStrategyEngine:
                 )
 
                 strike_limit = self.config.get_strike_limit(symbol, right)
-                if right.startswith("C"):
+                manager_rule = discretionary_mode_on(
+                    self.config
+                ) and not is_covered_call(right, symbol, portfolio_positions)
+                if manager_rule:
+                    # discretionary strategy: one rule for puts and uncovered calls
+                    buyback = midpoint_or_market_price(buy_ticker)
+                    premium = position.averageCost / float(
+                        position.contract.multiplier or 100
+                    )
+                    itm = isinstance(position.contract, Option) and await (
+                        self.call_is_itm if right.startswith("C") else self.put_is_itm
+                    )(position.contract)
+                    strike_limit = roll_strike_limit(
+                        right,
+                        position.contract.strike,
+                        # no quote: assume nothing captured (can't move against you)
+                        premium - buyback if buyback > 0 else 0.0,
+                        itm,
+                        strike_limit,
+                    )
+                elif right.startswith("C"):
                     average_cost = (
                         [
                             p.averageCost
@@ -1255,14 +1283,15 @@ class OptionsStrategyEngine:
                     raise RuntimeError(f"Invalid ticker (no contract): {sell_ticker}")
 
                 qty_to_roll = math.floor(abs(position.position))
-                maximum_new_contracts = await self.get_maximum_new_contracts_for(
-                    symbol,
-                    self.get_primary_exchange(symbol),
-                    account_summary,
-                )
                 from_dte = option_dte(position.contract.lastTradeDateOrContractMonth)
                 roll_when_dte = self.config.strategies.wheel.defaults.roll_when.dte
-                if from_dte > roll_when_dte:
+                # the discretionary strategy rolls the whole position (no buying-power cap)
+                if from_dte > roll_when_dte and not discretionary_mode_on(self.config):
+                    maximum_new_contracts = await self.get_maximum_new_contracts_for(
+                        symbol,
+                        self.get_primary_exchange(symbol),
+                        account_summary,
+                    )
                     qty_to_roll = min([qty_to_roll, maximum_new_contracts])
 
                 price = midpoint_or_market_price(buy_ticker) - midpoint_or_market_price(
@@ -1334,7 +1363,7 @@ class OptionsStrategyEngine:
                 log.error(
                     f"{position.contract.symbol}: Error occurred when trying to roll position. Continuing anyway..."
                 )
-            except RuntimeError:
+            except (RuntimeError, RequiredFieldValidationError):
                 log.error(
                     f"{position.contract.symbol}: Error occurred when trying to roll position. Continuing anyway..."
                 )
