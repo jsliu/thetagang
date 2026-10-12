@@ -5,9 +5,11 @@
 #   - prints SPX beta-weighted greeks, stress P&L and delta by symbol
 #     (see PORTFOLIO_RISK_GUIDE.md),
 #   - opens the trades listed in [[strategies.discretionary.trades]], sized so the
-#     account's SPX delta goes to 0. Existing positions are never resized,
+#     account's SPX delta goes to 0; or, with place_target_orders = true, resizes
+#     the positions you hold toward SPX delta 0 instead (see below),
 #   - rolls or closes short options per roll_when: standalone shorts alone,
-#     credit verticals as whole spreads; calendar/diagonal legs are left alone,
+#     credit verticals as whole spreads; long (debit) verticals as whole spreads
+#     with their own take-profit / roll rules; calendar/diagonal legs are left alone,
 #     except short calls fully covered by your shares, which roll on their own,
 #   - shows the long VIX calls you hold and sells them once VIX passes
 #     strategies.vix_call_hedge.close_hedges_when_vix_exceeds.
@@ -143,6 +145,26 @@ close_if_unable_to_roll = true
 # move, i.e. one SPX share's worth of exposure).
 delta_band = 1.0
 
+# Place the positions summary's "Net target contracts" as real orders: resizes
+# what you already hold toward SPX delta 0 (limit orders at mid). Off: they are
+# only shown. Use either this or the trades below, not both.
+place_target_orders = false
+
+# Option orders only (rolls, closes, trades, resizes, VIX hedges), for every
+# symbol whose [portfolio.symbols.X] block doesn't set it: unfilled orders are
+# re-priced once, halfway toward the current mid, after a random wait within
+# runtime.orders.price_update_delay. Share and cash-fund orders stay as placed.
+adjust_price_after_delay = false
+
+# Long (debit) verticals - long call below the short call, long put above the
+# short put, same expiry and quantity - are managed as one combo order:
+#   - closed when the spread is worth >= debit_spread_take_profit x its width,
+#   - otherwise rolled out at roll_when.dte (same width, new long leg at the
+#     target delta, later expiry), unless the roll costs more than
+#     debit_spread_max_roll_debit x width; then it's logged for you to handle.
+debit_spread_take_profit = 0.8
+debit_spread_max_roll_debit = 0.5
+
 # Trades to open. Each run the bot prices them, then picks how many contracts
 # (whole spreads for verticals) bring the account's SPX delta to 0, given what you
 # already hold. The needed delta is split across trades by weight; a trade that
@@ -153,6 +175,8 @@ delta_band = 1.0
 #            put_credit_spread, call_credit_spread, put_debit_spread, call_debit_spread
 # delta:     target |delta| of the main leg (the short leg of a credit spread,
 #            the long leg of a debit spread)
+# dte:       minimum days to expiry: the nearest expiry at least this far out
+#            (max_dte in [portfolio.symbols.X] is a roll rule, not used here)
 # width:     strike distance to the second leg (verticals only)
 #
 #   [[strategies.discretionary.trades]]

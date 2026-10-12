@@ -534,6 +534,27 @@ class DiscretionaryStrategyConfig(BaseModel):
     # from churning once the book is roughly neutral
     delta_band: float = Field(default=1.0, ge=0.0)
     trades: list[DiscretionaryTradeConfig] = Field(default_factory=list)
+    # place the positions summary's "Net target contracts" as real orders
+    # (resizing what is held toward SPX delta 0) instead of only showing them
+    place_target_orders: bool = False
+    # re-price unfilled option orders (rolls, closes, trades, resizes, VIX) once,
+    # halfway toward the current mid, for symbols whose [portfolio.symbols.X]
+    # block doesn't set it; share and cash-fund orders are left as placed
+    adjust_price_after_delay: bool = False
+    # long (debit) verticals, managed as one combo: close when the spread is worth
+    # at least this fraction of its width (its maximum value); otherwise roll it
+    # out at roll_when.dte, skipping rolls that cost more than max_roll_debit x width
+    debit_spread_take_profit: float = Field(default=0.8, gt=0.0, le=1.0)
+    debit_spread_max_roll_debit: float = Field(default=0.5, ge=0.0)
+
+    @model_validator(mode="after")
+    def check_one_hedge(self) -> DiscretionaryStrategyConfig:
+        if self.place_target_orders and self.trades:
+            raise ValueError(
+                "strategies.discretionary: use either trades or place_target_orders, "
+                "not both - each hedges the whole SPX delta on its own"
+            )
+        return self
 
 
 class StrategiesConfig(BaseModel):

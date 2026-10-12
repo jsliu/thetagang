@@ -75,6 +75,8 @@ def config():
 def engine(config, mocker):
     mocker.patch("thetagang.strategies.discretionary_engine.log")
     mocker.patch("thetagang.strategies.discretionary_risk.log")
+    mocker.patch("thetagang.strategies.discretionary_spreads.log")
+    mocker.patch("thetagang.strategies.discretionary_trades.log")
     orders = Orders()
     order_ops = OrderOperations(
         config=config, account_number=ACCOUNT, orders=orders, data_store=None
@@ -398,6 +400,171 @@ async def test_close_spread_builds_two_leg_combo(engine, mocker):
     assert order.lmtPrice == pytest.approx(0.30)
 
 
+# ------------------------------------------------------------ debit spreads
+
+
+def test_find_debit_verticals():
+    call_long = _opt("HOOD", "20261120", 65.0, "C", 1)
+    call_short = _opt("HOOD", "20261120", 70.0, "C", -1)
+    put_long = _opt("HOOD", "20261120", 55.0, "P", 2)
+    put_short = _opt("HOOD", "20261120", 50.0, "P", -2)
+    credit_long = _opt("HOOD", "20261120", 45.0, "P", 3)
+    credit_short = _opt("HOOD", "20261120", 48.0, "P", -3)
+    positions = [call_long, call_short, put_long, put_short, credit_long, credit_short]
+    assert DiscretionaryEngine.find_debit_verticals(positions) == [
+        (call_short, call_long),
+        (put_short, put_long),
+    ]
+
+
+def test_debit_spread_short_leg_is_not_rolled_alone(engine, mocker):
+    log = mocker.patch("thetagang.strategies.discretionary_spreads.log")
+    short = _opt("HOOD", "20261120", 70.0, "C", -1)
+    long = _opt("HOOD", "20261120", 65.0, "C", 1)
+    assert engine.without_spread_legs([short], {"HOOD": [short, long]}) == []
+    (message,) = log.notice.call_args.args
+    assert "debit spread" in message and "calendar" not in message
+    assert not engine.has_calendar_or_diagonal_legs([short, long])
+
+
+@pytest.mark.asyncio
+async def test_debit_spread_closed_as_one_combo_at_take_profit(engine, mocker):
+    """Worth 4.20 of a 5-wide spread (>= 80%): sell long, buy short together."""
+    long = _opt("HOOD", "20991120", 50.0, "C", 2, con_id=1)
+    short = _opt("HOOD", "20991120", 55.0, "C", -2, con_id=2)
+    _spread_mocks(engine, mocker, {1: 4.50, 2: 0.30}, [], [])
+    await engine.manage_debit_spreads({"HOOD": [long, short]})
+    ((combo, order, _),) = engine.order_ops.orders.records()
+    assert [(leg.conId, leg.action) for leg in combo.comboLegs] == [
+        (2, "BUY"),  # buy back the short
+        (1, "SELL"),  # sell the long
+    ]
+    assert (order.action, order.totalQuantity) == ("BUY", 2)
+    assert order.lmtPrice == pytest.approx(-4.20)  # credit
+
+
+def _near_expiry():
+    return (date.today() + timedelta(days=2)).strftime("%Y%m%d")  # noqa: DTZ011
+
+
+@pytest.mark.asyncio
+async def test_debit_spread_rolled_out_as_one_four_leg_combo(engine, mocker):
+    long = _opt("HOOD", _near_expiry(), 50.0, "C", 1, con_id=1)
+    short = _opt("HOOD", _near_expiry(), 55.0, "C", -1, con_id=2)
+    new_long = Option("HOOD", "20991218", 52.0, "C", "SMART", conId=3)
+    new_short = Option("HOOD", "20991218", 57.0, "C", "SMART", conId=4)
+    _spread_mocks(
+        engine, mocker, {1: 2.5, 2: 0.5, 3: 2.8, 4: 0.9}, [new_long], [new_short]
+    )
+    await engine.manage_debit_spreads({"HOOD": [long, short]})
+    ((combo, order, _),) = engine.order_ops.orders.records()
+    assert [(leg.conId, leg.action) for leg in combo.comboLegs] == [
+        (1, "SELL"),
+        (2, "BUY"),
+        (3, "BUY"),
+        (4, "SELL"),
+    ]
+    asked = engine.ibkr.qualify_contracts.call_args.args[0]
+    assert asked.strike == 57.0  # same 5-point width
+    assert order.lmtPrice == pytest.approx(-0.10)  # new 1.90 - old 2.00
+
+
+@pytest.mark.asyncio
+async def test_debit_spread_roll_skipped_above_max_debit(engine, mocker):
+    """New spread 4.80 - old 2.00 = 2.80 debit > 0.5 x 5 width: not rolled."""
+    long = _opt("HOOD", _near_expiry(), 50.0, "C", 1, con_id=1)
+    short = _opt("HOOD", _near_expiry(), 55.0, "C", -1, con_id=2)
+    new_long = Option("HOOD", "20991218", 52.0, "C", "SMART", conId=3)
+    new_short = Option("HOOD", "20991218", 57.0, "C", "SMART", conId=4)
+    _spread_mocks(
+        engine, mocker, {1: 2.5, 2: 0.5, 3: 5.0, 4: 0.2}, [new_long], [new_short]
+    )
+    await engine.manage_debit_spreads({"HOOD": [long, short]})
+    assert engine.order_ops.orders.records() == []
+
+
+@pytest.mark.asyncio
+async def test_credit_spread_short_is_never_also_a_debit_leg(engine, mocker):
+    """-P100/+P95 is a credit vertical; the extra +P105 must not pair with -P100
+    as a debit spread (that would buy the short back twice)."""
+    short = _opt("HOOD", "20991120", 100.0, "P", -1, con_id=1)
+    credit_long = _opt("HOOD", "20991120", 95.0, "P", 1, con_id=2)
+    extra_long = _opt("HOOD", "20991120", 105.0, "P", 1, con_id=3)
+    _spread_mocks(engine, mocker, {1: 1.0, 2: 0.5, 3: 9.0}, [], [])
+    pairs = engine.split_option_legs([short, credit_long, extra_long])[0]
+    assert pairs == [(short, credit_long)]
+    await engine.manage_debit_spreads({"HOOD": [short, credit_long, extra_long]})
+    assert engine.order_ops.orders.records() == []
+
+
+@pytest.mark.asyncio
+async def test_covered_call_is_not_a_debit_spread(engine, mocker):
+    """100 shares cover the -C110, so +C100 isn't its debit-spread partner."""
+    shares = _stock("HOOD", 100)
+    covered = _opt("HOOD", "20991120", 110.0, "C", -1, con_id=1)
+    long_call = _opt("HOOD", "20991120", 100.0, "C", 1, con_id=2)
+    _spread_mocks(engine, mocker, {1: 0.1, 2: 9.9}, [], [])
+    positions = [shares, covered, long_call]
+    assert engine.split_option_legs(positions)[0] == []
+    assert engine.without_spread_legs([covered], {"HOOD": positions}) == [covered]
+    await engine.manage_debit_spreads({"HOOD": positions})
+    assert engine.order_ops.orders.records() == []
+
+
+@pytest.mark.asyncio
+async def test_unrollable_debit_spread_closed_when_allowed(engine, mocker):
+    """Roll too expensive, profitable, within max_dte, close_if_unable_to_roll:
+    closed as one combo instead of being left to expire."""
+    rw = engine.config.strategies.wheel.defaults.roll_when
+    rw.close_if_unable_to_roll, rw.max_dte = True, 30
+    long = _opt("HOOD", _near_expiry(), 50.0, "C", 1, avg=200.0, upnl=50.0, con_id=1)
+    short = _opt("HOOD", _near_expiry(), 55.0, "C", -1, avg=50.0, con_id=2)
+    new_long = Option("HOOD", "20991218", 52.0, "C", "SMART", conId=3)
+    new_short = Option("HOOD", "20991218", 57.0, "C", "SMART", conId=4)
+    _spread_mocks(
+        engine, mocker, {1: 2.5, 2: 0.5, 3: 5.0, 4: 0.2}, [new_long], [new_short]
+    )
+    await engine.manage_debit_spreads({"HOOD": [long, short]})
+    ((combo, _, _),) = engine.order_ops.orders.records()
+    assert [(leg.conId, leg.action) for leg in combo.comboLegs] == [
+        (2, "BUY"),  # buy back the short
+        (1, "SELL"),  # sell the long
+    ]
+
+
+def test_resize_never_adds_short_options():
+    from thetagang.risk import Adjuster
+    from thetagang.strategies.discretionary_trades import Resize, adds_short_options
+
+    short_put = _opt("HOOD", "20991120", 50.0, "P", -1)
+    single = Adjuster(10, "HOOD P50", False, -10.0, 0, 0, 0, 1, 1, (short_put,))
+    assert adds_short_options(Resize("HOOD", -2, single))  # sell 2 more puts
+    assert not adds_short_options(Resize("HOOD", 1, single))  # buy one back
+    credit = (
+        _opt("HOOD", "20991120", 50.0, "P", -1),
+        _opt("HOOD", "20991120", 45.0, "P", 1),
+    )
+    debit = (
+        _opt("HOOD", "20991120", 50.0, "P", -1),
+        _opt("HOOD", "20991120", 55.0, "P", 1),
+    )
+    spread = Adjuster(10, "s", True, 5.0, 0, 0, 0, 1, -1, credit)
+    assert adds_short_options(Resize("HOOD", 1, spread))  # open more credit
+    assert not adds_short_options(Resize("HOOD", -1, spread))  # close one
+    paid = Adjuster(10, "d", True, -5.0, 0, 0, 0, 1, -1, debit)
+    assert not adds_short_options(Resize("HOOD", 1, paid))  # debit: risk paid
+
+
+def test_target_share_sale_keeps_covered_calls_covered(engine):
+    """100 shares under a far-OTM short call: never suggested to sell them."""
+    shares = _stock("HOOD", 100)
+    call = _opt("HOOD", "20991120", 200.0, "C", -1, con_id=1)
+    traded, _, _, resize = engine._symbol_adjustment(
+        [shares, call], -100.0, {1: _greek(0.001)}, 1.0, 5000.0
+    )
+    assert (traded, resize) == (0, None)
+
+
 # ------------------------------------------------------------ VIX hedges
 
 
@@ -430,6 +597,15 @@ async def test_close_vix_hedges(engine, mocker):
     prices["option"] = float("nan")  # no quote: never sell at 0
     await engine.close_vix_hedges()
     assert engine.order_ops.orders.records() == []
+
+
+def test_vix_hedges_table_shows_unrealized_pnl():
+    from thetagang.strategies.discretionary_engine import vix_hedges_table
+
+    hedge = _opt("VIX", "20991118", 25.0, "C", 10, avg=150.0, upnl=420.0)
+    table = vix_hedges_table([hedge], 28.0, 30.0, False, False)
+    row = {c.header: Text.from_markup(str(c._cells[0])).plain for c in table.columns}
+    assert row["Unrealized P&L"] == "$420"
 
 
 @pytest.mark.asyncio
@@ -692,6 +868,18 @@ async def test_no_trading_override_applies_to_symbols_not_held(engine, mocker):
 
 
 @pytest.mark.asyncio
+async def test_new_trades_ignore_max_dte(engine, mocker):
+    """max_dte is a roll rule: new trades search with no expiry cap."""
+    from thetagang.config_models import SymbolConfig
+
+    _spy_put_plan(engine, mocker)
+    engine.symbol_overrides = {"SPY": SymbolConfig(weight=0.0, max_dte=21)}
+    await engine.portfolio_greeks_table()
+    kwargs = engine.option_scanner.find_eligible_contracts.call_args.kwargs
+    assert kwargs["max_dte"] == 0
+
+
+@pytest.mark.asyncio
 async def test_failed_spx_history_is_retried_next_run(engine, mocker):
     _book(engine, mocker)
     engine.ibkr.request_historical_data = mocker.AsyncMock(
@@ -781,6 +969,181 @@ async def test_zero_delta_proposals_without_trades(engine, mocker):
         "$-10",
     )
     assert engine.contract_greeks[7] == pytest.approx((-0.3, 0.02, -0.05, 0.1))
+
+
+def _place_targets(engine, mocker, price=2.0):
+    from thetagang.config import DiscretionaryStrategyConfig
+    from thetagang.config_models import SymbolConfig
+
+    engine.config.strategies.discretionary = DiscretionaryStrategyConfig(
+        place_target_orders=True
+    )
+    engine.config.portfolio.symbols = {  # managed = held stock/option symbols
+        s: SymbolConfig(weight=0.0) for s in ("AAPL", "HOOD")
+    }
+    engine.leg_price = mocker.AsyncMock(return_value=price)
+
+
+@pytest.mark.asyncio
+async def test_place_target_orders_turns_net_targets_into_orders(engine, mocker):
+    """AAPL sells 100 shares, HOOD buys back its short put, both at mid."""
+    _book(engine, mocker)
+    _place_targets(engine, mocker)
+    await engine.portfolio_greeks_table()
+    orders = {c.symbol: o for c, o in engine.planned_orders}
+    assert (orders["AAPL"].action, orders["AAPL"].totalQuantity) == ("SELL", 100)
+    assert (orders["HOOD"].action, orders["HOOD"].totalQuantity) == ("BUY", 1)
+    assert {o.orderRef for o in orders.values()} == {"thetagang-discretionary-resize"}
+    assert orders["AAPL"].lmtPrice == 2.0
+
+
+@pytest.mark.asyncio
+async def test_target_orders_skip_no_trading_symbols(engine, mocker):
+    from thetagang.config_models import SymbolConfig
+
+    _book(engine, mocker)
+    _place_targets(engine, mocker)
+    engine.config.portfolio.symbols["HOOD"] = SymbolConfig(weight=0.0, no_trading=True)
+    await engine.portfolio_greeks_table()
+    assert [c.symbol for c, _ in engine.planned_orders] == ["AAPL"]
+    assert engine.zero_delta["HOOD"][-1] == "none (no_trading)"
+
+
+@pytest.mark.asyncio
+async def test_target_orders_blocked_inside_band(engine, mocker):
+    from thetagang.config import DiscretionaryStrategyConfig
+
+    _book(engine, mocker)
+    engine.leg_price = mocker.AsyncMock(return_value=2.0)
+    engine.config.strategies.discretionary = DiscretionaryStrategyConfig(
+        place_target_orders=True, delta_band=10.0
+    )
+    await engine.portfolio_greeks_table()
+    assert engine.planned_orders == []  # SPX delta 4.30 is inside the band
+
+
+@pytest.mark.asyncio
+async def test_target_order_for_a_vertical_is_one_combo(engine, mocker):
+    from thetagang.risk import Adjuster
+    from thetagang.strategies.discretionary_trades import Resize
+
+    short = _opt("HOOD", "20991120", 50.0, "P", -2, con_id=1)
+    long = _opt("HOOD", "20991120", 45.0, "P", 2, con_id=2)
+    spread = Adjuster(30, "HOOD 50/45P", True, 15.0, 0, 0, 0, 2, -1, (short, long))
+    prices = {1: 2.5, 2: 1.0}
+    engine.leg_price = mocker.AsyncMock(side_effect=lambda c, ex: prices[c.conId])
+    combo, order = await engine._resize_order(Resize("HOOD", 2, spread), "SMART")
+    assert [(leg.conId, leg.action) for leg in combo.comboLegs] == [
+        (1, "SELL"),
+        (2, "BUY"),
+    ]  # open 2 more spreads for a credit
+    assert (order.action, order.totalQuantity, order.lmtPrice) == ("BUY", 2, -1.5)
+    combo, order = await engine._resize_order(Resize("HOOD", -1, spread), "SMART")
+    assert [leg.action for leg in combo.comboLegs] == ["BUY", "SELL"]  # close 1
+    assert order.lmtPrice == 1.5
+
+
+@pytest.mark.asyncio
+async def test_target_orders_skip_unmanaged_symbols(engine, mocker):
+    """Index options (and anything discover_symbols leaves out) are never resized."""
+    _book(engine, mocker)
+    _place_targets(engine, mocker)
+    del engine.config.portfolio.symbols["HOOD"]
+    await engine.portfolio_greeks_table()
+    assert [c.symbol for c, _ in engine.planned_orders] == ["AAPL"]
+
+
+@pytest.mark.asyncio
+async def test_debit_roll_uses_trade_target_and_skips_overlap(engine, mocker):
+    """Rolls keep the configured debit spread's delta/DTE, and an overlapping
+    first candidate is excluded and searched again."""
+    from thetagang.config import DiscretionaryStrategyConfig
+
+    engine.config.strategies.discretionary = DiscretionaryStrategyConfig(
+        trades=[
+            {
+                "symbol": "HOOD",
+                "structure": "call_debit_spread",
+                "delta": 0.5,
+                "dte": 60,
+                "width": 5,
+            }
+        ]
+    )
+    long = _opt("HOOD", _near_expiry(), 50.0, "C", 1, con_id=1)
+    short = _opt("HOOD", _near_expiry(), 55.0, "C", -1, con_id=2)
+    overlap = Option("HOOD", _near_expiry(), 45.0, "C", "SMART", conId=5)
+    new_long = Option("HOOD", "20991218", 52.0, "C", "SMART", conId=3)
+    new_short = Option("HOOD", "20991218", 57.0, "C", "SMART", conId=4)
+    old_long_again = Option("HOOD", _near_expiry(), 50.0, "C", "SMART", conId=1)
+    _spread_mocks(
+        engine,
+        mocker,
+        {1: 2.5, 2: 0.5, 3: 2.8, 4: 0.9, 5: 6.0},
+        [overlap, new_long],
+        [old_long_again, new_short],
+    )
+    await engine.manage_debit_spreads({"HOOD": [long, short]})
+    calls = engine.option_scanner.find_eligible_contracts.call_args_list
+    assert len(calls) == 2
+    assert (calls[0].kwargs["target_delta"], calls[0].kwargs["target_dte"]) == (0.5, 60)
+    assert (45.0, _near_expiry()) in calls[1].kwargs["also_exclude"]
+    ((combo, _, _),) = engine.order_ops.orders.records()
+    assert {leg.conId for leg in combo.comboLegs} == {1, 2, 3, 4}
+
+
+@pytest.mark.asyncio
+async def test_positions_caption_says_what_target_orders_did(engine, mocker):
+    from thetagang.config import DiscretionaryStrategyConfig
+
+    _book(engine, mocker)
+    _place_targets(engine, mocker)
+    await engine.portfolio_greeks_table()
+    caption = str(engine.positions_summary_table({}).caption)
+    assert "2 order(s) planned, 0 not placed" in caption
+    engine.config.strategies.discretionary = DiscretionaryStrategyConfig(
+        place_target_orders=True, delta_band=10.0
+    )
+    await engine.portfolio_greeks_table()
+    caption = str(engine.positions_summary_table({}).caption)
+    assert "no orders this run" in caption and "planned" not in caption
+
+
+def test_target_orders_and_trades_are_exclusive():
+    from pydantic import ValidationError
+
+    from thetagang.config import DiscretionaryStrategyConfig
+
+    with pytest.raises(ValidationError, match="not both"):
+        DiscretionaryStrategyConfig(
+            place_target_orders=True,
+            trades=[{"symbol": "SPY", "structure": "long_put"}],
+        )
+
+
+def test_option_reprice_default_covers_options_only(config):
+    """The discretionary default re-prices option orders of any symbol (VIX and
+    symbols not held included); shares stay as placed; a block's own setting wins."""
+    from ib_async import Contract
+
+    from thetagang.config_models import SymbolConfig
+    from thetagang.order_execution import OrderExecutionManager
+
+    config.strategies.discretionary.adjust_price_after_delay = True
+    config.portfolio.symbols = {
+        "HOOD": SymbolConfig(weight=0.0, adjust_price_after_delay=False),
+        "AAPL": SymbolConfig(weight=0.0),
+    }
+    manager = OrderExecutionManager.__new__(OrderExecutionManager)
+    manager.config = config
+    enabled = manager._legacy_adjust_enabled
+    assert enabled(Option("VIX", "20991118", 25.0, "C"))
+    assert enabled(Option("SPY", "20991120", 500.0, "P"))  # not held
+    assert enabled(Contract(secType="BAG", symbol="AAPL"))  # spread combo
+    assert not enabled(Stock("AAPL", "SMART", "USD"))  # shares
+    assert not enabled(Option("HOOD", "20991120", 50.0, "P"))  # explicit false
+    config.strategies.discretionary.adjust_price_after_delay = False
+    assert not enabled(Option("VIX", "20991118", 25.0, "C"))
 
 
 def test_discretionary_trade_config_validation():

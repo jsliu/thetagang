@@ -11,7 +11,7 @@ from ib_async import Contract, LimitOrder, MarketOrder, Order, Ticker
 from ib_async.wrapper import RequestError
 
 from thetagang import log
-from thetagang.config import Config
+from thetagang.config import Config, discretionary_mode_on
 from thetagang.config_models import SymbolConfig
 from thetagang.db import DataStore
 from thetagang.fmt import dfmt
@@ -389,23 +389,37 @@ class OrderExecutionManager:
         for idx, trade in enumerate(trades.records()):
             if not trade or is_tail_order_ref(getattr(trade.order, "orderRef", None)):
                 continue
-            symbol = trade.contract.symbol
-            try:
-                symbol_config = self.config.portfolio.symbols.get(symbol)
-            except AttributeError:
-                continue
-            if (
-                symbol_config is not None
-                and self._policy_for_symbol(symbol) is None
-                and symbol_config.adjust_price_after_delay
-                and not trade.isDone()
-            ):
+            if self._legacy_adjust_enabled(trade.contract) and not trade.isDone():
                 candidates.append((idx, trade))
         return candidates
 
+    def _discretionary_option_default(self) -> bool:
+        """[strategies.discretionary] adjust_price_after_delay: re-price unfilled
+        option orders (single options and combos) of symbols whose own block
+        doesn't set it, VIX and symbols not held included."""
+        return (
+            discretionary_mode_on(self.config)
+            and self.config.strategies.discretionary.adjust_price_after_delay is True
+        )
+
+    def _legacy_adjust_enabled(self, contract: Any) -> bool:
+        symbol = contract.symbol
+        if self._policy_for_symbol(symbol) is not None:
+            return False  # its execution policy reprices instead
+        try:
+            symbol_config = self.config.portfolio.symbols.get(symbol)
+        except AttributeError:
+            return False
+        own = getattr(symbol_config, "adjust_price_after_delay", None)
+        if symbol_config is not None and own is not None:
+            return bool(own)  # the symbol's own choice
+        return self._discretionary_option_default() and getattr(
+            contract, "secType", None
+        ) in ("OPT", "BAG")
+
     async def _adjust_legacy_prices(self, trades: Trades) -> None:
         try:
-            adjustment_enabled = any(
+            adjustment_enabled = self._discretionary_option_default() or any(
                 symbol_config.adjust_price_after_delay
                 and self._policy_for_symbol(symbol) is None
                 for symbol, symbol_config in self.config.portfolio.symbols.items()

@@ -157,6 +157,7 @@ class OptionChainScanner:
         exclude_con_ids: set[int] | None = None,
         also_exclude: Sequence[tuple[float, str]] = (),
         allow_missing_open_interest: bool | None = None,
+        max_dte: int | None = None,  # None: per-symbol/default cap; 0: no cap
     ) -> Ticker:
         contract_target_dte: int = (
             target_dte if target_dte else self.config.get_target_dte(underlying.symbol)
@@ -166,7 +167,11 @@ class OptionChainScanner:
             if target_delta
             else self.config.get_target_delta(underlying.symbol, right)
         )
-        contract_max_dte = self.config.get_max_dte_for(underlying.symbol)
+        contract_max_dte = (
+            max_dte
+            if max_dte is not None
+            else self.config.get_max_dte_for(underlying.symbol)
+        )
 
         log.notice(
             f"{underlying.symbol}: Searching option chain for "

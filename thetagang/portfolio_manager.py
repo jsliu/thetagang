@@ -56,7 +56,7 @@ from thetagang.strategies import (
     run_post_stages,
 )
 from thetagang.strategies.discretionary_engine import DiscretionaryEngine
-from thetagang.strategies.discretionary_risk import DISCRETIONARY_ORDER_REFS
+from thetagang.strategies.discretionary_trades import DISCRETIONARY_ORDER_REFS
 from thetagang.strategies.equity import EquityRebalanceService, RegimeRebalanceService
 from thetagang.strategies.equity_engine import EquityRebalanceEngine
 from thetagang.strategies.options import OptionsManageService, OptionsWriteService

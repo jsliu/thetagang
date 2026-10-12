@@ -339,7 +339,13 @@ suggested trade, next to the **Now** column. When
 `[[strategies.discretionary.trades]]` are configured, that column shows the
 planned discretionary trades instead (section 6), since those are real orders.
 
-They are suggestions only and place no orders. A symbol shows "n/a" if its
+They are suggestions only and place no orders, unless you set
+`place_target_orders = true` under `[strategies.discretionary]`. Then each one is
+placed as a limit order at mid (a spread as one combo order), tagged
+`thetagang-discretionary-resize`, with the same guards as new trades: no orders
+when an option has no greeks, inside `delta_band`, or while rolls/closes are
+queued; symbols with `no_trading` are skipped. It can't be combined with
+`[[strategies.discretionary.trades]]`, since each hedges the whole SPX delta. A symbol shows "n/a" if its
 Greeks couldn't be computed. Positions such as SGOV or VIX are counted in the
 totals but have no row in these tables.
 
@@ -393,3 +399,20 @@ and the short grows (+22%). Both totals end at zero.
   trade, or which you want to keep. Use it as a starting point.
 - **Delta drifts.** Hitting the target in share-equivalents works for small
   moves only, because option deltas change as prices move.
+
+---
+
+## 8. Long (debit) spreads
+
+A long call spread (long call below the short call) or long put spread (long put
+above the short put), same expiry and quantity, is managed as **one combo order**,
+never leg by leg:
+
+| When | Action | Setting |
+|---|---|---|
+| Spread worth ≥ 80% of its width (its maximum value) | Close: sell the long, buy back the short | `debit_spread_take_profit = 0.8` |
+| Otherwise, at DTE ≤ `roll_when.dte` | Roll out: sell the old spread, buy one in a later expiry with the same width, new long leg at the target delta | — |
+| The roll would cost more than 50% of the width | Not rolled; a warning asks you to handle it | `debit_spread_max_roll_debit = 0.5` |
+
+Both settings are under `[strategies.discretionary]`. Debit spreads also count as
+whole spreads in "Net target contracts" (`open N spread` / `close N spread`).

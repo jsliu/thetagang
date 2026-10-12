@@ -799,3 +799,12 @@ buy_only_rebalancing = true
     assert "[strategies.wheel.defaults.target]" in migrated
     assert "[strategies.wheel.equity_rebalance.symbol_overrides.AAA]" in migrated
     assert 'mode = "buy_only"' in migrated
+
+
+def test_migration_leaves_unset_adjust_price_after_delay_out(
+    sample_v1_config: str,
+) -> None:
+    """Unset per-symbol adjust_price_after_delay isn't written as false, so the
+    discretionary default can still apply to migrated symbols."""
+    result = migrate_v1_to_v2(sample_v1_config)
+    assert "adjust_price_after_delay" not in result.migrated_text

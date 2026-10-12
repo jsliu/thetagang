@@ -82,6 +82,7 @@ class Adjuster(NamedTuple):
     vega: float
     held: float  # units held; closing is capped here so positions never flip
     close_sign: int  # direction of units that close: -1 sell/close, +1 buy back
+    legs: tuple[Any, ...] = ()  # the positions: (option,) or (short, long)
 
 
 def size_adjustment(adjuster: Adjuster, shares: float) -> tuple[int, str]:
@@ -130,7 +131,18 @@ def spread_adjuster(
         f"{c.symbol} {c.lastTradeDateOrContractMonth} "
         f"{c.strike:g}/{long.contract.strike:g}{c.right}"
     )
-    return Adjuster(abs(delta * held), name, True, delta, gamma, theta, vega, held, -1)
+    return Adjuster(
+        abs(delta * held),
+        name,
+        True,
+        delta,
+        gamma,
+        theta,
+        vega,
+        held,
+        -1,
+        (short, long),
+    )
 
 
 def single_adjuster(
@@ -152,7 +164,15 @@ def single_adjuster(
         vega,
         held,
         close_sign,
+        (item,),
     )
+
+
+def is_debit_vertical(short: Any, long: Any) -> bool:
+    """The long leg is closer to the money than the short (paid a debit)."""
+    if short.contract.right.upper().startswith("P"):
+        return long.contract.strike > short.contract.strike
+    return long.contract.strike < short.contract.strike
 
 
 def scenario_pnl(legs: list[tuple[Any, ...]], spx_move: float, use_beta: bool) -> float:
