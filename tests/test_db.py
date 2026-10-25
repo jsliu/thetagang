@@ -115,6 +115,23 @@ def test_data_store_records_executions_and_queries(tmp_path) -> None:
         assert stored.account == "TEST123"
 
 
+def test_data_store_iv_snapshot_round_trip(tmp_path) -> None:
+    data_store = DataStore(
+        f"sqlite:///{tmp_path / 'state.db'}",
+        str(tmp_path / "thetagang.toml"),
+        dry_run=False,
+        config_text="test",
+    )
+    day = "2026-10-15"
+    assert data_store.get_iv_snapshot(day) == {}
+    data_store.record_iv_snapshot(day, {123: 0.4, 456: 0.25})
+    assert data_store.get_iv_snapshot(day) == {123: 0.4, 456: 0.25}
+    assert data_store.get_iv_snapshot("2026-10-14") == {}  # day mismatch
+    # a later, fuller snapshot for the same day replaces the earlier one
+    data_store.record_iv_snapshot(day, {123: 0.41, 456: 0.25, 789: 0.30})
+    assert data_store.get_iv_snapshot(day) == {123: 0.41, 456: 0.25, 789: 0.30}
+
+
 def test_sqlite_db_path_parses(tmp_path) -> None:
     db_path = tmp_path / "state.db"
     assert sqlite_db_path(f"sqlite:///{db_path}") == db_path

@@ -1,7 +1,8 @@
 from __future__ import annotations
 
+import asyncio
 import math
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from typing import Any
 
 from ib_async import TagValue, Ticker, util
@@ -9,13 +10,34 @@ from ib_async.contract import Contract, Option
 from ib_async.order import LimitOrder
 
 from thetagang import log
-from thetagang.config import Config
+from thetagang.config import Config, discretionary_mode_on
 from thetagang.db import DataStore
+from thetagang.exchange_hours import market_is_open
 from thetagang.fmt import dfmt
 from thetagang.ibkr import IBKR, TickerField
 from thetagang.options import option_dte
 from thetagang.orders import Orders
 from thetagang.util import midpoint_or_market_price
+
+
+def open_interest_ok(
+    ticker: Ticker, right: str, minimum: int, missing_ok: bool = False
+) -> bool:
+    """Open interest filter for option candidates. IB often sends no open interest
+    (historical/frozen data, outside market hours); ib_async leaves it NaN, which
+    fails every >= check. With missing_ok (the discretionary strategy, which only rolls
+    positions already held) missing counts as unknown and the contract is kept; the
+    wheel keeps the strict check for new contracts. Real low open interest is always
+    filtered."""
+    if right.startswith("P"):
+        oi = ticker.putOpenInterest
+    elif right.startswith("C"):
+        oi = ticker.callOpenInterest
+    else:
+        return False
+    if oi is None or util.isNan(oi):
+        return missing_ok
+    return oi >= minimum
 
 
 class NoValidContractsError(Exception):
@@ -115,6 +137,18 @@ class OrderOperations:
             )
 
 
+# discretionary chain scan: strikes requested per batch, nearest the money first
+QUOTE_SCAN_BATCH = 5
+
+
+def has_two_sided_quote(ticker: Ticker) -> bool:
+    """Both a bid and an ask (IB sends nan or -1 when a side is missing)."""
+    return all(
+        price is not None and not util.isNan(price) and price > 0
+        for price in (ticker.bid, ticker.ask)
+    )
+
+
 class OptionChainScanner:
     def __init__(
         self, *, config: Config, ibkr: IBKR, order_ops: OrderOperations
@@ -122,6 +156,65 @@ class OptionChainScanner:
         self.config = config
         self.ibkr = ibkr
         self.order_ops = order_ops
+
+    async def _chain_quotes(
+        self,
+        symbol: str,
+        contracts: Sequence[Contract],
+        right: str,
+        quote_fields: dict[str, Any],
+    ) -> list[Ticker]:
+        """Quotes for the chain scan. Discretionary mode with the market open:
+        stop at the first strike without a bid/ask; off-hours every strike lacks
+        one, so the whole window is requested (as outside discretionary mode)."""
+        if discretionary_mode_on(self.config) and market_is_open(
+            self.config.runtime.exchange_hours.exchange
+        ):
+            return await self._quotes_until_gap(symbol, contracts, right, quote_fields)
+        return await self.ibkr.get_tickers_for_contracts(
+            symbol, list(contracts), **quote_fields
+        )
+
+    async def _quotes_until_gap(
+        self,
+        symbol: str,
+        contracts: Sequence[Contract],
+        right: str,
+        quote_fields: dict[str, Any],
+    ) -> list[Ticker]:
+        """Discretionary mode, market open: per expiration, request strikes from the money
+        outward in small batches and stop at the first strike with no bid or no
+        ask - strikes further out are less liquid still, so the rest of the
+        option_chains.strikes window isn't requested. Expirations run in
+        parallel; only strikes before the gap are returned."""
+        by_expiry: dict[str, list[Contract]] = {}
+        for c in contracts:
+            by_expiry.setdefault(c.lastTradeDateOrContractMonth, []).append(c)
+
+        async def scan(chain: list[Contract]) -> list[Ticker]:
+            # calls: strikes go up from the money; puts: down from it
+            chain.sort(key=lambda c: c.strike, reverse=right.startswith("P"))
+            kept: list[Ticker] = []
+            for i in range(0, len(chain), QUOTE_SCAN_BATCH):
+                batch = chain[i : i + QUOTE_SCAN_BATCH]
+                quotes = await asyncio.gather(
+                    *(
+                        self.ibkr.get_ticker_for_contract(c, **quote_fields)
+                        for c in batch
+                    )
+                )
+                for c, ticker in zip(batch, quotes):
+                    if not has_two_sided_quote(ticker):
+                        log.info(
+                            f"{symbol} {c.lastTradeDateOrContractMonth}: no bid/ask "
+                            f"at strike {c.strike:g}, scan stops there"
+                        )
+                        return kept
+                    kept.append(ticker)
+            return kept
+
+        found = await asyncio.gather(*(scan(c) for c in by_expiry.values()))
+        return [ticker for tickers in found for ticker in tickers]
 
     async def find_eligible_contracts(
         self,
@@ -135,6 +228,9 @@ class OptionChainScanner:
         target_dte: int | None = None,
         target_delta: float | None = None,
         exclude_con_ids: set[int] | None = None,
+        also_exclude: Sequence[tuple[float, str]] = (),
+        allow_missing_open_interest: bool | None = None,
+        max_dte: int | None = None,  # None: per-symbol/default cap; 0: no cap
     ) -> Ticker:
         contract_target_dte: int = (
             target_dte if target_dte else self.config.get_target_dte(underlying.symbol)
@@ -144,7 +240,11 @@ class OptionChainScanner:
             if target_delta
             else self.config.get_target_delta(underlying.symbol, right)
         )
-        contract_max_dte = self.config.get_max_dte_for(underlying.symbol)
+        contract_max_dte = (
+            max_dte
+            if max_dte is not None
+            else self.config.get_max_dte_for(underlying.symbol)
+        )
 
         log.notice(
             f"{underlying.symbol}: Searching option chain for "
@@ -224,35 +324,44 @@ class OptionChainScanner:
         if exclude_con_ids:
             contracts = [c for c in contracts if c.conId not in exclude_con_ids]
 
+        # exclude specific (strike, expiry) contracts, e.g. legs of a spread being rolled
+        excluded = {(strike, expiry) for strike, expiry in also_exclude}
         if exclude_exp_strike:
+            excluded.add(exclude_exp_strike)
+        if excluded:
             contracts = [
                 c
                 for c in contracts
-                if (
-                    c.lastTradeDateOrContractMonth != exclude_exp_strike[1]
-                    or c.strike != exclude_exp_strike[0]
-                )
+                if (c.strike, c.lastTradeDateOrContractMonth) not in excluded
             ]
 
-        tickers = await self.ibkr.get_tickers_for_contracts(
-            underlying.symbol,
-            contracts,
-            generic_tick_list="101",
-            required_fields=[],
-            optional_fields=[
+        quote_fields: dict[str, Any] = {
+            "generic_tick_list": "101",
+            "required_fields": [],
+            "optional_fields": [
                 TickerField.MARKET_PRICE,
                 TickerField.GREEKS,
                 TickerField.OPEN_INTEREST,
                 TickerField.MIDPOINT,
             ],
+        }
+        tickers = await self._chain_quotes(
+            underlying.symbol, contracts, right, quote_fields
         )
 
         def open_interest_is_valid(ticker: Ticker, minimum_open_interest: int) -> bool:
-            if right.startswith("P"):
-                return ticker.putOpenInterest >= minimum_open_interest
-            if right.startswith("C"):
-                return ticker.callOpenInterest >= minimum_open_interest
-            return False
+            return open_interest_ok(
+                ticker,
+                right,
+                minimum_open_interest,
+                # rolls of held positions in discretionary mode may accept a
+                # missing open interest; new positions never do
+                missing_ok=(
+                    discretionary_mode_on(self.config)
+                    if allow_missing_open_interest is None
+                    else allow_missing_open_interest
+                ),
+            )
 
         def delta_is_valid(ticker: Ticker) -> bool:
             model_greeks = ticker.modelGreeks

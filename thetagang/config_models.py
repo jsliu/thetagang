@@ -815,7 +815,9 @@ class SymbolConfig(BaseModel):
     volatility_weight: Optional["SymbolConfig.VolatilityWeight"] = None
     absolute_trend: Optional["SymbolConfig.AbsoluteTrend"] = None
     execution: Optional["SymbolConfig.Execution"] = None
-    adjust_price_after_delay: bool = Field(default=False)
+    # None = not set: off, or [strategies.discretionary] adjust_price_after_delay
+    # for option orders; written out only when set, so migrated configs inherit it
+    adjust_price_after_delay: bool | None = None
     no_trading: bool | None = None
     buy_only_rebalancing: bool | None = None
     buy_only_min_threshold_shares: int | None = Field(default=None, ge=1)

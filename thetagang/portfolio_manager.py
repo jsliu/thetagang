@@ -33,8 +33,10 @@ from thetagang.accounting import (
 from thetagang.config import (
     CANONICAL_STAGE_ORDER,
     DEFAULT_RUN_STRATEGIES,
+    DISCRETIONARY_STAGE_ID,
     Config,
     RunConfig,
+    discretionary_mode_on,
     enabled_stage_ids_from_run,
     stage_enabled_map_from_run,
 )
@@ -53,6 +55,8 @@ from thetagang.strategies import (
     run_option_write_stages,
     run_post_stages,
 )
+from thetagang.strategies.discretionary_engine import DiscretionaryEngine
+from thetagang.strategies.discretionary_trades import DISCRETIONARY_ORDER_REFS
 from thetagang.strategies.equity import EquityRebalanceService, RegimeRebalanceService
 from thetagang.strategies.equity_engine import EquityRebalanceEngine
 from thetagang.strategies.options import OptionsManageService, OptionsWriteService
@@ -201,6 +205,17 @@ class PortfolioManager:
             qualified_contracts=self.qualified_contracts,
             data_store=self.data_store,
         )
+        self.discretionary_engine = DiscretionaryEngine(
+            config=self.config,
+            ibkr=self.ibkr,
+            order_ops=self.order_ops,
+            option_scanner=self.option_scanner,
+            qualified_contracts=self.qualified_contracts,
+            put_is_itm=self.options_engine.put_is_itm,
+            call_is_itm=self.options_engine.call_is_itm,
+            get_primary_exchange=self.get_primary_exchange,
+        )
+        self.options_engine.discretionary = self.discretionary_engine
         self.regime_engine = RegimeRebalanceEngine(
             config=self.config,
             ibkr=self.ibkr,
@@ -422,6 +437,18 @@ class PortfolioManager:
             and getattr(order, "account", "") == self.account_number
             and (
                 symbol in self.get_symbols()
+                or (
+                    # portfolio manager: [portfolio.symbols.X] overrides not held yet
+                    # are ours; stale VIX hedge sells must not double-sell on rerun
+                    discretionary_mode_on(self.config)
+                    and (
+                        symbol in self.discretionary_engine.symbol_overrides
+                        or (
+                            symbol == "VIX"
+                            and self.config.strategies.vix_call_hedge.close_hedges_when_vix_exceeds
+                        )
+                    )
+                )
                 or (self.config.strategies.vix_call_hedge.enabled and symbol == "VIX")
                 or (
                     self.config.strategies.cash_management.enabled
@@ -440,18 +467,17 @@ class PortfolioManager:
                 order is None
                 or trade.isDone()
                 or getattr(order, "account", None) != self.account_number
-                or getattr(order, "orderRef", None) != TAIL_HEDGE_ENTRY_ORDER_REF
+                or getattr(order, "orderRef", None)
+                not in (TAIL_HEDGE_ENTRY_ORDER_REF, *DISCRETIONARY_ORDER_REFS)
             ):
                 continue
             if self.dry_run:
                 log.warning(
-                    f"{trade.contract.symbol}: Dry run, would cancel stale tail entry "
+                    f"{trade.contract.symbol}: Dry run, would cancel stale entry "
                     f"{order}"
                 )
             else:
-                log.warning(
-                    f"{trade.contract.symbol}: Canceling stale tail entry {order}"
-                )
+                log.warning(f"{trade.contract.symbol}: Canceling stale entry {order}")
                 self.ibkr.cancel_order(order)
 
         if not self.config.runtime.account.cancel_orders:
@@ -461,7 +487,7 @@ class PortfolioManager:
             if not self._is_startup_cancel_candidate(trade):
                 continue
             order_ref = getattr(trade.order, "orderRef", None)
-            if order_ref == TAIL_HEDGE_ENTRY_ORDER_REF:
+            if order_ref in (TAIL_HEDGE_ENTRY_ORDER_REF, *DISCRETIONARY_ORDER_REFS):
                 continue
             if is_tail_order_ref(order_ref):
                 log.info(
@@ -512,11 +538,16 @@ class PortfolioManager:
         )
         table.add_row("Total cash", dfmt(account.total_cash, 0))
         table.add_row("Cushion", pfmt(account.value(AccountMetric.CUSHION), 0))
-        table.add_section()
-        table.add_row(
-            "Target buying power usage", dfmt(self.get_buying_power(account_summary), 0)
-        )
-        log.print(Panel(table))
+        if discretionary_mode_on(self.config):
+            # portfolio manager: SPX beta-weighted greeks, stress, delta by symbol
+            log.print(Panel(await self.discretionary_engine.risk_panel(table)))
+        else:
+            table.add_section()
+            table.add_row(
+                "Target buying power usage",
+                dfmt(self.get_buying_power(account_summary), 0),
+            )
+            log.print(Panel(table))
 
         portfolio_positions = await self.load_initial_portfolio_positions()
         untracked_positions = self.last_untracked_positions
@@ -599,6 +630,29 @@ class PortfolioManager:
         table.add_column("Exp", justify="right")
         table.add_column("DTE", justify="right")
         table.add_column("ITM?")
+        # discretionary: per-contract greeks from the risk tables (explained under
+        # the Managed symbols table)
+        show_greeks = discretionary_mode_on(self.config)
+        contract_greeks = self.discretionary_engine.contract_greeks
+        if show_greeks:
+            for column in ("Delta", "Gamma", "Theta", "Vega"):
+                table.add_column(column, justify="right")
+            table.caption = (
+                "Portfolio positions shows the same greeks per contract, per share, "
+                "as IB quotes them (delta 0-1, stock = 1); multiply by 100 x "
+                "quantity for the position.\n"
+                "n/a: no greeks from IB (VIX and untracked positions are not in "
+                "the risk numbers)."
+            )
+            table.caption_justify = "left"
+
+        def greek_cells(values: tuple[float, ...] | None) -> list[str]:
+            if not show_greeks:
+                return []
+            if values is None:
+                return ["n/a"] * 4
+            delta, gamma, theta, vega = values
+            return [f"{delta:+.2f}", f"{gamma:+.3f}", f"{theta:+.3f}", f"{vega:+.3f}"]
 
         def getval(col: str, conId: int) -> str:
             return position_values[conId][col]
@@ -627,6 +681,8 @@ class PortfolioManager:
                         getval("cost", conId),
                         getval("unrealized", conId),
                         getval("p&l", conId),
+                        *([""] * 4 if show_greeks else []),
+                        *greek_cells(contract_greeks.get(conId)),
                     )
                 elif isinstance(pos.contract, Option):
                     table.add_row(
@@ -643,6 +699,7 @@ class PortfolioManager:
                         getval("exp", conId),
                         getval("dte", conId),
                         getval("itm?", conId),
+                        *greek_cells(contract_greeks.get(conId)),
                     )
 
         first = True
@@ -838,8 +895,18 @@ class PortfolioManager:
             self.set_reserved_cash_for_post_management(0.0)
             if self.data_store:
                 self.data_store.record_event("run_start", {"dry_run": self.dry_run})
+            if discretionary_mode_on(self.config):
+                # manage every symbol held; [portfolio.symbols.X] are overrides
+                self.discretionary_engine.discover_symbols()
             self.initialize_account()
             (account_summary, portfolio_positions) = await self.summarize_account()
+            if discretionary_mode_on(self.config):
+                log.print(self.discretionary_engine.symbols_table())
+                log.print(
+                    self.discretionary_engine.positions_summary_table(
+                        portfolio_positions
+                    )
+                )
 
             enabled_stages = set(self.run_stage_order)
             stage_index = {
@@ -855,7 +922,9 @@ class PortfolioManager:
                 "post_tail_hedge",
                 "post_cash_management",
             }
-            rematerialize_before_stage_ids = management_stage_ids | post_stage_ids
+            rematerialize_before_stage_ids = (
+                management_stage_ids | post_stage_ids | {DISCRETIONARY_STAGE_ID}
+            )
             pre_management_trade_stage_ids = {
                 "options_write_puts",
                 "options_write_calls",
@@ -923,6 +992,8 @@ class PortfolioManager:
                         account_summary,
                         portfolio_positions,
                     )
+                elif stage_id == DISCRETIONARY_STAGE_ID:
+                    await self.discretionary_engine.run_post_stage(portfolio_positions)
                 elif stage_id in post_stage_ids:
                     post_positions = portfolio_positions
                     if stage_id == "post_tail_hedge":
@@ -944,7 +1015,7 @@ class PortfolioManager:
             if self.dry_run:
                 log.warning("Dry run enabled, no trades will be executed.")
 
-                self.orders.print_summary()
+                self.orders.print_summary(self.qualified_contracts)
             else:
                 with self.ibkr.supervise_order_errors(self.trades.records):
                     self.submit_orders()

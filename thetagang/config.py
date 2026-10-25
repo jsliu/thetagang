@@ -6,7 +6,7 @@ import re
 from collections import defaultdict
 from collections.abc import Mapping
 from enum import Enum
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 from rich import box
@@ -49,6 +49,7 @@ STAGE_KIND_BY_ID: dict[str, str] = {
     "equity_sell_rebalance": "equity.sell_rebalance",
     "options_roll_positions": "options.roll_positions",
     "options_close_positions": "options.close_positions",
+    "post_discretionary": "post.discretionary",
     "post_vix_call_hedge": "post.vix_call_hedge",
     "post_tail_hedge": "post.tail_hedge",
     "post_cash_management": "post.cash_management",
@@ -62,6 +63,7 @@ CANONICAL_STAGE_ORDER: list[str] = [
     "equity_sell_rebalance",
     "options_roll_positions",
     "options_close_positions",
+    "post_discretionary",
     "post_vix_call_hedge",
     "post_tail_hedge",
     "post_cash_management",
@@ -75,6 +77,7 @@ STAGE_CAPABILITY_LABELS: dict[str, str] = {
     "equity_sell_rebalance": "Wheel share selling",
     "options_roll_positions": "Wheel option rolling",
     "options_close_positions": "Wheel option closing",
+    "post_discretionary": "Discretionary trading",
     "post_vix_call_hedge": "VIX call hedging",
     "post_tail_hedge": "Tail-hedge option trading",
     "post_cash_management": "Cash management",
@@ -93,7 +96,25 @@ WHEEL_OPTION_STAGE_IDS = {
     "options_close_positions",
 }
 
+# The discretionary strategy manages what is held (rolls/closes, credit verticals
+# as whole spreads), shows SPX risk tables, closes long VIX hedges above a VIX
+# threshold, and opens only the trades listed in strategies.discretionary.trades,
+# sized so SPX delta goes to 0 while existing positions stay as they are.
+# Roll settings come from strategies.wheel.
+DISCRETIONARY_STAGE_ID = "post_discretionary"
+DISCRETIONARY_STRATEGY_ID = "discretionary"
+# stages that size positions by portfolio weights: never combined with the
+# discretionary strategy, which sizes its own trades by SPX delta
+POSITION_OPENING_STAGE_IDS = {
+    "options_write_puts",
+    "options_write_calls",
+    "equity_regime_rebalance",
+    "equity_buy_rebalance",
+    "equity_sell_rebalance",
+}
+
 RUN_STRATEGY_IDS = {
+    "discretionary",
     "wheel",
     "regime_rebalance",
     "vix_call_hedge",
@@ -102,6 +123,11 @@ RUN_STRATEGY_IDS = {
 }
 
 STRATEGY_STAGE_IDS: dict[str, set[str]] = {
+    "discretionary": {
+        "options_roll_positions",
+        "options_close_positions",
+        "post_discretionary",
+    },
     "wheel": {
         "options_write_puts",
         "options_write_calls",
@@ -190,6 +216,14 @@ class RunConfig(BaseModel):
                 raise ValueError(
                     "run.strategies cannot enable wheel and regime_rebalance together"
                 )
+            if DISCRETIONARY_STRATEGY_ID in self.strategies and (
+                {"wheel", "regime_rebalance"} & set(self.strategies)
+            ):
+                raise ValueError(
+                    "run.strategies cannot enable discretionary together with "
+                    "wheel or regime_rebalance (it sizes its own trades by SPX "
+                    "delta, they size positions by portfolio weights)"
+                )
             return self
 
         stage_ids = [s.id for s in self.stages]
@@ -257,6 +291,13 @@ class RunConfig(BaseModel):
                 raise ValueError(
                     f"run.stages.{stage_id} requires enabled stage(s): {missing_text}"
                 )
+        if DISCRETIONARY_STAGE_ID in enabled_stage_ids and (
+            enabled_stage_ids & POSITION_OPENING_STAGE_IDS
+        ):
+            raise ValueError(
+                "run.stages cannot enable post_discretionary together with "
+                "weight-sizing stages (options_write_*/equity_*)"
+            )
         if "equity_regime_rebalance" in enabled_stage_ids and (
             enabled_stage_ids & WHEEL_OPTION_STAGE_IDS
         ):
@@ -308,21 +349,10 @@ class RuntimeConfig(BaseModel):
 
 
 class PortfolioConfig(BaseModel):
+    # Wheel/regime: the symbols to trade, with weights summing to 1 (checked in
+    # Config). Discretionary strategy: optional per-symbol overrides; every held
+    # symbol is managed.
     symbols: dict[str, SymbolConfig] = Field(default_factory=dict)
-
-    @model_validator(mode="after")
-    def check_symbols(self) -> PortfolioConfig:
-        if not self.symbols:
-            raise ValueError("At least one symbol must be specified")
-        return self
-
-    @model_validator(mode="after")
-    def check_symbol_weights(self) -> PortfolioConfig:
-        if not math.isclose(
-            1, sum([s.weight or 0.0 for s in self.symbols.values()]), rel_tol=1e-5
-        ):
-            raise ValueError("Symbol weights must sum to 1.0")
-        return self
 
 
 class RebalanceMode(str, Enum):
@@ -443,6 +473,93 @@ class RegimeRebalanceStrategyConfig(RegimeRebalanceConfig):
     )
 
 
+# structure -> (right, sign of the main leg at the target delta,
+#              (strike offset direction, sign) of the second leg or None)
+DISCRETIONARY_STRUCTURES: dict[str, tuple[str, int, tuple[int, int] | None]] = {
+    "long_call": ("C", +1, None),
+    "short_call": ("C", -1, None),
+    "long_put": ("P", +1, None),
+    "short_put": ("P", -1, None),
+    "put_credit_spread": ("P", -1, (-1, +1)),  # short put, long put below
+    "call_credit_spread": ("C", -1, (+1, +1)),  # short call, long call above
+    "put_debit_spread": ("P", +1, (-1, -1)),  # long put, short put below
+    "call_debit_spread": ("C", +1, (+1, -1)),  # long call, short call above
+}
+
+
+class DiscretionaryTradeConfig(BaseModel):
+    """A trade the discretionary strategy may open to bring SPX delta to 0."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    symbol: str = Field(min_length=1)
+    structure: Literal[
+        "long_call",
+        "short_call",
+        "long_put",
+        "short_put",
+        "put_credit_spread",
+        "call_credit_spread",
+        "put_debit_spread",
+        "call_debit_spread",
+    ]
+    # |delta| of the main leg (the short leg of a credit spread, the long leg of a
+    # debit spread); the closest available contract at or below it is used
+    delta: float = Field(default=0.3, gt=0.0, lt=1.0)
+    # minimum days to expiry of the new contract
+    dte: int = Field(default=30, ge=1)
+    # spreads only: distance in $ between the two strikes
+    width: float | None = Field(default=None, gt=0.0)
+    # relative share of the hedge this trade carries (normalized across trades)
+    weight: float = Field(default=1.0, gt=0.0)
+    # optional cap on contracts (spreads: number of spreads) opened per run
+    max_contracts: int | None = Field(default=None, ge=1)
+
+    @model_validator(mode="after")
+    def validate_width(self) -> DiscretionaryTradeConfig:
+        is_spread = DISCRETIONARY_STRUCTURES[self.structure][2] is not None
+        if is_spread and self.width is None:
+            raise ValueError(f"{self.symbol} {self.structure}: width is required")
+        if not is_spread and self.width is not None:
+            raise ValueError(
+                f"{self.symbol} {self.structure}: width is for spreads only"
+            )
+        return self
+
+
+class DiscretionaryStrategyConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    # no new trades while |SPX delta| is within this band (SPX units): keeps reruns
+    # from churning once the book is roughly neutral
+    delta_band: float = Field(default=1.0, ge=0.0)
+    trades: list[DiscretionaryTradeConfig] = Field(default_factory=list)
+    # place the positions summary's "Net target contracts" as real orders
+    # (resizing what is held toward SPX delta 0) instead of only showing them
+    place_target_orders: bool = False
+    # re-price unfilled option orders (rolls, closes, trades, resizes, VIX) once,
+    # halfway toward the current mid, for symbols whose [portfolio.symbols.X]
+    # block doesn't set it; share and cash-fund orders are left as placed
+    adjust_price_after_delay: bool = False
+    # long (debit) verticals, managed as one combo: close once this fraction of
+    # the max profit (width - debit paid) is made; otherwise roll it out at
+    # roll_when.dte, skipping rolls that cost more than max_roll_debit x width
+    debit_spread_take_profit: float = Field(default=0.8, gt=0.0, le=1.0)
+    debit_spread_max_roll_debit: float = Field(default=0.5, ge=0.0)
+    # standalone long calls/puts: remind to roll or close once |delta| reaches
+    # this (deep in the money: little time value left). Reminder only, no orders.
+    long_option_alert_delta: float = Field(default=0.8, gt=0.0, lt=1.0)
+
+    @model_validator(mode="after")
+    def check_one_hedge(self) -> DiscretionaryStrategyConfig:
+        if self.place_target_orders and self.trades:
+            raise ValueError(
+                "strategies.discretionary: use either trades or place_target_orders, "
+                "not both - each hedges the whole SPX delta on its own"
+            )
+        return self
+
+
 class StrategiesConfig(BaseModel):
     wheel: WheelStrategyConfig
     regime_rebalance: RegimeRebalanceStrategyConfig = Field(
@@ -451,6 +568,9 @@ class StrategiesConfig(BaseModel):
     vix_call_hedge: VIXCallHedgeConfig = Field(default_factory=VIXCallHedgeConfig)
     tail_hedge: TailHedgeConfig = Field(default_factory=TailHedgeConfig)
     cash_management: CashManagementConfig = Field(default_factory=CashManagementConfig)
+    discretionary: DiscretionaryStrategyConfig = Field(
+        default_factory=DiscretionaryStrategyConfig
+    )
 
 
 class Config(BaseModel, DisplayMixin):
@@ -461,6 +581,44 @@ class Config(BaseModel, DisplayMixin):
     runtime: RuntimeConfig
     portfolio: PortfolioConfig
     strategies: StrategiesConfig
+
+    @model_validator(mode="before")
+    @classmethod
+    def discretionary_defaults(cls, data: Any) -> Any:
+        """Discretionary strategy: [portfolio] is optional, [portfolio.symbols.X]
+        blocks are overrides only (no weight), and account.margin_usage (wheel
+        sizing) is not needed."""
+        if not isinstance(data, dict) or not run_enables_discretionary(data.get("run")):
+            return data
+        account = (data.get("runtime") or {}).get("account")
+        if isinstance(account, dict):
+            # wheel sizing only; discretionary trades are sized by SPX delta
+            account.setdefault("margin_usage", 1.0)
+        portfolio = data.setdefault("portfolio", {})
+        if isinstance(portfolio, dict):
+            for symbol_cfg in (portfolio.get("symbols") or {}).values():
+                if isinstance(symbol_cfg, dict):
+                    symbol_cfg.setdefault("weight", 0.0)
+        return data
+
+    @model_validator(mode="after")
+    def check_portfolio_symbols(self) -> Config:
+        if self.discretionary_mode:
+            return self  # symbols come from the IB positions at runtime
+        if not self.portfolio.symbols:
+            raise ValueError("At least one symbol must be specified")
+        if not math.isclose(
+            1,
+            sum([s.weight or 0.0 for s in self.portfolio.symbols.values()]),
+            rel_tol=1e-5,
+        ):
+            raise ValueError("Symbol weights must sum to 1.0")
+        return self
+
+    @property
+    def discretionary_mode(self) -> bool:
+        """True when the discretionary strategy runs."""
+        return run_enables_discretionary(self.run)
 
     def _validate_external_market_decision(self, policy: MarketDecisionConfig) -> None:
         decision_name = policy.decision_name
@@ -1061,6 +1219,28 @@ class Config(BaseModel, DisplayMixin):
 
 
 DEFAULT_RUN_STRATEGIES: list[str] = ["wheel", "vix_call_hedge", "cash_management"]
+
+
+def discretionary_mode_on(config: Any) -> bool:
+    """Strict check that the discretionary strategy is enabled (False for anything that
+    isn't a real Config saying so, e.g. test doubles)."""
+    return getattr(config, "discretionary_mode", False) is True
+
+
+def run_enables_discretionary(run: Any) -> bool:
+    """Whether a run config (model or raw dict) enables the discretionary strategy."""
+    if isinstance(run, RunConfig):
+        return DISCRETIONARY_STAGE_ID in enabled_stage_ids_from_run(run)
+    if not isinstance(run, dict):
+        return False
+    if DISCRETIONARY_STRATEGY_ID in (run.get("strategies") or []):
+        return True
+    return any(
+        isinstance(stage, dict)
+        and stage.get("id") == DISCRETIONARY_STAGE_ID
+        and stage.get("enabled", True)
+        for stage in run.get("stages") or []
+    )
 
 
 def enabled_stage_ids_from_run(run: RunConfig) -> list[str]:

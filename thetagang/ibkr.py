@@ -1,5 +1,6 @@
 import asyncio
 import math
+import time
 from collections.abc import Awaitable, Callable, Coroutine, Iterator
 from contextlib import contextmanager
 from enum import Enum
@@ -94,6 +95,34 @@ class IBKR:
 
     def portfolio(self, account: str) -> list[PortfolioItem]:
         return self.ib.portfolio(account)
+
+    async def daily_pnl(
+        self, account: str, con_ids: list[int], timeout: float = 5.0
+    ) -> dict[int, float]:
+        """Today's P&L per position by conId (TWS's "Daily P&L"). Positions IB
+        doesn't report within `timeout` seconds are left out."""
+        subscriptions = {
+            con_id: self.ib.reqPnLSingle(account, "", con_id) for con_id in set(con_ids)
+        }
+
+        def reported(value: float) -> bool:
+            # IB sends nan before the first update and DBL_MAX for "unset"
+            return not util.isNan(value) and abs(value) < 1e300
+
+        try:
+            deadline = time.monotonic() + timeout
+            while time.monotonic() < deadline and not all(
+                reported(s.dailyPnL) for s in subscriptions.values()
+            ):
+                await asyncio.sleep(0.1)
+            return {
+                con_id: float(s.dailyPnL)
+                for con_id, s in subscriptions.items()
+                if reported(s.dailyPnL)
+            }
+        finally:
+            for con_id in subscriptions:
+                self.ib.cancelPnLSingle(account, "", con_id)
 
     def cached_net_liquidation(self, account: str) -> float:
         """Read NLV from a newly materialized synchronized account-value cache."""

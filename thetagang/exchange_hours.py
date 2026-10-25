@@ -1,5 +1,6 @@
 import time
 from datetime import UTC, date, datetime
+from functools import lru_cache
 
 import exchange_calendars as xcals
 import pandas as pd
@@ -37,6 +38,25 @@ def _next_session_open_from_schedule(
         candidate = sessions[idx]
         schedule = calendar.schedule.loc[candidate]
     return schedule["open"]
+
+
+@lru_cache(maxsize=4)
+def _calendar(exchange: str) -> xcals.ExchangeCalendar:
+    return xcals.get_calendar(exchange)
+
+
+def market_is_open(exchange: str, now: datetime | None = None) -> bool:
+    """Regular session open right now (no delay_after_open/before_close)."""
+    now = now or datetime.now(UTC)
+    is_session, session_open, session_close = _session_times_from_schedule(
+        _calendar(exchange), now.date()
+    )
+    return bool(
+        is_session
+        and session_open is not None
+        and session_close is not None
+        and session_open <= pd.Timestamp(now) < session_close
+    )
 
 
 def determine_action(config: ExchangeHoursConfig, now: datetime) -> str:

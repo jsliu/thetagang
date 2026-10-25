@@ -255,12 +255,26 @@ class TestPortfolioManager:
             portfolio_manager,
             order_ref="tg:tail-hedge:close",
         )
-        prepare_initialization(portfolio_manager, mocker, [entry, close])
+        discretionary = working_trade(
+            mocker,
+            portfolio_manager,
+            order_ref="thetagang-discretionary-entry",
+        )
+        managed = working_trade(  # spread roll/close or VIX hedge sell
+            mocker,
+            portfolio_manager,
+            order_ref="thetagang-discretionary-manage",
+        )
+        prepare_initialization(
+            portfolio_manager, mocker, [entry, close, discretionary, managed]
+        )
         portfolio_manager.config.runtime.account.cancel_orders = False
 
         portfolio_manager.initialize_account()
 
-        portfolio_manager.ibkr.cancel_order.assert_called_once_with(entry.order)
+        assert [
+            call.args[0] for call in portfolio_manager.ibkr.cancel_order.call_args_list
+        ] == [entry.order, discretionary.order, managed.order]
 
     def test_submit_orders_caps_tail_sales_to_uncommitted_live_position(
         self, portfolio_manager, mocker
