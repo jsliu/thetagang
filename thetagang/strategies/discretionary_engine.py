@@ -17,6 +17,7 @@ engine to skip spread legs and applies the manager strike rule.
 
 from __future__ import annotations
 
+import math
 from collections.abc import Awaitable, Callable
 from datetime import date
 from typing import Any
@@ -28,7 +29,7 @@ from rich.table import Table
 
 from thetagang import log
 from thetagang.config import Config
-from thetagang.fmt import dfmt, ifmt, pfmt
+from thetagang.fmt import contract_label, dfmt, ifmt, pfmt
 from thetagang.ibkr import IBKR
 from thetagang.options import option_dte
 from thetagang.strategies.discretionary_risk import DiscretionaryRiskMixin
@@ -119,7 +120,7 @@ def vix_hedges_table(
         table.add_column(column, justify="left" if column == "Contract" else "right")
     for p in hedges:
         table.add_row(
-            p.contract.localSymbol,
+            contract_label(p.contract),
             ifmt(int(p.position)),
             str(option_dte(p.contract.lastTradeDateOrContractMonth)),
             dfmt(p.marketPrice),
@@ -127,6 +128,85 @@ def vix_hedges_table(
             pfmt(position_pnl(p), 1),
             "[red]Close" if close else "Keep",
         )
+    return table
+
+
+def options_table(
+    kind: str,
+    shorts: list[PortfolioItem],
+    rollable: list[PortfolioItem],
+    closeable: list[PortfolioItem],
+    longs: list[PortfolioItem],
+    deltas: dict[int, float],
+    take_profit: float | None,
+    alert_delta: float,
+) -> Table:
+    """Standalone puts or calls (spread legs are in the Spreads table): shorts
+    with what this run does and the take-profit buy-back price; longs with a
+    roll-or-close reminder once |delta| >= alert_delta (no orders for longs)."""
+    rolled = {id(p) for p in rollable}
+    closed = {id(p) for p in closeable}
+
+    def count(items: list[PortfolioItem]) -> int:
+        return math.floor(sum(abs(p.position) for p in items))
+
+    alerts = 0
+    table = Table(title=f"{kind.capitalize()} (standalone)", caption_justify="left")
+    for column in (
+        "Contract",
+        "Side",
+        "Qty",
+        "DTE",
+        "Delta",
+        "P&L",
+        "Take profit at",
+        "Action",
+    ):
+        table.add_column(column, justify="left" if column == "Contract" else "right")
+    for p in sorted(
+        shorts + longs, key=lambda p: (p.position > 0, contract_label(p.contract))
+    ):
+        delta = deltas.get(p.contract.conId)
+        if p.position < 0:
+            premium = abs(p.averageCost) / float(p.contract.multiplier or 100)
+            target = (
+                f"buy <= {dfmt(premium * (1 - take_profit))}"
+                if premium and take_profit
+                else "n/a"
+            )
+            action = (
+                "[blue]Roll"
+                if id(p) in rolled
+                else "[green]Close"
+                if id(p) in closed
+                else "Keep"
+            )
+        else:
+            target = "-"
+            if delta is not None and abs(delta) >= alert_delta:
+                alerts += 1
+                action = f"[yellow]Roll or close by hand (|Δ| >= {alert_delta:g})"
+            else:
+                action = "Hold"
+        table.add_row(
+            contract_label(p.contract),
+            "short" if p.position < 0 else "long",
+            ifmt(int(abs(p.position))),
+            str(option_dte(p.contract.lastTradeDateOrContractMonth)),
+            "n/a" if delta is None else f"{delta:+.2f}",
+            pfmt(position_pnl(p), 1),
+            target,
+            action,
+        )
+    table.caption = (
+        f"Shorts: {count(rollable)} to roll, {count(closeable)} to close, "
+        f"{count(shorts) - count(rollable) - count(closeable)} kept (contracts). "
+        f"Longs: {alerts} to roll or close by hand (|delta| >= {alert_delta:g}, "
+        "long_option_alert_delta). P&L: of the premium. Take profit at: buy the "
+        "short back at or below this price (per share) - the bot closes at "
+        + (f"{take_profit:.0%}" if take_profit else "n/a (unset)")
+        + " of the premium (roll_when.close_at_pnl)."
+    )
     return table
 
 
@@ -166,6 +246,7 @@ class DiscretionaryEngine(
         # "Net target contracts" trades of this run (orders if place_target_orders)
         self.resizes: list[Any] = []
         self.resize_note = ""  # what place_target_orders did this run (caption)
+        self.spread_rows: list[tuple[str, ...]] = []  # Spreads table, per run
         # SPX delta = 0 targets per symbol for the positions summary (display only)
         self.zero_delta: dict[str, tuple[str, ...]] = {}
         # delta (shares), gamma, theta, vega per position (conId) and per symbol.
@@ -177,6 +258,9 @@ class DiscretionaryEngine(
         self.beta_cache: dict[str, float] = {}
         self.beta_cache_day: date | None = None
         self.spx_closes: dict[Any, float] = {}
+        # per-symbol daily closes (from the beta history), used to turn today's
+        # moves into a greek P&L attribution
+        self.symbol_closes: dict[str, dict[Any, float]] = {}
 
     # ----------------------------------------------------------------- symbols
 
@@ -303,13 +387,38 @@ class DiscretionaryEngine(
         except Exception as e:  # noqa: BLE001
             log.error(f"VIX: closing hedges failed: {e!r}")
 
+    def standalone_longs(
+        self, portfolio_positions: dict[str, list[PortfolioItem]], right: str
+    ) -> list[PortfolioItem]:
+        """Long puts or calls not in a vertical or calendar/diagonal (VIX hedges
+        have their own table)."""
+        longs: list[PortfolioItem] = []
+        for symbol, positions in portfolio_positions.items():
+            if symbol == "VIX":
+                continue
+            _, unpaired, mixed = self.split_option_legs(positions)
+            longs += [
+                p
+                for p in unpaired
+                if p.position > 0
+                and p.contract.right.upper().startswith(right)
+                and p.contract.right not in mixed
+            ]
+        return longs
+
     async def run_post_stage(
         self, portfolio_positions: dict[str, list[PortfolioItem]]
     ) -> None:
         """post_discretionary stage: credit and debit verticals, VIX hedges, then
         the orders planned while building the risk tables."""
+        self.spread_rows = []
         await self.roll_spreads(portfolio_positions)
         await self.manage_debit_spreads(portfolio_positions)
+        table = self.spreads_table()
+        if table is None:
+            log.info("No credit or debit spreads held")
+        else:
+            log.print(table)
         await self.close_vix_hedges()
         if self.planned_orders and self.order_ops.orders.records():
             # trades were sized on the book before these rolls/closes, which

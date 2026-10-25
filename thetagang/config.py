@@ -541,11 +541,14 @@ class DiscretionaryStrategyConfig(BaseModel):
     # halfway toward the current mid, for symbols whose [portfolio.symbols.X]
     # block doesn't set it; share and cash-fund orders are left as placed
     adjust_price_after_delay: bool = False
-    # long (debit) verticals, managed as one combo: close when the spread is worth
-    # at least this fraction of its width (its maximum value); otherwise roll it
-    # out at roll_when.dte, skipping rolls that cost more than max_roll_debit x width
+    # long (debit) verticals, managed as one combo: close once this fraction of
+    # the max profit (width - debit paid) is made; otherwise roll it out at
+    # roll_when.dte, skipping rolls that cost more than max_roll_debit x width
     debit_spread_take_profit: float = Field(default=0.8, gt=0.0, le=1.0)
     debit_spread_max_roll_debit: float = Field(default=0.5, ge=0.0)
+    # standalone long calls/puts: remind to roll or close once |delta| reaches
+    # this (deep in the money: little time value left). Reminder only, no orders.
+    long_option_alert_delta: float = Field(default=0.8, gt=0.0, lt=1.0)
 
     @model_validator(mode="after")
     def check_one_hedge(self) -> DiscretionaryStrategyConfig:

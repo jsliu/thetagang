@@ -410,7 +410,7 @@ never leg by leg:
 
 | When | Action | Setting |
 |---|---|---|
-| Spread worth ≥ 80% of its width (its maximum value) | Close: sell the long, buy back the short | `debit_spread_take_profit = 0.8` |
+| 80% of the max profit made (max profit = width − debit paid) | Close: sell the long, buy back the short | `debit_spread_take_profit = 0.8` |
 | Otherwise, at DTE ≤ `roll_when.dte` | Roll out: sell the old spread, buy one in a later expiry with the same width, new long leg at the target delta | — |
 | The roll would cost more than 50% of the width | Not rolled; a warning asks you to handle it | `debit_spread_max_roll_debit = 0.5` |
 

@@ -602,6 +602,27 @@ class DataStore:
         except Exception as exc:  # noqa: BLE001
             log.warning(f"Failed to record positions snapshot: {exc}")
 
+    def record_iv_snapshot(self, day: str, ivs: dict[int, float]) -> bool:
+        """Persist the day's implied-vol snapshot keyed by conId (the baseline
+        for per-symbol vega P&L attribution)."""
+        return self.record_event(
+            "iv_snapshot", {"day": day, "ivs": {str(k): v for k, v in ivs.items()}}
+        )
+
+    def get_iv_snapshot(self, day: str) -> dict[int, float]:
+        """The latest implied-vol snapshot for `day` (conId -> IV), or {} when
+        there is none."""
+        payload = self.get_last_event_payload("iv_snapshot")
+        if not payload or payload.get("day") != day:
+            return {}
+        raw = payload.get("ivs")
+        if not isinstance(raw, dict):
+            return {}
+        try:
+            return {int(k): float(v) for k, v in raw.items()}
+        except (TypeError, ValueError):
+            return {}
+
     def record_order_intent(self, contract: Any, order: Any) -> int | None:
         try:
 

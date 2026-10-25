@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import math
 from collections.abc import Callable, Sequence
 from typing import Any
@@ -11,6 +12,7 @@ from ib_async.order import LimitOrder
 from thetagang import log
 from thetagang.config import Config, discretionary_mode_on
 from thetagang.db import DataStore
+from thetagang.exchange_hours import market_is_open
 from thetagang.fmt import dfmt
 from thetagang.ibkr import IBKR, TickerField
 from thetagang.options import option_dte
@@ -135,6 +137,18 @@ class OrderOperations:
             )
 
 
+# discretionary chain scan: strikes requested per batch, nearest the money first
+QUOTE_SCAN_BATCH = 5
+
+
+def has_two_sided_quote(ticker: Ticker) -> bool:
+    """Both a bid and an ask (IB sends nan or -1 when a side is missing)."""
+    return all(
+        price is not None and not util.isNan(price) and price > 0
+        for price in (ticker.bid, ticker.ask)
+    )
+
+
 class OptionChainScanner:
     def __init__(
         self, *, config: Config, ibkr: IBKR, order_ops: OrderOperations
@@ -142,6 +156,65 @@ class OptionChainScanner:
         self.config = config
         self.ibkr = ibkr
         self.order_ops = order_ops
+
+    async def _chain_quotes(
+        self,
+        symbol: str,
+        contracts: Sequence[Contract],
+        right: str,
+        quote_fields: dict[str, Any],
+    ) -> list[Ticker]:
+        """Quotes for the chain scan. Discretionary mode with the market open:
+        stop at the first strike without a bid/ask; off-hours every strike lacks
+        one, so the whole window is requested (as outside discretionary mode)."""
+        if discretionary_mode_on(self.config) and market_is_open(
+            self.config.runtime.exchange_hours.exchange
+        ):
+            return await self._quotes_until_gap(symbol, contracts, right, quote_fields)
+        return await self.ibkr.get_tickers_for_contracts(
+            symbol, list(contracts), **quote_fields
+        )
+
+    async def _quotes_until_gap(
+        self,
+        symbol: str,
+        contracts: Sequence[Contract],
+        right: str,
+        quote_fields: dict[str, Any],
+    ) -> list[Ticker]:
+        """Discretionary mode, market open: per expiration, request strikes from the money
+        outward in small batches and stop at the first strike with no bid or no
+        ask - strikes further out are less liquid still, so the rest of the
+        option_chains.strikes window isn't requested. Expirations run in
+        parallel; only strikes before the gap are returned."""
+        by_expiry: dict[str, list[Contract]] = {}
+        for c in contracts:
+            by_expiry.setdefault(c.lastTradeDateOrContractMonth, []).append(c)
+
+        async def scan(chain: list[Contract]) -> list[Ticker]:
+            # calls: strikes go up from the money; puts: down from it
+            chain.sort(key=lambda c: c.strike, reverse=right.startswith("P"))
+            kept: list[Ticker] = []
+            for i in range(0, len(chain), QUOTE_SCAN_BATCH):
+                batch = chain[i : i + QUOTE_SCAN_BATCH]
+                quotes = await asyncio.gather(
+                    *(
+                        self.ibkr.get_ticker_for_contract(c, **quote_fields)
+                        for c in batch
+                    )
+                )
+                for c, ticker in zip(batch, quotes):
+                    if not has_two_sided_quote(ticker):
+                        log.info(
+                            f"{symbol} {c.lastTradeDateOrContractMonth}: no bid/ask "
+                            f"at strike {c.strike:g}, scan stops there"
+                        )
+                        return kept
+                    kept.append(ticker)
+            return kept
+
+        found = await asyncio.gather(*(scan(c) for c in by_expiry.values()))
+        return [ticker for tickers in found for ticker in tickers]
 
     async def find_eligible_contracts(
         self,
@@ -262,17 +335,18 @@ class OptionChainScanner:
                 if (c.strike, c.lastTradeDateOrContractMonth) not in excluded
             ]
 
-        tickers = await self.ibkr.get_tickers_for_contracts(
-            underlying.symbol,
-            contracts,
-            generic_tick_list="101",
-            required_fields=[],
-            optional_fields=[
+        quote_fields: dict[str, Any] = {
+            "generic_tick_list": "101",
+            "required_fields": [],
+            "optional_fields": [
                 TickerField.MARKET_PRICE,
                 TickerField.GREEKS,
                 TickerField.OPEN_INTEREST,
                 TickerField.MIDPOINT,
             ],
+        }
+        tickers = await self._chain_quotes(
+            underlying.symbol, contracts, right, quote_fields
         )
 
         def open_interest_is_valid(ticker: Ticker, minimum_open_interest: int) -> bool:

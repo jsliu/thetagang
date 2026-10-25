@@ -1,8 +1,7 @@
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 
 from ib_async import Contract, LimitOrder
 from rich import box
-from rich.pretty import Pretty
 from rich.table import Table
 
 from thetagang import log
@@ -17,7 +16,7 @@ from thetagang.accounting import (
     working_buy_cash,
     working_order_cash,
 )
-from thetagang.fmt import dfmt, ifmt
+from thetagang.fmt import contract_label, dfmt, ifmt
 
 __all__ = [
     "Orders",
@@ -54,7 +53,8 @@ class Orders:
             record for record in self.__records if id(record) not in record_ids
         ]
 
-    def print_summary(self) -> None:
+    def print_summary(self, legs: Mapping[int, Contract] | None = None) -> None:
+        """`legs`: conId -> contract, to name the legs of combo orders."""
         if not self.__records:
             return
 
@@ -72,7 +72,7 @@ class Orders:
             table.add_row(
                 contract.symbol,
                 contract.exchange,
-                Pretty(contract, indent_size=2),
+                contract_label(contract, legs),
                 order.action,
                 dfmt(float(order.lmtPrice) if order.lmtPrice is not None else None),
                 ifmt(int(order.totalQuantity)),

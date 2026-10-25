@@ -401,38 +401,183 @@ def stress_table(legs: list[tuple[Any, ...]]) -> Table:
     return scenarios
 
 
-def breakdown_table(book: Book, betas: dict[str, float]) -> Table:
+def daily_pnl_by_symbol(
+    items: list[PortfolioItem], daily: dict[int, float]
+) -> dict[str, float]:
+    """IB's daily P&L per position (by conId) summed per symbol."""
+    out: dict[str, float] = {}
+    for i in items:
+        if i.contract.conId in daily:
+            symbol = i.contract.symbol
+            out[symbol] = out.get(symbol, 0.0) + daily[i.contract.conId]
+    return out
+
+
+@dataclass
+class DailyAttribution:
+    """Inputs for decomposing today's P&L by symbol: IB's daily P&L, each
+    symbol's actual % move today, the SPX % move, and each symbol's vega P&L
+    from its options' implied-vol changes since the day's first observation."""
+
+    daily: dict[str, float]  # symbol -> IB daily P&L
+    moves: dict[str, float]  # symbol -> % move today
+    spx_move: float
+    vega: dict[str, float]  # symbol -> vega P&L ($) from IV change
+
+
+def breakdown_table(
+    book: Book,
+    betas: dict[str, float],
+    sym_greeks: dict[str, tuple[float, float, float, float] | None],
+    attr: DailyAttribution | None = None,
+) -> Table:
+    """Delta by symbol and, when IB's daily P&L is available, a greek P&L
+    attribution. From SPX: beta delta $ x the SPX move, what the market predicts.
+    Unexplained: P&L - From SPX, the old catch-all. Delta: delta $ x the symbol's
+    own move. Gamma: 1/2 gamma (dS)^2. Theta: one day of decay. Vega: each
+    option's implied-vol change since the day's first observation. Residual: the
+    P&L the four greeks don't explain (mostly today's trades); P&L = Delta +
+    Gamma + Theta + Vega + Residual. Sorted by the largest unexplained, else by
+    the largest beta effect."""
+    with_pnl = attr is not None
+    rows: list[tuple[Any, ...]] = []
+    for symbol, (plain, weighted) in book.by_symbol.items():
+        pnl = from_spx = unexplained = delta = gamma = theta = vega = residual = None
+        if attr is not None:
+            pnl = attr.daily.get(symbol)
+            from_spx = weighted * attr.spx_move
+            if pnl is not None:
+                unexplained = pnl - from_spx
+            move = attr.moves.get(symbol)
+            if pnl is not None and move is not None:
+                delta = plain * move
+                g = sym_greeks.get(symbol)
+                if g is not None:
+                    ds = book.prices.get(symbol, 0.0) * move  # actual $ move
+                    gamma = 0.5 * g[1] * ds * ds
+                    theta = g[2]
+                    vega = attr.vega.get(symbol, 0.0)
+                    residual = pnl - delta - gamma - theta - vega
+        rows.append(
+            (
+                symbol,
+                plain,
+                weighted,
+                pnl,
+                from_spx,
+                unexplained,
+                delta,
+                gamma,
+                theta,
+                vega,
+                residual,
+            )
+        )
+    if with_pnl:
+        rows.sort(key=lambda r: -abs(r[5] or 0.0))
+    else:
+        rows.sort(key=lambda r: -abs(r[2] - r[1]))
+    caption = (
+        "Beta effect = beta delta $ - delta $. Its total drives the gap "
+        "between the stress columns: a -10% SPX move changes P&L by about "
+        "-10% of the beta effect beyond the all-betas-1 column."
+    )
+    if attr is not None:
+        caption += (
+            f" SPX {attr.spx_move:+.2%} today. P&L today: IB's daily P&L. From "
+            "SPX: beta delta $ x SPX move, what the market predicts. Unexplained: "
+            "P&L - From SPX. Delta: delta $ x the symbol's own move. Gamma: 1/2 "
+            "gamma (dS)^2. Theta: one day of decay. Vega: vega x each option's "
+            "implied-vol change since the day's first observation. Residual: the "
+            "rest - today's trades, vanna/volga, and dividends. P&L = Delta + "
+            "Gamma + Theta + Vega + Residual."
+        )
     breakdown = Table(
-        title="Delta by symbol (largest beta effect first)",
-        caption=(
-            "Beta effect = beta delta $ - delta $. Its total drives the gap "
-            "between the stress columns: a -10% SPX move changes P&L by about "
-            "-10% of the beta effect beyond the all-betas-1 column."
-        ),
+        title="Delta and daily P&L by symbol (largest unexplained first)"
+        if with_pnl
+        else "Delta by symbol (largest beta effect first)",
+        caption=caption,
         caption_justify="left",
     )
-    breakdown.add_column("Symbol")
-    breakdown.add_column("Beta", justify="right")
-    breakdown.add_column("Delta $ (no beta)", justify="right")
-    breakdown.add_column("Beta delta $", justify="right")
-    breakdown.add_column("Beta effect", justify="right")
-    for symbol, (plain, weighted) in sorted(
-        book.by_symbol.items(), key=lambda kv: -abs(kv[1][1] - kv[1][0])
-    ):
-        breakdown.add_row(
+    columns = ["Symbol", "Beta", "Delta $ (no beta)", "Beta delta $", "Beta effect"]
+    if with_pnl:
+        columns += [
+            "P&L today",
+            "From SPX",
+            "Unexplained",
+            "Δ Delta",
+            "Γ Gamma",
+            "Θ Theta",
+            "V Vega",
+            "Residual",
+        ]
+    for column in columns:
+        breakdown.add_column(column, justify="left" if column == "Symbol" else "right")
+
+    def money(x: float | None) -> str:
+        return "n/a" if x is None else dfmt(x, 0)
+
+    for (
+        symbol,
+        plain,
+        weighted,
+        pnl,
+        from_spx,
+        unexplained,
+        delta,
+        gamma,
+        theta,
+        vega,
+        residual,
+    ) in rows:
+        cells = [
             symbol,
             ffmt(betas[symbol], 2),
             dfmt(plain, 0),
             dfmt(weighted, 0),
             no_noise_dollars(weighted - plain),
-        )
+        ]
+        if with_pnl:
+            cells += [
+                money(pnl),
+                money(from_spx),
+                money(unexplained),
+                money(delta),
+                money(gamma),
+                money(theta),
+                money(vega),
+                money(residual),
+            ]
+        breakdown.add_row(*cells)
     t = book.totals
-    breakdown.add_section()
-    breakdown.add_row(
+    totals = [
         "Total",
         "",
         dfmt(t.plain_delta_dollars, 0),
         dfmt(t.delta_dollars, 0),
         no_noise_dollars(t.delta_dollars - t.plain_delta_dollars),
-    )
+    ]
+    if with_pnl:
+        total_pnl = sum(r[3] for r in rows if r[3] is not None)
+        total_spx = sum(r[4] for r in rows if r[4] is not None)
+        total_unexplained = total_pnl - total_spx
+        total_delta = sum(r[6] for r in rows if r[6] is not None)
+        total_gamma = sum(r[7] for r in rows if r[7] is not None)
+        total_theta = sum(r[8] for r in rows if r[8] is not None)
+        total_vega = sum(r[9] for r in rows if r[9] is not None)
+        total_residual = (
+            total_pnl - total_delta - total_gamma - total_theta - total_vega
+        )
+        totals += [
+            money(total_pnl),
+            money(total_spx),
+            money(total_unexplained),
+            money(total_delta),
+            money(total_gamma),
+            money(total_theta),
+            money(total_vega),
+            money(total_residual),
+        ]
+    breakdown.add_section()
+    breakdown.add_row(*totals)
     return breakdown

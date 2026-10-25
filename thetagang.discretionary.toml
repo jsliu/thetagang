@@ -158,12 +158,20 @@ adjust_price_after_delay = false
 
 # Long (debit) verticals - long call below the short call, long put above the
 # short put, same expiry and quantity - are managed as one combo order:
-#   - closed when the spread is worth >= debit_spread_take_profit x its width,
+#   - closed once debit_spread_take_profit of its max profit (width - debit
+#     paid) is made, e.g. 0.8 = 80%,
 #   - otherwise rolled out at roll_when.dte (same width, new long leg at the
 #     target delta, later expiry), unless the roll costs more than
 #     debit_spread_max_roll_debit x width; then it's logged for you to handle.
 debit_spread_take_profit = 0.8
 debit_spread_max_roll_debit = 0.5
+
+# Standalone long calls/puts are listed in the Calls/Puts tables; once |delta|
+# reaches this they're flagged "Roll or close" (deep in the money, little time
+# value left). Reminder only - the bot doesn't trade long options.
+# Short options and credit spreads take profit at roll_when.close_at_pnl
+# (e.g. 0.8 = close once 80% of the premium is made).
+long_option_alert_delta = 0.8
 
 # Trades to open. Each run the bot prices them, then picks how many contracts
 # (whole spreads for verticals) bring the account's SPX delta to 0, given what you

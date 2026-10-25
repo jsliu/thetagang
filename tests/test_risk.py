@@ -137,3 +137,100 @@ def test_position_greeks_and_symbol_greeks():
     }
     per_contract = contract_greeks([stock, put, call], greeks)
     assert per_contract == {1: (1.0, 0.0, 0.0, 0.0), 2: (-0.25, 0.03, -0.04, 0.06)}
+
+
+def test_daily_pnl_by_symbol():
+    from ib_async import Option, PortfolioItem, Stock
+
+    from thetagang.risk import daily_pnl_by_symbol
+
+    aapl = PortfolioItem(
+        Stock("AAPL", "SMART", "USD", conId=1), 100, 200, 0, 1, 0, 0, "A"
+    )
+    put = PortfolioItem(
+        Option("TQQQ", "20991120", 90.0, "P", "SMART", "100", "USD", conId=2),
+        2,
+        1,
+        0,
+        1,
+        0,
+        0,
+        "A",
+    )
+    assert daily_pnl_by_symbol([aapl, put], {1: 100.0, 2: -1_900.0}) == {
+        "AAPL": 100.0,
+        "TQQQ": -1_900.0,
+    }
+
+
+def test_breakdown_with_daily_pnl_attribution():
+    from rich.text import Text
+
+    from thetagang.risk import Book, DailyAttribution, Totals, breakdown_table
+
+    book = Book(
+        Totals(plain_delta_dollars=0.0, delta_dollars=-20_000.0),
+        [],
+        {"AAPL": [10_000.0, 10_000.0], "TQQQ": [-10_000.0, -30_000.0]},
+        {"AAPL": 100.0, "TQQQ": 100.0},
+        {},
+        0,
+    )
+    betas = {"AAPL": 1.0, "TQQQ": 3.0}
+    sym_greeks = {
+        "AAPL": (100.0, 0.0, 0.0, 0.0),
+        "TQQQ": (-100.0, -2.0, 3.0, 4.0),
+    }
+    attr = DailyAttribution(
+        daily={"AAPL": 100.0, "TQQQ": -500.0},
+        moves={"AAPL": 0.01, "TQQQ": 0.03},
+        spx_move=0.01,
+        vega={"TQQQ": 2.0},
+    )
+
+    def rows(table):
+        cells = [
+            [Text.from_markup(str(c)).plain for c in col._cells]
+            for col in table.columns
+        ]
+        return list(zip(*cells))
+
+    table = breakdown_table(book, betas, sym_greeks, attr)
+    got = rows(table)
+    # TQQQ ranked first (unexplained -200 vs AAPL 0): from SPX -30,000 x 1% =
+    # -300; delta -10,000 x 3% = -300; gamma 1/2(-2)(3)^2 = -9; theta 3; vega 2;
+    # residual -500 + 300 + 9 - 3 - 2 = -196
+    assert got[0][0] == "TQQQ" and got[0][5:] == (
+        "$-500",  # P&L today
+        "$-300",  # From SPX
+        "$-200",  # Unexplained
+        "$-300",  # Delta
+        "$-9",  # Gamma
+        "$3",  # Theta
+        "$2",  # Vega
+        "$-196",  # Residual
+    )
+    assert got[1][0] == "AAPL" and got[1][5:] == (
+        "$100",
+        "$100",
+        "$0",
+        "$100",
+        "$0",
+        "$0",
+        "$0",
+        "$0",
+    )
+    assert got[2][0] == "Total" and got[2][5:] == (
+        "$-400",
+        "$-200",
+        "$-200",
+        "$-200",
+        "$-9",
+        "$3",
+        "$2",
+        "$-196",
+    )
+    assert "largest unexplained first" in str(table.title)
+
+    plain = breakdown_table(book, betas, sym_greeks)  # no daily P&L
+    assert len(plain.columns) == 5 and "largest beta effect" in str(plain.title)

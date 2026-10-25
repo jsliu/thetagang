@@ -21,7 +21,11 @@ from thetagang.db import DataStore
 from thetagang.fmt import dfmt, ifmt, pfmt
 from thetagang.ibkr import IBKR, RequiredFieldValidationError, TickerField
 from thetagang.options import option_dte
-from thetagang.strategies.discretionary_engine import is_covered_call, roll_strike_limit
+from thetagang.strategies.discretionary_engine import (
+    is_covered_call,
+    options_table,
+    roll_strike_limit,
+)
 from thetagang.strategies.runtime_services import resolve_symbol_configs
 from thetagang.strategies.tail_hedge_state import TailHedgeStateStore
 from thetagang.trading_operations import (
@@ -1008,6 +1012,30 @@ class OptionsStrategyEngine:
 
         return False
 
+    def _discretionary_options_table(
+        self,
+        kind: str,
+        right: str,
+        shorts: list[PortfolioItem],
+        rollable: list[PortfolioItem],
+        closeable: list[PortfolioItem],
+        portfolio_positions: dict[str, list[PortfolioItem]],
+    ) -> Table:
+        cfg = self.config.strategies
+        return options_table(
+            kind,
+            shorts,
+            rollable,
+            closeable,
+            self.discretionary.standalone_longs(portfolio_positions, right),
+            {
+                con_id: greeks[0]
+                for con_id, greeks in self.discretionary.contract_greeks.items()
+            },
+            cfg.wheel.defaults.roll_when.close_at_pnl,
+            cfg.discretionary.long_option_alert_delta,
+        )
+
     async def check_puts(
         self, portfolio_positions: dict[str, list[PortfolioItem]]
     ) -> tuple[list[Any], list[Any], Group]:
@@ -1047,6 +1075,17 @@ class OptionsStrategyEngine:
             if total_closeable_puts + total_rollable_puts > 0
             else Group(text1, text2)
         )
+        if discretionary_mode_on(self.config):
+            group = Group(
+                self._discretionary_options_table(
+                    "puts",
+                    "P",
+                    puts,
+                    rollable_puts,
+                    closeable_puts,
+                    portfolio_positions,
+                )
+            )
         return (rollable_puts, closeable_puts, group)
 
     async def check_calls(
@@ -1090,6 +1129,17 @@ class OptionsStrategyEngine:
             if total_closeable_calls + total_rollable_calls > 0
             else Group(text1, text2)
         )
+        if discretionary_mode_on(self.config):
+            group = Group(
+                self._discretionary_options_table(
+                    "calls",
+                    "C",
+                    calls,
+                    rollable_calls,
+                    closeable_calls,
+                    portfolio_positions,
+                )
+            )
         return (rollable_calls, closeable_calls, group)
 
     async def close_puts(self, puts: list[PortfolioItem]) -> None:

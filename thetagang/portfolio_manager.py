@@ -1015,7 +1015,7 @@ class PortfolioManager:
             if self.dry_run:
                 log.warning("Dry run enabled, no trades will be executed.")
 
-                self.orders.print_summary()
+                self.orders.print_summary(self.qualified_contracts)
             else:
                 with self.ibkr.supervise_order_errors(self.trades.records):
                     self.submit_orders()

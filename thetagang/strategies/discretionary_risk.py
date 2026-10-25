@@ -30,11 +30,13 @@ from thetagang.ibkr import IBKR, TickerField
 from thetagang.risk import (
     Adjuster,
     Book,
+    DailyAttribution,
     Totals,
     aggregate_book,
     breakdown_table,
     compute_beta,
     contract_greeks,
+    daily_pnl_by_symbol,
     greeks_table,
     per_contract,
     position_greeks,
@@ -95,6 +97,7 @@ class DiscretionaryRiskMixin:
     beta_cache: dict[str, float]
     beta_cache_day: date | None
     spx_closes: dict[Any, float]
+    symbol_closes: dict[str, dict[Any, float]]
 
     symbol_overrides: dict[str, Any]
 
@@ -196,19 +199,115 @@ class DiscretionaryRiskMixin:
         tables: list[RenderableType] = [
             greeks_table(book, after, spx_price),
             stress_table(book.legs),
-            breakdown_table(book, betas),
+            breakdown_table(
+                book,
+                betas,
+                self.symbol_greeks,
+                await self._daily_pnl(items, book.prices, spx_price, greeks),
+            ),
         ]
         if plan_table is not None:
             tables.append(plan_table)
         return tables
 
+    async def _daily_pnl(
+        self,
+        items: list[PortfolioItem],
+        prices: dict[str, float],
+        spx_price: float,
+        greeks: dict[int, Any],
+    ) -> DailyAttribution | None:
+        """Daily P&L attribution inputs, or None when IB's daily P&L isn't
+        available - display only, never blocks a run."""
+        try:
+            today = date.today()  # noqa: DTZ011
+            previous = [
+                close for day, close in sorted(self.spx_closes.items()) if day < today
+            ]
+            if not previous or not spx_price:
+                return None
+            daily = await self.ibkr.daily_pnl(
+                self.account_number, [i.contract.conId for i in items]
+            )
+        except Exception as e:  # noqa: BLE001
+            log.warning(f"Daily P&L by symbol unavailable: {e!r}")
+            return None
+        if not daily:
+            log.warning("Daily P&L by symbol unavailable: IB reported no daily P&L")
+            return None
+        spx_move = spx_price / previous[-1] - 1
+        return DailyAttribution(
+            daily_pnl_by_symbol(items, daily),
+            self._symbol_moves(prices, spx_move),
+            spx_move,
+            self._vega_by_symbol(items, greeks),
+        )
+
+    def _symbol_moves(
+        self, prices: dict[str, float], spx_move: float
+    ) -> dict[str, float]:
+        """Actual % move today per symbol from the beta history's closes; falls
+        back to the SPX move where a symbol has none (its beta also defaulted to
+        1)."""
+        today = date.today()  # noqa: DTZ011
+        out: dict[str, float] = {}
+        for symbol, price in prices.items():
+            closes = self.symbol_closes.get(symbol)
+            previous = (
+                [close for day, close in sorted(closes.items()) if day < today]
+                if closes
+                else []
+            )
+            out[symbol] = price / previous[-1] - 1 if previous and price else spx_move
+        return out
+
+    def _vega_by_symbol(
+        self, items: list[PortfolioItem], greeks: dict[int, Any]
+    ) -> dict[str, float]:
+        """Vega P&L ($) per symbol from each option's implied-vol change since
+        the day's first observation. An option seen for the first time today is
+        snapshotted at its current IV (no measured change yet); later runs use
+        the recorded IV as the baseline. Without a data store the change is 0."""
+        store = self.order_ops.data_store
+        today = date.today().isoformat()  # noqa: DTZ011
+        snapshot = store.get_iv_snapshot(today) if store else {}
+        merged = dict(snapshot)
+        out: dict[str, float] = {}
+        for item in items:
+            if item.contract.secType != "OPT":
+                continue
+            con_id = item.contract.conId
+            g = greeks.get(con_id)
+            if g is None or not valid_greeks(g):
+                continue
+            try:
+                iv = float(g.impliedVol)
+            except (TypeError, ValueError):
+                continue
+            if math.isnan(iv):
+                continue
+            prev = snapshot.get(con_id)
+            if prev is None:
+                merged[con_id] = iv  # first observation today
+                continue
+            position_vega = self.position_greeks.get(con_id)
+            if position_vega is None:
+                continue
+            out[item.contract.symbol] = out.get(item.contract.symbol, 0.0) + (
+                position_vega[3] * (iv - prev)
+            )
+        if store and len(merged) > len(snapshot):
+            store.record_iv_snapshot(today, merged)
+        return out
+
     async def risk_panel(self, account_table: Table) -> RenderableType:
-        """Account summary next to the greeks and stress tables; breakdown and the
-        trade plan below."""
+        """Account summary next to the greeks table; stress P&L, the breakdown and
+        the trade plan below."""
         self.planned_orders = []  # never carry a plan over from an earlier run
         try:
             greeks, scenarios, *rest = await self.portfolio_greeks_table()
-            return Group(Columns([account_table, greeks, scenarios]), *rest)
+            # account summary and greeks side by side; stress P&L below them
+            return Group(Columns([account_table, greeks]), scenarios, *rest)
         except Exception as e:  # noqa: BLE001
             # display-only: never block managing positions on missing market data
             log.warning(f"Could not compute portfolio greeks: {e!r}")
@@ -246,7 +345,9 @@ class DiscretionaryRiskMixin:
                     bars = await self.ibkr.request_historical_data(
                         self._history_contract(symbol), "1 Y"
                     )
-            beta = compute_beta({b.date: b.close for b in bars}, self.spx_closes)
+            closes = {b.date: b.close for b in bars}
+            self.symbol_closes[symbol] = closes
+            beta = compute_beta(closes, self.spx_closes)
         except Exception:  # noqa: BLE001
             beta = None
         if beta is not None:

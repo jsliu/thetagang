@@ -3,6 +3,7 @@
 import itertools
 from datetime import date, timedelta
 from types import SimpleNamespace
+from typing import cast
 
 import numpy as np
 import pytest
@@ -563,6 +564,232 @@ def test_target_share_sale_keeps_covered_calls_covered(engine):
         [shares, call], -100.0, {1: _greek(0.001)}, 1.0, 5000.0
     )
     assert (traded, resize) == (0, None)
+
+
+@pytest.mark.asyncio
+async def test_spreads_table_lists_each_spread_and_action(engine, mocker):
+    """Spread legs aren't in the put/call roll counts: the Spreads table shows
+    every credit/debit vertical and what the run does with it."""
+    credit_short = _opt("HOOD", "20991120", 50.0, "P", -2, avg=200.0, con_id=1)
+    credit_long = _opt("HOOD", "20991120", 45.0, "P", 2, avg=50.0, con_id=2)
+    debit_long = _opt("RDDT", "20991120", 160.0, "C", 1, avg=500.0, con_id=3)
+    debit_short = _opt("RDDT", "20991120", 170.0, "C", -1, avg=100.0, con_id=4)
+    _spread_mocks(engine, mocker, {1: 1.0, 2: 0.5, 3: 9.5, 4: 0.5}, [], [])
+    engine.ibkr.portfolio = mocker.Mock(return_value=[])  # no VIX hedges
+    engine.config.strategies.wheel.defaults.roll_when.close_at_pnl = 0.8
+    await engine.run_post_stage(
+        {"HOOD": [credit_short, credit_long], "RDDT": [debit_long, debit_short]}
+    )
+    table = engine.spreads_table()
+    rows = _rows(table)
+    # credit $1.50 (200 - 50 per contract): 80% kept = buy back at <= $0.30
+    assert rows[0][5] == "buy <= $0.30"
+    # debit $4.00 on a 10-wide: max profit $6.00, 80% = sell at >= 4.00 + 4.80
+    assert rows[1][5] == "sell >= $8.80"
+    assert rows[0][:2] == ("HOOD 20991120 45/50P", "credit")
+    assert rows[0][-1] == "Keep"
+    assert rows[1][:2] == ("RDDT 20991120 160/170C", "debit")
+    assert rows[1][-1] == "Close (take-profit)"  # worth 9.00 of 10 wide
+    assert "0 to roll, 1 to close, 1 kept" in str(table.caption)
+
+
+def test_options_table_shorts_take_profit_and_long_alerts():
+    from thetagang.strategies.discretionary_engine import options_table
+
+    roll = _opt("HOOD", "20991120", 50.0, "P", -2, avg=150.0, upnl=200.0, con_id=1)
+    keep = _opt("AMD", "20991120", 140.0, "P", -1, avg=300.0, upnl=-30.0, con_id=2)
+    deep = _opt("TQQQ", "20991120", 90.0, "P", 1, avg=900.0, upnl=100.0, con_id=3)
+    otm = _opt("TQQQ", "20991120", 60.0, "P", 1, avg=100.0, con_id=4)
+    deltas = {1: -0.3, 2: -0.2, 3: -0.85, 4: -0.1}
+    table = options_table(
+        "puts", [roll, keep], [roll], [], [deep, otm], deltas, 0.7, 0.8
+    )
+    rows = {r[0]: r for r in _rows(table)}  # shorts first, then longs
+    assert list(rows) == [
+        "AMD 20991120 140P",
+        "HOOD 20991120 50P",
+        "TQQQ 20991120 60P",
+        "TQQQ 20991120 90P",
+    ]
+    # short: premium $1.50, close_at_pnl 70% -> buy back at <= $0.45
+    hood = rows["HOOD 20991120 50P"]
+    assert hood[1:3] == ("short", "2")
+    assert hood[4:] == ("-0.30", "66.7%", "buy <= $0.45", "Roll")
+    assert rows["AMD 20991120 140P"][6:] == ("buy <= $0.90", "Keep")
+    # longs: |delta| 0.85 >= 0.8 -> reminder; 0.10 -> hold
+    deep = rows["TQQQ 20991120 90P"]
+    assert deep[1] == "long" and deep[-1] == "Roll or close by hand (|Δ| >= 0.8)"
+    assert rows["TQQQ 20991120 60P"][-1] == "Hold"
+    caption = str(table.caption)
+    assert "2 to roll, 0 to close, 1 kept" in caption
+    assert "Longs: 1 to roll or close" in caption and "70%" in caption
+
+
+def test_standalone_longs_skip_spread_and_calendar_legs(engine):
+    lone = _opt("TQQQ", "20991120", 90.0, "P", 1)
+    spread_short = _opt("HOOD", "20991120", 50.0, "P", -1)
+    spread_long = _opt("HOOD", "20991120", 45.0, "P", 1)
+    cal_short = _opt("RDDT", "20991120", 170.0, "C", -1)
+    cal_long = _opt("RDDT", "20991218", 160.0, "C", 1)
+    positions = {
+        "TQQQ": [lone],
+        "HOOD": [spread_short, spread_long],
+        "RDDT": [cal_short, cal_long],
+    }
+    assert engine.standalone_longs(positions, "P") == [lone]
+    assert engine.standalone_longs(positions, "C") == []
+
+
+@pytest.mark.asyncio
+async def test_chain_scan_stops_at_first_missing_bid_or_ask(engine, mocker):
+    """Strikes are requested from the money outward; the first strike with no
+    bid or ask ends that expiration's scan, and further strikes aren't asked."""
+    from thetagang.trading_operations import OptionChainScanner
+
+    asked = []
+    no_ask = {("20991120", 115.0), ("20991218", 105.0)}
+
+    async def ticker(contract, **kwargs):
+        asked.append((contract.lastTradeDateOrContractMonth, contract.strike))
+        t = mocker.Mock(contract=contract, bid=1.0, ask=1.1)
+        if (contract.lastTradeDateOrContractMonth, contract.strike) in no_ask:
+            t.ask = float("nan")
+        return t
+
+    scanner = OptionChainScanner(
+        config=engine.config,
+        ibkr=mocker.Mock(get_ticker_for_contract=ticker),
+        order_ops=engine.order_ops,
+    )
+
+    def key(t):
+        c = t.contract
+        assert c is not None
+        return (c.lastTradeDateOrContractMonth, c.strike)
+
+    calls = [
+        Option("HOOD", exp, float(k), "C", "SMART", conId=i)
+        for i, (exp, k) in enumerate(
+            (exp, k) for exp in ("20991120", "20991218") for k in range(130, 95, -5)
+        )
+    ]
+    got = await scanner._quotes_until_gap("HOOD", calls, "C", {})
+    assert sorted(map(key, got)) == [
+        ("20991120", 100.0),
+        ("20991120", 105.0),
+        ("20991120", 110.0),
+        ("20991218", 100.0),
+    ]
+    # Nov: 100..110 then a gap at 115 ends it; Dec: gap at 105. Only the first
+    # batch of 5 strikes (100..120) was ever requested.
+    assert ("20991120", 130.0) not in asked
+    assert all(k <= 120.0 for _, k in asked)
+
+    puts = [
+        Option("HOOD", "20991120", float(k), "P", "SMART", conId=k)
+        for k in (90, 95, 100)
+    ]
+    no_ask.add(("20991120", 95.0))
+    got = await scanner._quotes_until_gap("HOOD", puts, "P", {})
+    assert [key(t)[1] for t in got] == [100.0]  # puts scan downward
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("market_open", [True, False])
+async def test_gap_rule_only_while_market_is_open(engine, mocker, market_open):
+    """Off-hours there's no bid/ask anywhere: request the whole strike window."""
+    from thetagang.trading_operations import OptionChainScanner
+
+    mocker.patch(
+        "thetagang.trading_operations.market_is_open", return_value=market_open
+    )
+    full_scan = mocker.AsyncMock(return_value=[])
+    scanner = OptionChainScanner(
+        config=engine.config,
+        ibkr=mocker.Mock(get_tickers_for_contracts=full_scan),
+        order_ops=engine.order_ops,
+    )
+    gap_scan = mocker.patch.object(scanner, "_quotes_until_gap", return_value=[])
+    await scanner._chain_quotes("HOOD", [], "P", {})
+    assert gap_scan.called is market_open
+    assert full_scan.called is not market_open
+
+
+def test_market_is_open_uses_the_regular_session():
+    from datetime import UTC, datetime
+
+    from thetagang.exchange_hours import market_is_open
+
+    assert market_is_open("XNYS", datetime(2026, 10, 14, 15, 0, tzinfo=UTC))
+    assert not market_is_open("XNYS", datetime(2026, 10, 14, 21, 0, tzinfo=UTC))
+    assert not market_is_open("XNYS", datetime(2026, 10, 17, 15, 0, tzinfo=UTC))
+
+
+@pytest.mark.asyncio
+async def test_ibkr_daily_pnl_waits_then_cancels(mocker):
+    from thetagang.ibkr import IBKR
+
+    reported = {1: 120.0, 2: float("nan"), 3: 1.7976931348623157e308}
+    ib = mocker.Mock()
+    ib.reqPnLSingle.side_effect = lambda account, model, con_id: SimpleNamespace(
+        dailyPnL=reported[con_id]
+    )
+    fake = cast(IBKR, SimpleNamespace(ib=ib))  # only .ib is used
+    got = await IBKR.daily_pnl(fake, "DUX", [1, 2, 3, 1], timeout=0.2)
+    assert got == {1: 120.0}  # nan and IB's "unset" value are left out
+    assert sorted(c.args[2] for c in ib.cancelPnLSingle.call_args_list) == [1, 2, 3]
+
+
+@pytest.mark.asyncio
+async def test_daily_pnl_needs_previous_close_and_ib_pnl(engine, mocker):
+    from thetagang.risk import DailyAttribution
+
+    stock = _stock("AAPL", 100, price=200.0)
+    stock.contract.conId = 1
+    engine.ibkr.daily_pnl = mocker.AsyncMock(return_value={1: 300.0})
+    engine.ibkr.request_historical_data = mocker.AsyncMock(return_value=[])
+    engine.spx_closes = {date(2000, 1, 3): 5000.0}
+    attr = await engine._daily_pnl([stock], {"AAPL": 200.0}, 5050.0, {})
+    assert isinstance(attr, DailyAttribution)
+    assert attr.daily == {"AAPL": 300.0}
+    assert attr.spx_move == pytest.approx(0.01)
+    assert attr.moves == {"AAPL": pytest.approx(0.01)}  # no closes: SPX move
+    assert attr.vega == {}  # stock, no options
+    engine.spx_closes = {}  # no previous close
+    assert await engine._daily_pnl([stock], {"AAPL": 200.0}, 5050.0, {}) is None
+    engine.spx_closes = {date(2000, 1, 3): 5000.0}
+    engine.ibkr.daily_pnl = mocker.AsyncMock(side_effect=TimeoutError)
+    assert await engine._daily_pnl([stock], {"AAPL": 200.0}, 5050.0, {}) is None
+
+
+def test_vega_by_symbol_uses_iv_snapshot(engine, mocker):
+    put = _opt("HOOD", "20991120", 50.0, "P", -1, con_id=7)
+    g = _greek(-0.3)
+    g.impliedVol = 0.40
+    engine.position_greeks = {7: (30.0, -2.0, 5.0, -10.0)}  # vega -10 $/vol pt
+    store = mocker.Mock()
+    store.get_iv_snapshot.return_value = {}
+    engine.order_ops.data_store = store
+    # first observation today: snapshotted at current IV, no measured change yet
+    assert engine._vega_by_symbol([put], {7: g}) == {}
+    assert store.record_iv_snapshot.call_args.args[1] == {7: 0.40}
+    # later run: IV moved 0.40 -> 0.42, vega -10 x +0.02 = -0.20
+    g.impliedVol = 0.42
+    store.get_iv_snapshot.return_value = {7: 0.40}
+    store.record_iv_snapshot.reset_mock()
+    assert engine._vega_by_symbol([put], {7: g}) == {"HOOD": pytest.approx(-0.20)}
+    store.record_iv_snapshot.assert_not_called()  # nothing new to snapshot
+
+
+def test_vega_by_symbol_skips_missing_iv(engine, mocker):
+    put = _opt("HOOD", "20991120", 50.0, "P", -1, con_id=7)
+    g = _greek(-0.3)  # impliedVol=None by default
+    engine.position_greeks = {7: (30.0, -2.0, 5.0, -10.0)}
+    store = mocker.Mock()
+    store.get_iv_snapshot.return_value = {}
+    engine.order_ops.data_store = store
+    assert engine._vega_by_symbol([put], {7: g}) == {}
+    store.record_iv_snapshot.assert_not_called()  # no IV to snapshot
 
 
 # ------------------------------------------------------------ VIX hedges
@@ -1144,6 +1371,34 @@ def test_option_reprice_default_covers_options_only(config):
     assert not enabled(Option("HOOD", "20991120", 50.0, "P"))  # explicit false
     config.strategies.discretionary.adjust_price_after_delay = False
     assert not enabled(Option("VIX", "20991118", 25.0, "C"))
+
+
+def test_contract_label_matches_spreads_table():
+    from ib_async import ComboLeg, Contract
+
+    from thetagang.fmt import contract_label
+
+    short = Option("RDDT", "20261030", 185.0, "C", "SMART", conId=1)
+    long = Option("RDDT", "20261030", 215.0, "C", "SMART", conId=2)
+    old_short = Option("RDDT", "20261023", 170.0, "C", "SMART", conId=3)
+    old_long = Option("RDDT", "20261023", 200.0, "C", "SMART", conId=4)
+    legs = {c.conId: c for c in (short, long, old_short, old_long)}
+
+    def bag(*ids):
+        return Contract(
+            secType="BAG",
+            symbol="RDDT",
+            comboLegs=[ComboLeg(conId=i, ratio=1, action="BUY") for i in ids],
+        )
+
+    assert contract_label(short) == "RDDT 20261030 185C"
+    assert contract_label(Stock("TQQQ", "SMART", "USD")) == "TQQQ"
+    assert contract_label(bag(1, 2), legs) == "RDDT 20261030 185/215C"
+    assert (
+        contract_label(bag(3, 4, 1, 2), legs)
+        == "RDDT 20261023 170/200C -> 20261030 185/215C"
+    )
+    assert contract_label(bag(1, 9), legs) == "RDDT 20261030 185C -> conId 9"
 
 
 def test_discretionary_trade_config_validation():

@@ -45,3 +45,30 @@ When changes touch trading logic, recommend validating with:
 - `uv run ty check`
 
 For changes affecting run stages, migration, or rebalancing math, call out missing targeted tests as review findings.
+
+## Graphify Usage Instructions
+
+When working on this codebase:
+
+1. Before investigating a bug or making a non-trivial code change,
+   read `graphify-out/GRAPH_REPORT.md` if it exists.
+
+2. When investigating function call paths, module dependencies,
+   or the potential impact of a code change, query the existing
+   `graphify-out/graph.json` using Graphify.
+
+3. Use the graph to identify relevant source files, then inspect
+   those files to verify the findings before making changes.
+
+4. Do not rebuild the graph for every task. Reuse the existing
+   graph unless it is missing or the relevant code structure
+   has changed significantly.
+
+5. If the graph is missing or outdated, explain why an update
+   is needed before rebuilding it.
+
+6. Prefer focused graph queries over loading the entire graph
+   into the conversation.
+
+7. Do not assume the graph is always correct. Verify important
+   relationships against the actual source code.

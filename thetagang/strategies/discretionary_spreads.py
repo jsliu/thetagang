@@ -16,10 +16,11 @@ from typing import TYPE_CHECKING, Any
 from ib_async import PortfolioItem
 from ib_async.contract import ComboLeg, Contract, Option, Stock
 from ib_async.order import LimitOrder
+from rich.table import Table
 
 from thetagang import log
 from thetagang.config import DISCRETIONARY_STRUCTURES, Config
-from thetagang.fmt import dfmt
+from thetagang.fmt import dfmt, ifmt, pfmt
 from thetagang.ibkr import IBKR, TickerField
 from thetagang.options import option_dte
 from thetagang.risk import is_debit_vertical
@@ -109,6 +110,45 @@ def debit_spread_pnl(short: PortfolioItem, long: PortfolioItem) -> float | None:
     return (short.unrealizedPNL + long.unrealizedPNL) / debit
 
 
+def spread_net_price(short: PortfolioItem, long: PortfolioItem) -> float:
+    """Net price per share from the cost basis: > 0 credit received, < 0 debit paid."""
+    multiplier = float(short.contract.multiplier or 100)
+    return (abs(short.averageCost) - abs(long.averageCost)) / multiplier
+
+
+def debit_take_profit_value(
+    short: PortfolioItem, long: PortfolioItem, fraction: float
+) -> float:
+    """Spread value that makes `fraction` of the max profit (width - debit); the
+    same fraction of the width when the debit paid isn't known."""
+    width = abs(long.contract.strike - short.contract.strike)
+    debit = -spread_net_price(short, long)
+    if not 0 < debit < width:
+        return fraction * width
+    return debit + fraction * (width - debit)
+
+
+def target_close_price(
+    kind: str,
+    short: PortfolioItem,
+    long: PortfolioItem,
+    credit_take_profit: float | None,
+    debit_take_profit: float,
+) -> str:
+    """Per-share spread price at which the bot takes profit. Credit (max profit =
+    credit C): buy back at <= C x (1 - roll_when.close_at_pnl). Debit (max profit
+    = width - debit D): sell at >= D + debit_spread_take_profit x (width - D)."""
+    if kind == "credit":
+        credit = spread_net_price(short, long)
+        if not credit_take_profit or credit <= 0:
+            return "n/a"
+        return f"buy <= {dfmt(credit * (1 - credit_take_profit))}"
+    width = abs(long.contract.strike - short.contract.strike)
+    if not 0 < -spread_net_price(short, long) < width:
+        return "n/a"
+    return f"sell >= {dfmt(debit_take_profit_value(short, long, debit_take_profit))}"
+
+
 class DiscretionarySpreadsMixin:
     """Needs the DiscretionaryEngine attributes declared below."""
 
@@ -120,6 +160,7 @@ class DiscretionarySpreadsMixin:
     put_is_itm: Callable[[Contract], Awaitable[bool]]
     call_is_itm: Callable[[Contract], Awaitable[bool]]
     get_primary_exchange: Callable[[str], str]
+    spread_rows: list[tuple[str, ...]]
 
     if TYPE_CHECKING:  # from DiscretionaryTradesMixin
 
@@ -341,29 +382,105 @@ class DiscretionarySpreadsMixin:
             for short, long in self.find_credit_verticals(positions):
                 name = short.contract.localSymbol
                 pnl = self.spread_pnl(short, long)
-                if pnl is None:
-                    continue  # no net credit: warned about in without_spread_legs
                 dte = option_dte(short.contract.lastTradeDateOrContractMonth)
+                if pnl is None:
+                    # no net credit: warned about in without_spread_legs
+                    self._spread_row("credit", short, long, dte, None, "Manage by hand")
+                    continue
+                action = "Keep"
                 try:
                     itm = await self.short_leg_is_itm(short.contract)
                     # same order as standalone options: roll first, otherwise close
                     if self.roll_rule_chain(short.contract.right, itm, dte, pnl):
                         try:
                             await self.roll_spread(symbol, short, long, exchange, itm)
-                            continue
+                            action = "Roll"
                         except NoValidContractsError as e:
                             log.error(f"{name}: spread roll failed: {e}")
-                            if not self.close_if_unable_to_roll_allows(
-                                symbol, dte, pnl
-                            ):
-                                continue
-                            log.warning(f"{name}: unable to roll spread, closing it")
-                    elif not self.close_rule_allows(pnl):
-                        continue
-                    await self.close_spread(symbol, short, long, exchange)
+                            action = "Roll failed"
+                            if self.close_if_unable_to_roll_allows(symbol, dte, pnl):
+                                log.warning(
+                                    f"{name}: unable to roll spread, closing it"
+                                )
+                                await self.close_spread(symbol, short, long, exchange)
+                                action = "Close (unable to roll)"
+                    elif self.close_rule_allows(pnl):
+                        await self.close_spread(symbol, short, long, exchange)
+                        action = "Close"
                 except Exception as e:  # noqa: BLE001
                     # never let one spread abort the run before orders are submitted
                     log.error(f"{name}: spread roll/close failed: {e!r}")
+                    action = "Error (see log)"
+                self._spread_row("credit", short, long, dte, pnl, action)
+
+    def _spread_row(
+        self,
+        kind: str,
+        short: PortfolioItem,
+        long: PortfolioItem,
+        dte: int,
+        pnl: float | None,
+        action: str,
+    ) -> None:
+        c = short.contract
+        low, high = sorted((c.strike, long.contract.strike))
+        self.spread_rows.append(
+            (
+                f"{c.symbol} {c.lastTradeDateOrContractMonth} {low:g}/{high:g}{c.right}",
+                kind,
+                ifmt(int(abs(short.position))),
+                str(dte),
+                "n/a" if pnl is None else pfmt(pnl, 1),
+                target_close_price(
+                    kind,
+                    short,
+                    long,
+                    self.config.strategies.wheel.defaults.roll_when.close_at_pnl,
+                    self.config.strategies.discretionary.debit_spread_take_profit,
+                ),
+                action,
+            )
+        )
+
+    def spreads_table(self) -> Table | None:
+        """This run's credit and debit verticals and what was done with each (the
+        put/call roll counts leave spread legs out)."""
+        if not self.spread_rows:
+            return None
+        actions = [row[-1] for row in self.spread_rows]
+        rolled = sum(a == "Roll" for a in actions)
+        closed = sum(a.startswith("Close") for a in actions)
+        kept = sum(a == "Keep" for a in actions)
+        credit_tp = self.config.strategies.wheel.defaults.roll_when.close_at_pnl
+        debit_tp = self.config.strategies.discretionary.debit_spread_take_profit
+        table = Table(
+            title="Spreads (credit and debit verticals, one combo order each)",
+            caption=(
+                f"{rolled} to roll, {closed} to close, {kept} kept, "
+                f"{len(actions) - rolled - closed - kept} need attention. P&L: of the "
+                "net credit received (credit) or debit paid (debit). "
+                "Take profit at: the spread price (per share) at which the bot takes "
+                "profit - credit: buy back at or below, at "
+                + (f"{credit_tp:.0%}" if credit_tp else "n/a (unset)")
+                + " of the max profit (roll_when.close_at_pnl); debit: sell at or "
+                f"above, at {debit_tp:.0%} of the max profit "
+                "(debit_spread_take_profit)."
+            ),
+            caption_justify="left",
+        )
+        for column in (
+            "Spread",
+            "Type",
+            "Qty",
+            "DTE",
+            "P&L",
+            "Take profit at",
+            "Action",
+        ):
+            table.add_column(column, justify="left" if column == "Spread" else "right")
+        for row in self.spread_rows:
+            table.add_row(*row)
+        return table
 
     async def close_spread(
         self,
@@ -533,8 +650,9 @@ class DiscretionarySpreadsMixin:
     async def manage_debit_spreads(
         self, portfolio_positions: dict[str, list[PortfolioItem]]
     ) -> None:
-        """Long (debit) verticals as one combo: close at the take-profit (value >=
-        debit_spread_take_profit x width), else roll out at roll_when.dte."""
+        """Long (debit) verticals as one combo: close at the take-profit
+        (debit_spread_take_profit of the max profit), else roll out at
+        roll_when.dte."""
         cfg = self.config.strategies.discretionary
         roll_dte = self.config.strategies.wheel.defaults.roll_when.dte
         exchange = self.order_ops.get_order_exchange()
@@ -546,21 +664,26 @@ class DiscretionarySpreadsMixin:
             for short, long in (p for p in spreads if is_debit_vertical(*p)):
                 name = long.contract.localSymbol
                 width = abs(long.contract.strike - short.contract.strike)
+                dte = option_dte(long.contract.lastTradeDateOrContractMonth)
+                pnl = debit_spread_pnl(short, long)
+                action = "Keep"
                 try:
                     value = await self.leg_price(
                         long.contract, exchange
                     ) - await self.leg_price(short.contract, exchange)
-                    dte = option_dte(long.contract.lastTradeDateOrContractMonth)
-                    if value >= cfg.debit_spread_take_profit * width:
+                    if value >= debit_take_profit_value(
+                        short, long, cfg.debit_spread_take_profit
+                    ):
                         log.info(f"{name}: debit spread at the take-profit")
                         await self.close_spread(symbol, short, long, exchange, -value)
+                        action = "Close (take-profit)"
                     elif dte <= roll_dte:
                         try:
                             await self.roll_debit_spread(
                                 symbol, short, long, exchange, value, width
                             )
+                            action = "Roll"
                         except NoValidContractsError as e:
-                            pnl = debit_spread_pnl(short, long)
                             if pnl is None or not self.close_if_unable_to_roll_allows(
                                 symbol, dte, pnl
                             ):
@@ -569,10 +692,14 @@ class DiscretionarySpreadsMixin:
                             await self.close_spread(
                                 symbol, short, long, exchange, -value
                             )
+                            action = "Close (unable to roll)"
                 except NoValidContractsError as e:
                     log.warning(f"{name}: debit spread not rolled ({e}) - roll by hand")
+                    action = "Roll failed - roll by hand"
                 except Exception as e:  # noqa: BLE001
                     log.error(f"{name}: debit spread close/roll failed: {e!r}")
+                    action = "Error (see log)"
+                self._spread_row("debit", short, long, dte, pnl, action)
 
     def _debit_spread_target(
         self, symbol: str, right: str
