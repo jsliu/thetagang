@@ -6,8 +6,8 @@
 #   THETAGANG_CONFIG=thetagang.nt.toml docker compose up -d   # another config
 #   docker compose logs -f thetagang-nt
 # In Docker the bot reaches TWS at host.docker.internal (IB_HOST overrides ib.host).
-# Metrics: http://localhost:9464/metrics. Dashboard and Telegram alerts: the intraday
-# project's monitoring stack (http://localhost:3000, dashboard "thetagang").
+# Metrics: http://localhost:9464/metrics. Dashboard and Telegram alerts: the separate monitoring
+# repo, ../monitoring (http://localhost:3000, folder "thetagang").
 
 [node]
 trader_id = "THETAGANG-001"

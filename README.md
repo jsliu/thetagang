@@ -9,7 +9,7 @@ This repository holds two programs that share the same ideas but not their code:
 | Built on | [NautilusTrader](https://nautilustrader.io) 1.231 | [ib_async](https://github.com/ib-api-reloaded/ib_async) |
 | Runs as | a long-running node: checks every few minutes | one pass per start: run it from a scheduler |
 | Strategies | discretionary (rolls, closes, SPX-delta trades), VIX call hedge | wheel, discretionary, regime rebalancing, VIX call hedge, tail hedge, cash management |
-| Monitoring | Prometheus metrics, Grafana dashboard and Telegram alerts (in the intraday project's monitoring stack) | risk tables printed to the terminal |
+| Monitoring | Prometheus metrics; Grafana dashboard and Telegram alerts in the separate `monitoring` repo | risk tables printed to the terminal |
 | Config | [`thetagang.nt.toml`](thetagang.nt.toml) | [`thetagang.toml`](thetagang.toml), [`thetagang.discretionary.toml`](thetagang.discretionary.toml) |
 | Python | 3.12+ (or Docker) | 3.11 – 3.14 |
 
@@ -103,7 +103,7 @@ the nearest expiry, then the largest |delta| at or below the target.
 
 [`deploy/`](deploy/) runs the bot. The image holds only the dependencies; the
 repo is mounted read-only, so a code or config change needs only a restart.
-Dashboards and alerts come from the intraday project's monitoring stack (see
+Dashboards and alerts come from the separate `monitoring` repo (see
 [Monitoring and alerts](#monitoring-and-alerts)).
 
 1. Copy the sample config (`*.local.toml` files are git-ignored) and edit it:
@@ -176,15 +176,14 @@ copied across.
 
 ### Monitoring and alerts
 
-There is one Prometheus + Grafana for both of your projects: the intraday
-project's stack (`../intraday/monitoring`, started with
-`./intraday/run_monitoring.sh up` from the intraday repo). Its Prometheus scrapes
-this bot on the host's `127.0.0.1:9464` (job `thetagang`), keeps two years of
-history, and its Grafana (<http://localhost:3000>, user `admin`, password in
-intraday's `monitoring/.env`) shows the **thetagang** dashboard next to
-intraday's and sends alerts to Telegram. The files live in that repo:
-`monitoring/grafana/dashboards/thetagang.json` and the `thetagang` group in
-`monitoring/grafana/provisioning/alerting/rules.yaml`.
+Prometheus, Grafana and the Telegram alerts are a repo of their own,
+`../monitoring`; this repo only serves metrics. Start it with `./run.sh up` in that repo. Its Prometheus scrapes this
+bot on the host's `127.0.0.1:9464` (job `thetagang`) and keeps two years of
+history; its Grafana (<http://localhost:3000>, user `admin`, password in that
+repo's `.env`) shows the **thetagang** dashboard in its own **thetagang**
+folder and sends the alerts to Telegram. To change them, edit
+`grafana/dashboards/thetagang/thetagang.json` and the `thetagang` group in
+`grafana/provisioning/alerting/rules.yaml` there.
 
 Alerts are sent 09:30–16:00 New York time on weekdays, repeated at most every
 4 hours while they last:
@@ -203,11 +202,10 @@ The dashboard:
 
 | Row | Panels |
 |---|---|
-| Headline | net liquidation, unrealized P&L, SPX delta, theta per day, vega per vol point, gamma, *need attention* (positions without greeks + long options at the alert delta), data age |
-| History | net liquidation, SPX delta |
+| Headline | one tile each, the latest value (shown in any time range): net liquidation, unrealized P&L, SPX delta, theta per day, vega per vol point, gamma, *need attention* (positions without greeks + long options at the alert delta), data age |
 | Risk | beta delta $ by symbol; stress P&L, beta-weighted and with all betas at 1 |
 | Detail | per-symbol table (beta, delta, delta $, beta delta $, theta, vega); per-position table (quantity, cost, price, unrealized P&L, P&L ratio, DTE) |
-| Activity | unrealized P&L, VIX and VIXMO, orders per hour (dry-run orders included) |
+| Activity | VIX and VIXMO, orders per hour (dry-run orders included) |
 
 All metrics are named `thetagang_*`, so you can query them in Prometheus or
 add your own panels.
@@ -230,7 +228,7 @@ add your own panels.
   configured port, and that TWS accepts the connection (*Trusted IPs*, or
   allow connections from outside localhost).
 - **The dashboard shows no data.** Is the bot running (`docker compose ps`)
-  and is the intraday monitoring stack up? Prometheus' target page
+  and is the monitoring stack up (`./run.sh status` in `../monitoring`)? Prometheus' target page
   (<http://localhost:9090/targets>) shows the `thetagang` job's state.
 - **"No market data during competing live session".** The same IB user is
   logged in elsewhere, for example live TWS while testing paper.

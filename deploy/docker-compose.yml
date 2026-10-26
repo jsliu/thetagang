@@ -1,6 +1,6 @@
-# thetagang-nt in Docker. Dashboards and Telegram alerts live in the intraday project's
-# monitoring stack (../../intraday/monitoring: ./intraday/run_monitoring.sh up), which scrapes
-# this bot's metrics on the host's 127.0.0.1:9464 (Grafana: http://localhost:3000, "thetagang").
+# thetagang-nt in Docker. It serves its metrics on the host's 127.0.0.1:9464; dashboards and
+# Telegram alerts are the separate monitoring repo (../../monitoring: ./run.sh up), which scrapes them
+# (Grafana: http://localhost:3000, folder "thetagang").
 # The bot talks to TWS on the host (host.docker.internal; TWS: Configure > API > Settings must
 # allow the connection). `docker compose up -d --build`, then `docker compose logs -f thetagang-nt`.
 services:
@@ -14,7 +14,7 @@ services:
     volumes:
       - ..:/app:ro
     extra_hosts: ["host.docker.internal:host-gateway"]
-    ports: ["127.0.0.1:9464:9464"]   # /metrics, scraped by intraday's Prometheus
+    ports: ["127.0.0.1:9464:9464"]   # /metrics, scraped by the monitoring repo's Prometheus
     init: true                        # tini as PID 1: signals and crash exits behave
     stop_grace_period: 30s            # let the node disconnect cleanly
     restart: unless-stopped
