@@ -1,0 +1,6 @@
+# thetagang-nt runtime for the Docker image (deploy/Dockerfile). The code is mounted, not copied.
+nautilus_trader[ib]==1.231.0
+prometheus-client==0.26.0
+click>=8.1.3,<9
+exchange-calendars>=4.12
+tzdata

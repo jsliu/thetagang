@@ -34,6 +34,14 @@ version = "2.1.1"
 
   [project.scripts]
   thetagang = "thetagang.entry:cli"
+  thetagang-nt = "thetagang_nt.node:cli"
+
+  [project.optional-dependencies]
+  # the NautilusTrader rewrite (thetagang_nt/), Python >= 3.12
+  nautilus = [
+    "nautilus_trader[ib]>=1.231.0; python_version >= '3.12'",
+    "prometheus-client>=0.21,<1",
+  ]
 
 [dependency-groups]
 dev = [
@@ -68,7 +76,7 @@ build-backend = "hatchling.build"
 requires      = ["hatchling"]
 
 [tool.hatch.build]
-include = ["thetagang/**", "alembic.ini", "alembic/**"]
+include = ["thetagang/**", "thetagang_nt/**", "alembic.ini", "alembic/**"]
 
 [tool.uv]
 package = true

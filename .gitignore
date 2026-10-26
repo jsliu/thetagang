@@ -166,3 +166,4 @@ graphify-out/
 
 # macOS
 .DS_Store
+!thetagang.nt.toml

@@ -1,0 +1,117 @@
+# thetagang on NautilusTrader: `thetagang-nt -c thetagang.nt.toml`
+# Sample config (paper trading, dry run). Copy to thetagang.nt.local.toml (git-ignored)
+# for your own settings.
+# Run in Docker (Python 3.12 image; the trade env is 3.11):
+#   cd deploy && docker compose up -d --build   # the bot
+#   THETAGANG_CONFIG=thetagang.nt.toml docker compose up -d   # another config
+#   docker compose logs -f thetagang-nt
+# In Docker the bot reaches TWS at host.docker.internal (IB_HOST overrides ib.host).
+# Metrics: http://localhost:9464/metrics. Dashboard and Telegram alerts: the intraday
+# project's monitoring stack (http://localhost:3000, dashboard "thetagang").
+
+[node]
+trader_id = "THETAGANG-001"
+log_level = "INFO"
+# log_directory = "logs"
+# redis_host = "localhost"    # persist the Nautilus cache in Redis
+
+[ib]
+host = "127.0.0.1"
+port = 7497                   # TWS paper 7497, live 7496; IB Gateway paper 4002, live 4001
+client_id = 11
+# account_id = "DU0000000"    # or set TWS_ACCOUNT
+market_data_type = "REALTIME" # DELAYED_FROZEN shows last prices when markets are shut
+
+# Run IB Gateway in docker instead of a local TWS (Nautilus starts it):
+# [ib.gateway]
+# username = "..."
+# password = "..."
+# trading_mode = "paper"
+# read_only_api = false
+
+[monitor]
+interval_secs = 60
+metrics_port = 9464
+long_option_alert_delta = 0.8
+stress_moves = [-0.10, -0.05, 0.05, 0.10]
+
+# Remove this whole section to run the monitor only.
+[strategy]
+dry_run = true                # log orders, never send them
+interval_secs = 300
+market_hours_only = true
+delta_band = 1.0              # no new trades while |SPX delta| <= this
+minimum_credit = 0.0
+debit_spread_take_profit = 0.8
+debit_spread_max_roll_debit = 0.5
+reprice_after_secs = 60       # move unfilled orders halfway to mid, once
+chain_strikes = 15
+chain_expirations = 2
+
+[strategy.roll_target]        # what a roll moves into
+dte = 7
+max_dte = 60
+delta = 0.3
+
+[strategy.roll_when]
+pnl = 0.9
+dte = 10
+min_pnl = 0.7
+# max_dte = 180
+close_at_pnl = 0.9
+close_if_unable_to_roll = true  # needs max_dte
+
+  [strategy.roll_when.calls]
+  itm = true
+  always_when_itm = false
+  credit_only = false
+
+  [strategy.roll_when.puts]
+  itm = true
+  always_when_itm = false
+  credit_only = false
+
+# Trades opened to bring SPX delta to 0. structure: long_call, short_call,
+# long_put, short_put, put_credit_spread, call_credit_spread, put_debit_spread,
+# call_debit_spread (spreads need width).
+[[strategy.trades]]
+symbol = "SPY"
+structure = "put_debit_spread"
+width = 10.0
+delta = 0.5
+dte = 60
+max_contracts = 5
+
+[strategy.vix_call_hedge]
+enabled = false
+delta = 0.30
+target_dte = 30
+close_hedges_when_vix_exceeds = 30.0
+ignore_dte = 0
+
+# first match wins: lower_bound <= VIXMO < upper_bound; weight x net liq in VIX calls
+[[strategy.vix_call_hedge.allocation]]
+upper_bound = 15.0
+weight = 0.0
+
+[[strategy.vix_call_hedge.allocation]]
+lower_bound = 15.0
+upper_bound = 30.0
+weight = 0.01
+
+[[strategy.vix_call_hedge.allocation]]
+lower_bound = 30.0
+upper_bound = 50.0
+weight = 0.005
+
+[[strategy.vix_call_hedge.allocation]]
+lower_bound = 50.0
+weight = 0.0
+
+# Per-symbol overrides (every held symbol is managed):
+# [strategy.symbols.TQQQ]
+# no_trading = false
+# put_strike_limit = 100.0
+# call_strike_limit = 120.0
+# delta = 0.3
+# max_dte = 250
