@@ -136,12 +136,15 @@ class DiscretionaryConfig(StrategyConfig, frozen=True):
     trades: list[TradeConfig] = []
     vix_call_hedge: VixHedgeConfig = VixHedgeConfig()
     symbols: dict[str, SymbolConfig] = {}
+    # --role trade only: the trading process's own metrics (orders, dry_run, delta_band)
+    metrics_port: int = 9465
 
 
 class MonitorConfig(ActorConfig, frozen=True):
     interval_secs: int = 60
     metrics_addr: str = "0.0.0.0"
     metrics_port: int = 9464
+    publish: bool = True  # serve /metrics; off in --role trade, which only needs the betas
     long_option_alert_delta: float = 0.8
     stress_moves: tuple[float, ...] = (-0.10, -0.05, 0.05, 0.10)
 
@@ -175,7 +178,33 @@ def load(path: str | Path) -> AppConfig:
         return msgspec.convert(tomllib.load(f), AppConfig)
 
 
-def node_config(app: AppConfig) -> TradingNodeConfig:
+ROLES = ("all", "monitor", "trade")
+
+
+def split(
+    app: AppConfig, role: str
+) -> tuple[MonitorConfig, DiscretionaryConfig | None, int]:
+    """What one process runs: (monitor, strategy or None, IB client id).
+
+    all: monitor + strategy in one process (metrics on monitor.metrics_port).
+    monitor: the portfolio only, no strategy, so it can never trade; connects as
+      client_id + 1 so it runs beside a trade process.
+    trade: the strategy, with a monitor that only loads the betas it sizes with
+      (no metrics, so the dashboard isn't doubled); the strategy's own metrics go
+      on strategy.metrics_port."""
+    if role == "all":
+        return app.monitor, app.strategy, app.ib.client_id
+    if role == "monitor":
+        return app.monitor, None, app.ib.client_id + 1
+    if role == "trade":
+        if app.strategy is None:
+            raise ValueError("--role trade needs a [strategy] section")
+        quiet = msgspec.structs.replace(app.monitor, publish=False)
+        return quiet, app.strategy, app.ib.client_id
+    raise ValueError(f"role must be one of {ROLES}, got {role!r}")
+
+
+def node_config(app: AppConfig, client_id: int | None = None) -> TradingNodeConfig:
     ib = app.ib
     # one venue for everything, so options find their underlying for greeks
     provider = InteractiveBrokersInstrumentProviderConfig(
@@ -184,7 +213,7 @@ def node_config(app: AppConfig) -> TradingNodeConfig:
     common = dict(
         ibg_host=os.environ.get("IB_HOST", ib.host),  # docker: host.docker.internal
         ibg_port=ib.port,
-        ibg_client_id=ib.client_id,
+        ibg_client_id=ib.client_id if client_id is None else client_id,
         dockerized_gateway=ib.gateway,
         instrument_provider=provider,
     )

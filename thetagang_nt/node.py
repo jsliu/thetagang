@@ -1,4 +1,4 @@
-"""`thetagang-nt -c thetagang.nt.toml`: run the Nautilus TradingNode."""
+"""`thetagang-nt -c thetagang.nt.toml [--role all|monitor|trade]`: run the Nautilus TradingNode."""
 
 from __future__ import annotations
 
@@ -9,19 +9,23 @@ from nautilus_trader.adapters.interactive_brokers.factories import (
     InteractiveBrokersLiveExecClientFactory,
 )
 from nautilus_trader.live.node import TradingNode
+from prometheus_client import start_http_server
 
-from thetagang_nt.config import load, node_config
+from thetagang_nt.config import ROLES, load, node_config, split
 from thetagang_nt.monitor import PortfolioMonitor
 
 
-def build(path: str) -> TradingNode:
+def build(path: str, role: str = "all") -> TradingNode:
     app = load(path)
-    node = TradingNode(node_config(app))
-    node.trader.add_actor(PortfolioMonitor(app.monitor))
-    if app.strategy is not None:
+    monitor, strategy, client_id = split(app, role)
+    node = TradingNode(node_config(app, client_id))
+    node.trader.add_actor(PortfolioMonitor(monitor))
+    if strategy is not None:
         from thetagang_nt.strategy import Discretionary
 
-        node.trader.add_strategy(Discretionary(app.strategy))
+        node.trader.add_strategy(Discretionary(strategy))
+    if role == "trade":  # the strategy's own metrics; the monitor publishes none here
+        start_http_server(strategy.metrics_port, monitor.metrics_addr)
     node.add_data_client_factory(IB, InteractiveBrokersLiveDataClientFactory)
     node.add_exec_client_factory(IB, InteractiveBrokersLiveExecClientFactory)
     node.build()
@@ -30,8 +34,16 @@ def build(path: str) -> TradingNode:
 
 @click.command()
 @click.option("-c", "--config", "path", default="thetagang.nt.toml", show_default=True)
-def cli(path: str) -> None:
-    node = build(path)
+@click.option(
+    "--role",
+    type=click.Choice(ROLES),
+    default="all",
+    show_default=True,
+    help="monitor: the portfolio only, never trades; trade: the strategy only; "
+    "all: both in one process",
+)
+def cli(path: str, role: str) -> None:
+    node = build(path, role)
     try:
         node.run()
     finally:

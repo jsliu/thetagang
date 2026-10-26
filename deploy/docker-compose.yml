@@ -1,20 +1,36 @@
-# thetagang-nt in Docker. It serves its metrics on the host's 127.0.0.1:9464; dashboards and
-# Telegram alerts are the separate monitoring repo (../../monitoring: ./run.sh up), which scrapes them
-# (Grafana: http://localhost:3000, folder "thetagang").
-# The bot talks to TWS on the host (host.docker.internal; TWS: Configure > API > Settings must
-# allow the connection). `docker compose up -d --build`, then `docker compose logs -f thetagang-nt`.
+# thetagang-nt in Docker, as two processes from one image:
+#   thetagang-monitor  the portfolio: metrics on the host's 127.0.0.1:9464, never trades. Always on.
+#   thetagang-nt       the trading strategy (profile "trading"): started only on request; its own
+#                      metrics (orders, dry_run) on 127.0.0.1:9465.
+# Dashboards and Telegram alerts are the separate monitoring repo (../../monitoring: ./run.sh up),
+# which scrapes both (Grafana: http://localhost:3000, folder "thetagang").
+# Both talk to TWS on the host (host.docker.internal; TWS: Configure > API > Settings must allow the
+# connection), the monitor as ib.client_id + 1.
+#   docker compose up -d --build                       # the monitor only
+#   docker compose --profile trading up -d             # the monitor and the trading strategy
+#   docker compose stop thetagang-nt                   # stop trading, keep monitoring
+#   docker compose logs -f thetagang-monitor           # (or thetagang-nt)
+x-thetagang: &thetagang
+  build: .
+  image: thetagang-nt:1.231.0
+  environment:
+    IB_HOST: host.docker.internal
+  volumes:
+    - ..:/app:ro
+  extra_hosts: ["host.docker.internal:host-gateway"]
+  init: true                        # tini as PID 1: signals and crash exits behave
+  stop_grace_period: 30s            # let the node disconnect cleanly
+  restart: unless-stopped
+
 services:
-  thetagang-nt:
-    build: .
-    image: thetagang-nt:1.231.0
+  thetagang-monitor:
+    <<: *thetagang
     # THETAGANG_CONFIG: path relative to the repo root (default: your local config)
-    command: ["python", "-m", "thetagang_nt.node", "-c", "${THETAGANG_CONFIG:-thetagang.nt.local.toml}"]
-    environment:
-      IB_HOST: host.docker.internal
-    volumes:
-      - ..:/app:ro
-    extra_hosts: ["host.docker.internal:host-gateway"]
-    ports: ["127.0.0.1:9464:9464"]   # /metrics, scraped by the monitoring repo's Prometheus
-    init: true                        # tini as PID 1: signals and crash exits behave
-    stop_grace_period: 30s            # let the node disconnect cleanly
-    restart: unless-stopped
+    command: ["python", "-m", "thetagang_nt.node", "-c", "${THETAGANG_CONFIG:-thetagang.nt.local.toml}", "--role", "monitor"]
+    ports: ["127.0.0.1:9464:9464"]   # /metrics: the dashboard
+
+  thetagang-nt:
+    <<: *thetagang
+    profiles: ["trading"]
+    command: ["python", "-m", "thetagang_nt.node", "-c", "${THETAGANG_CONFIG:-thetagang.nt.local.toml}", "--role", "trade"]
+    ports: ["127.0.0.1:9465:9465"]   # /metrics: orders, dry_run, delta_band

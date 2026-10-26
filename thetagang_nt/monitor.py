@@ -78,16 +78,18 @@ class PortfolioMonitor(Actor):
         self._busy = False
 
     def on_start(self) -> None:
-        start_http_server(self.config.metrics_port, self.config.metrics_addr)
-        REGISTRY.register(self._snapshot)
-        self.log.info(
-            f"Metrics on http://{self.config.metrics_addr}:"
-            f"{self.config.metrics_port}/metrics"
-        )
+        if self.config.publish:
+            start_http_server(self.config.metrics_port, self.config.metrics_addr)
+            REGISTRY.register(self._snapshot)
+            self.log.info(
+                f"Metrics on http://{self.config.metrics_addr}:"
+                f"{self.config.metrics_port}/metrics"
+            )
         aio.spawn(self, self._boot(), "monitor boot")
 
     def on_stop(self) -> None:
-        REGISTRY.unregister(self._snapshot)
+        if self.config.publish:
+            REGISTRY.unregister(self._snapshot)
         self.clock.cancel_timers()
 
     async def _boot(self) -> None:
@@ -137,6 +139,8 @@ class PortfolioMonitor(Actor):
         legs = held_legs(self.cache)  # again, now with prices
         if self._beta_day != today:
             await self._load_betas(equity_symbols(symbols), today)
+        if not self.config.publish:  # --role trade: the betas are all the strategy needs
+            return
 
         f = _Families()
         for name, iid in (("spx", SPX), ("vix", VIX), ("vixmo", VIXMO)):

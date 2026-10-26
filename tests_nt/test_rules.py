@@ -137,3 +137,18 @@ def test_sample_config_loads() -> None:
     assert app.strategy is not None and app.strategy.dry_run
     assert app.strategy.roll_when.rules().close_at_pnl == 0.9
     assert node_config(app).trader_id.value == "THETAGANG-001"
+
+
+def test_roles_split_monitoring_from_trading() -> None:
+    pytest.importorskip("nautilus_trader")
+    from thetagang_nt.config import load, split
+
+    app = load("thetagang.nt.toml")  # has a [strategy] section, client_id 11
+    monitor, strategy, cid = split(app, "monitor")
+    assert strategy is None and monitor.publish and cid == 12  # can never trade
+    monitor, strategy, cid = split(app, "trade")
+    assert strategy is app.strategy and not monitor.publish and cid == 11  # no doubled metrics
+    monitor, strategy, cid = split(app, "all")
+    assert strategy is app.strategy and monitor.publish and cid == 11
+    with pytest.raises(ValueError, match="role"):
+        split(app, "everything")
