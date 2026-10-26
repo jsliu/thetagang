@@ -163,6 +163,7 @@ data/thetagang.db
 
 # graphify knowledge-graph output (regenerate with /graphify .)
 graphify-out/
+.worktrees/
 
 # macOS
 .DS_Store
