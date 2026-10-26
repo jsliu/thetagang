@@ -39,8 +39,8 @@ RUN apt-get update \
   wget \
   xdg-utils \
   xvfb \
-  && echo '0bd03c713f04c0a64367abbd3d5a40d228fcc2fb969c927bd7cdbd85baddac4b  ibc.zip' | tee ibc.zip.sha256 \
-  && wget -q https://github.com/IbcAlpha/IBC/releases/download/3.23.0/IBCLinux-3.23.0.zip -O ibc.zip \
+  && echo 'cc097ca1dfa75413a5fbe02e4743050af15f3308eb6a97c769b3cff9850c80c5  ibc.zip' | tee ibc.zip.sha256 \
+  && wget -q https://github.com/IbcAlpha/IBC/releases/download/3.24.2/IBCLinux-3.24.2.zip -O ibc.zip \
   && sha256sum -c ibc.zip.sha256 \
   && unzip ibc.zip -d /opt/ibc \
   && chmod o+x /opt/ibc/*.sh /opt/ibc/*/*.sh \
