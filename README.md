@@ -9,7 +9,7 @@ This repository holds two programs that share the same ideas but not their code:
 | Built on | [NautilusTrader](https://nautilustrader.io) 1.231 | [ib_async](https://github.com/ib-api-reloaded/ib_async) |
 | Runs as | a long-running node: checks every few minutes | one pass per start: run it from a scheduler |
 | Strategies | discretionary (rolls, closes, SPX-delta trades), VIX call hedge | wheel, discretionary, regime rebalancing, VIX call hedge, tail hedge, cash management |
-| Monitoring | Prometheus metrics; Grafana dashboard and Telegram alerts in the separate `monitoring` repo | risk tables printed to the terminal |
+| Monitoring | Prometheus metrics, also available from the independent `thetagang-monitor`; Grafana dashboard and Telegram alerts in the separate `monitoring` repo | risk tables printed to the terminal |
 | Config | [`thetagang.nt.toml`](thetagang.nt.toml) | [`thetagang.toml`](thetagang.toml), [`thetagang.discretionary.toml`](thetagang.discretionary.toml) |
 | Python | 3.12+ (or Docker) | 3.11 – 3.14 |
 
@@ -151,6 +151,24 @@ thetagang-nt -c thetagang.nt.local.toml
 Use an environment of its own: NautilusTrader upgrades pandas and other
 packages that the `thetagang` environment relies on. Monitoring works the
 same: the bot serves `:9464` on the host either way.
+
+### Standalone portfolio monitoring
+
+To serve the portfolio metrics without starting either trading program, install
+the monitor extra and run its separate command:
+
+```console
+uv sync --extra monitor
+thetagang-monitor --config thetagang.nt.toml
+```
+
+The monitor reads the `[ib]` and `[monitor]` settings from the same TOML file
+and serves Prometheus metrics at <http://localhost:9464/metrics> by default.
+It connects to IBKR in read-only mode, does not import NautilusTrader, and
+does not start `thetagang` or `thetagang-nt`. For an additional safeguard,
+enable the read-only API setting in TWS or IB Gateway. If a trading process
+uses the same TWS/Gateway, configure a different `ib.client_id` for the
+monitor so the API connections do not conflict.
 
 ### Configuration
 
