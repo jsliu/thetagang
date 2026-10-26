@@ -234,3 +234,44 @@ def test_breakdown_with_daily_pnl_attribution():
 
     plain = breakdown_table(book, betas, sym_greeks)  # no daily P&L
     assert len(plain.columns) == 5 and "largest beta effect" in str(plain.title)
+
+
+def test_option_volga_matches_the_change_in_vega_per_vol_point() -> None:
+    """Volga = d(vega)/d(vol): checked against finite differences of bs_price."""
+    from types import SimpleNamespace
+
+    from thetagang.risk import bs_price, option_volga
+
+    spot, strike, years, vol = 100.0, 120.0, 0.5, 0.30
+
+    def vega(v: float) -> float:  # $ per vol point, per share
+        return bs_price(spot, strike, years, v + 0.005, "C") - bs_price(
+            spot, strike, years, v - 0.005, "C"
+        )
+
+    g = SimpleNamespace(vega=vega(vol), undPrice=spot, impliedVol=vol)
+    expected = vega(vol + 0.005) - vega(vol - 0.005)  # change per vol point
+    assert option_volga(g, strike, years) == pytest.approx(expected, rel=1e-3)
+    assert (
+        option_volga(
+            SimpleNamespace(vega=1.0, undPrice=100.0, impliedVol=float("nan")),
+            100.0,
+            0.5,
+        )
+        == 0.0
+    )
+
+
+def test_greeks_table_shows_volga() -> None:
+    from rich.text import Text
+
+    from thetagang.risk import Book, Totals, greeks_table
+
+    table = greeks_table(
+        Book(Totals(volga=12.0), [], {}, {}, {}, 0), Totals(volga=3.0), 5000.0
+    )
+    cols = [
+        [Text.from_markup(str(c)).plain for c in col._cells] for col in table.columns
+    ]
+    rows = {name: (now, after) for name, now, after in zip(*cols)}
+    assert rows["Volga ($ vega/vol pt)"] == ("$12", "$3")

@@ -316,3 +316,390 @@ def compute_beta(
     a = np.diff(np.log([closes[d] for d in dates]))
     b = np.diff(np.log([index_closes[d] for d in dates]))
     return float(np.cov(a, b)[0][1] / np.var(b, ddof=1))
+
+
+# ------------------------------------------- SPX delta = 0 proposals (display)
+
+
+def zero_delta_targets(
+    delta_dollars: dict[str, float], betas: dict[str, float]
+) -> dict[str, float]:
+    """Target delta $ (no beta) per symbol so that both totals are zero:
+    sum(delta $) = 0 and sum(beta x delta $) = 0. Smallest proportional change
+    (weighted least squares); symbols with zero delta $ never change."""
+    symbols = list(delta_dollars)
+    if not symbols:
+        return {}
+    d = np.array([delta_dollars[s] for s in symbols], dtype=float)
+    b = np.array([betas[s] for s in symbols], dtype=float)
+    w = np.abs(d)
+    a = np.vstack([np.ones_like(d), b])
+    residual = -(a @ d)
+    change = w * (a.T @ (np.linalg.pinv((a * w) @ a.T) @ residual))
+    return {s: float(x) for s, x in zip(symbols, d + change)}
+
+
+def side_weight(beta_dollars: float, gross: float) -> tuple[float, str]:
+    """Share of gross |beta delta $| and the market side ("" when ~0)."""
+    if abs(beta_dollars) < 0.5 or not gross:
+        return 0.0, ""
+    return abs(beta_dollars) / gross, "long" if beta_dollars > 0 else "short"
+
+
+# per contract: share delta, SPX gamma, theta, vega, volga
+Unit = tuple[float, float, float, float, float]
+
+
+def volga(
+    vega: float, spot: float, strike: float, years: float, vol: float, carry: float
+) -> float:
+    """How much vega ($ per vol point) changes per vol point: vega x d1 x d2 / sigma
+    (Black-Scholes with cost of carry `carry`); 0 without usable inputs."""
+    values = (vega, spot, strike, years, vol)
+    if not all(math.isfinite(x) for x in values) or min(spot, strike, years, vol) <= 0:
+        return 0.0
+    sd = vol * math.sqrt(years)
+    d1 = (math.log(spot / strike) + (carry + vol * vol / 2) * years) / sd
+    return vega * d1 * (d1 - sd) / vol / 100
+
+
+@dataclass(frozen=True)
+class Adjuster:
+    """A position the proposal may resize: one option, or a whole vertical.
+    Greeks per unit: +1 = buy one contract / open one more spread."""
+
+    exposure: float
+    name: str
+    is_spread: bool
+    delta: float
+    gamma: float
+    theta: float
+    vega: float
+    held: float
+    close_sign: int  # direction of units that close: -1 sell/close, +1 buy back
+    legs: tuple[Leg, ...] = ()
+    volga: float = 0.0
+
+
+def leg_name(leg: Leg) -> str:
+    iid = leg.instrument_id
+    return iid.symbol.value if hasattr(iid, "symbol") else str(iid)
+
+
+def option_label(leg: Leg) -> str:
+    """The old bot's contract label: "EWQ 20261120 43C"; the symbol for stock."""
+    symbol = leg.symbol.lstrip("^")
+    if not leg.is_option:
+        return symbol
+    expiry = leg.expiry.strftime("%Y%m%d") if leg.expiry else ""
+    return f"{symbol} {expiry} {leg.strike:g}{leg.right}"
+
+
+def spread_name(short: Leg, long: Leg) -> str:
+    """The old bot's vertical label: "EWQ 20261120 43/45C"."""
+    low, high = sorted((short.strike, long.strike))
+    expiry = short.expiry.strftime("%Y%m%d") if short.expiry else ""
+    return f"{short.symbol.lstrip('^')} {expiry} {low:g}/{high:g}{short.right}"
+
+
+def size_adjustment(adjuster: Adjuster, shares: float) -> tuple[int, str]:
+    """Whole units that best add `shares` of delta, without flipping the position."""
+    units = round(shares / adjuster.delta)
+    if units * adjuster.close_sign > adjuster.held:
+        units = int(adjuster.close_sign * adjuster.held)
+    if not units:
+        return 0, "0"
+    if adjuster.is_spread:
+        verb = "open" if units > 0 else "close"
+        return units, f"{verb} {abs(units)} spread {adjuster.name}"
+    return units, f"{units:+d} {adjuster.name}"
+
+
+def stock_trade(shares: float, held: float) -> int:
+    """Whole shares to trade toward `shares`, closing at most what is held."""
+    traded = round(shares)
+    if traded * held < 0 and abs(traded) > abs(held):
+        return -round(held)
+    return traded
+
+
+def option_adjusters(legs: list[Leg], unit: dict[Any, Unit]) -> list[Adjuster]:
+    """Verticals resized as whole spreads (both legs need greeks), other options
+    one contract at a time; calendar/diagonal legs and |delta| < 0.01 left alone."""
+    pairs, unpaired, mixed = split_option_legs(legs)
+    found: list[Adjuster] = []
+    for short, long in pairs:
+        if short.instrument_id not in unit or long.instrument_id not in unit:
+            continue
+        su, lu = unit[short.instrument_id], unit[long.instrument_id]
+        delta, gamma, theta, vega, volga_ = (lv - sv for sv, lv in zip(su, lu))
+        if abs(delta) >= 1:
+            held = abs(short.qty)
+            found.append(
+                Adjuster(
+                    abs(delta * held),
+                    spread_name(short, long),
+                    True,
+                    delta,
+                    gamma,
+                    theta,
+                    vega,
+                    held,
+                    -1,
+                    (short, long),
+                    volga_,
+                )
+            )
+    for leg in unpaired:
+        if leg.right in mixed or leg.instrument_id not in unit:
+            continue
+        delta, gamma, theta, vega, volga_ = unit[leg.instrument_id]
+        if abs(delta) >= 1:
+            held = abs(leg.qty)
+            close_sign = 1 if leg.qty < 0 else -1
+            found.append(
+                Adjuster(
+                    abs(delta * held),
+                    leg_name(leg),
+                    False,
+                    delta,
+                    gamma,
+                    theta,
+                    vega,
+                    held,
+                    close_sign,
+                    (leg,),
+                    volga_,
+                )
+            )
+    return found
+
+
+def symbol_adjustment(
+    legs: list[Leg], shares: float, unit: dict[Any, Unit]
+) -> tuple[float, str, tuple[float, float, float, float]]:
+    """The trade toward `shares` of delta in one symbol: (share delta traded,
+    description, gamma/theta/vega/volga added). Resizes the position with the most
+    delta; stock-only symbols trade shares, never selling shares that cover
+    short calls; never flips a position."""
+    adjusters = option_adjusters(legs, unit)
+    if adjusters:
+        main = max(adjusters, key=lambda a: a.exposure)
+        units, text = size_adjustment(main, shares)
+        return (
+            units * main.delta,
+            text,
+            (
+                units * main.gamma,
+                units * main.theta,
+                units * main.vega,
+                units * main.volga,
+            ),
+        )
+    stock = [leg for leg in legs if not leg.is_option]
+    if stock:
+        traded = stock_trade(shares, stock[0].qty)
+        covering = sum(
+            -leg.qty * leg.multiplier
+            for leg in legs
+            if leg.right == "C" and leg.qty < 0
+        )
+        traded = max(traded, -int(max(stock[0].qty - covering, 0)))
+        text = f"{traded:+d} shares" if traded else "0"
+        return traded, text, (0.0, 0.0, 0.0, 0.0)
+    _, _, mixed = split_option_legs(legs)
+    reason = "none (calendar/diagonal legs)" if mixed else "none (delta < 0.01)"
+    return 0.0, reason, (0.0, 0.0, 0.0, 0.0)
+
+
+def weighted_strike(legs: list[Leg], right: str, short: bool) -> float | None:
+    """Contract-weighted average strike of the short or long options of a right."""
+    chosen = [leg for leg in legs if leg.right == right and (leg.qty < 0) == short]
+    total = sum(abs(leg.qty) for leg in chosen)
+    return sum(leg.strike * abs(leg.qty) for leg in chosen) / total if total else None
+
+
+# ------------------------------------------------- what the rules would do
+
+
+@dataclass(frozen=True)
+class Action:
+    """One position or vertical, what the strategy's rules would do with it
+    this run, and the price that takes profit (per share)."""
+
+    kind: str  # short, long, credit spread, debit spread, calendar/diagonal
+    name: str
+    symbol: str
+    right: str
+    qty: float
+    dte: int
+    pnl: float | None  # share of the premium (credit / debit)
+    take_profit: float | None
+    take_profit_side: str  # "buy <=" (shorts, credit) or "sell >=" (debit)
+    action: str
+
+
+def position_actions(
+    legs: list[Leg],
+    und: float | None,
+    rw: RollWhen,
+    debit_take_profit: float,
+    alert_delta: float,
+    deltas: dict[Any, float],
+    today: date,
+    no_trading: bool = False,
+) -> list[Action]:
+    """The roll/close/keep decision for every option leg or vertical of one
+    symbol, by the same rules the strategy trades with. A roll can still fail
+    when no contract fits; the strategy then closes or leaves it, as logged."""
+    out: list[Action] = []
+    symbol = legs[0].symbol if legs else ""
+    index = symbol.startswith("^")
+    tp_frac = rw.close_at_pnl if rw.close_at_pnl < 1 else None
+
+    def decide(right: str, strike: float, dte: int, pnl: float | None) -> str:
+        if no_trading:
+            return "none (no_trading)"
+        if index:
+            return "by hand (index option)"
+        if pnl is None:
+            return "by hand (no credit / no quote)"
+        itm = und is not None and is_itm(right, strike, und)
+        if should_roll(rw, right, itm, dte, pnl):
+            return "roll"
+        if should_close(rw, pnl):
+            return "close"
+        return "keep"
+
+    pairs, unpaired, mixed = split_option_legs(legs)
+    for short, long in pairs:
+        dte = short.dte(today)
+        if is_debit_vertical(short, long):
+            pnl = debit_pnl(short, long)
+            target = debit_take_profit_value(short, long, debit_take_profit)
+            value = (
+                None if short.mid is None or long.mid is None else long.mid - short.mid
+            )
+            if no_trading or index:
+                action = "none (no_trading)" if no_trading else "by hand (index option)"
+            elif value is None:
+                action = "by hand (no quote)"
+            elif value >= target:
+                action = "close (take-profit)"
+            elif dte <= rw.dte:
+                action = "roll"
+            else:
+                action = "keep"
+            out.append(
+                Action(
+                    "debit spread",
+                    spread_name(short, long),
+                    symbol,
+                    short.right,
+                    abs(long.qty),
+                    dte,
+                    pnl,
+                    target,
+                    "sell >=",
+                    action,
+                )
+            )
+        else:
+            pnl = credit_pnl(short, long)
+            credit = short.avg_px - long.avg_px
+            tp = credit * (1 - tp_frac) if tp_frac is not None and credit > 0 else None
+            out.append(
+                Action(
+                    "credit spread",
+                    spread_name(short, long),
+                    symbol,
+                    short.right,
+                    abs(short.qty),
+                    dte,
+                    pnl,
+                    tp,
+                    "buy <=",
+                    decide(short.right, short.strike, dte, pnl),
+                )
+            )
+    for leg in unpaired:
+        dte = leg.dte(today)
+        if leg.right in mixed:
+            out.append(
+                Action(
+                    "calendar/diagonal",
+                    option_label(leg),
+                    symbol,
+                    leg.right,
+                    leg.qty,
+                    dte,
+                    None,
+                    None,
+                    "",
+                    "by hand (calendar/diagonal)",
+                )
+            )
+        elif leg.qty < 0:
+            pnl = short_pnl(leg)
+            tp = (
+                leg.avg_px * (1 - tp_frac)
+                if tp_frac is not None and leg.avg_px > 0
+                else None
+            )
+            out.append(
+                Action(
+                    "short",
+                    option_label(leg),
+                    symbol,
+                    leg.right,
+                    leg.qty,
+                    dte,
+                    pnl,
+                    tp,
+                    "buy <=",
+                    decide(leg.right, leg.strike, dte, pnl),
+                )
+            )
+        else:
+            delta = deltas.get(leg.instrument_id)
+            pnl = (
+                (leg.mid - leg.avg_px) / leg.avg_px
+                if leg.mid is not None and leg.avg_px
+                else None
+            )
+            alert = delta is not None and abs(delta) >= alert_delta
+            out.append(
+                Action(
+                    "long",
+                    option_label(leg),
+                    symbol,
+                    leg.right,
+                    leg.qty,
+                    dte,
+                    pnl,
+                    None,
+                    "",
+                    f"roll or close by hand (|delta| >= {alert_delta:g})"
+                    if alert
+                    else "hold",
+                )
+            )
+    return out
+
+
+def vix_hedge_action(
+    held_calls: float, vix: float | None, vixmo: float | None, cfg: Any
+) -> tuple[str, float]:
+    """(what the VIX call hedge would do, the allocation weight at VIXMO)."""
+    weight = vix_hedge_weight(cfg.allocation, vixmo) if vixmo is not None else 0.0
+    if not cfg.enabled:
+        return "disabled", weight
+    threshold = cfg.close_hedges_when_vix_exceeds
+    above = bool(threshold) and vix is not None and vix > threshold
+    if held_calls > 0:
+        return ("sell all (VIX above threshold)" if above else "keep"), weight
+    if above or vix is None:
+        return "none (VIX above threshold)" if above else "none (no VIX price)", weight
+    return (
+        f"buy calls ({weight:.1%} of net liq)" if weight > 0 else "none (weight 0)"
+    ), weight

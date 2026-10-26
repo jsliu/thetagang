@@ -144,7 +144,9 @@ class MonitorConfig(ActorConfig, frozen=True):
     interval_secs: int = 60
     metrics_addr: str = "0.0.0.0"
     metrics_port: int = 9464
-    publish: bool = True  # serve /metrics; off in --role trade, which only needs the betas
+    publish: bool = (
+        True  # serve /metrics; off in --role trade, which only needs the betas
+    )
     long_option_alert_delta: float = 0.8
     stress_moves: tuple[float, ...] = (-0.10, -0.05, 0.05, 0.10)
 

@@ -253,6 +253,7 @@ class DiscretionaryEngine(
         # Filled with the risk tables, shown in the symbol and position tables
         self.position_greeks: dict[int, tuple[float, float, float, float]] = {}
         self.symbol_greeks: dict[str, tuple[float, float, float, float] | None] = {}
+        self.symbol_volga: dict[str, float] = {}  # options' volga per symbol
         self.contract_greeks: dict[int, tuple[float, float, float, float]] = {}
         # betas barely move within a day: reuse them across reconnects/reruns
         self.beta_cache: dict[str, float] = {}

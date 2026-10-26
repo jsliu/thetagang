@@ -12,6 +12,7 @@ from nautilus_trader.live.node import TradingNode
 from prometheus_client import start_http_server
 
 from thetagang_nt.config import ROLES, load, node_config, split
+from thetagang_nt.ib_extra import EXTRA_CLIENT_OFFSET, AccountExtras
 from thetagang_nt.monitor import PortfolioMonitor
 
 
@@ -19,7 +20,12 @@ def build(path: str, role: str = "all") -> TradingNode:
     app = load(path)
     monitor, strategy, client_id = split(app, role)
     node = TradingNode(node_config(app, client_id))
-    node.trader.add_actor(PortfolioMonitor(monitor))
+    extras = None
+    if monitor.publish:  # the read-only side connection, only where metrics are served
+        extras = AccountExtras(
+            app.ib.host, app.ib.port, client_id + EXTRA_CLIENT_OFFSET, app.ib.account_id
+        )
+    node.trader.add_actor(PortfolioMonitor(monitor, rules=app.strategy, extras=extras))
     if strategy is not None:
         from thetagang_nt.strategy import Discretionary
 

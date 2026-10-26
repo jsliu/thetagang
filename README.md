@@ -206,14 +206,26 @@ Alerts are sent 09:30–16:00 New York time on weekdays, repeated at most every
 | stress loss | a −10% SPX move (beta-weighted) would lose more than 5% of net liquidation (15 min) |
 | order sent | the bot sent a real (not dry-run) order in the last 10 minutes |
 
-The dashboard:
+The dashboard (everything the old bot printed):
 
 | Row | Panels |
 |---|---|
-| Headline | one tile each, the latest value (shown in any time range): net liquidation, unrealized P&L, SPX delta, theta per day, vega per vol point, gamma, *need attention* (positions without greeks + long options at the alert delta), data age |
-| Risk | beta delta $ by symbol; stress P&L, beta-weighted and with all betas at 1 |
-| Detail | per-symbol table (beta, delta, delta $, beta delta $, theta, vega); per-position table (quantity, cost, price, unrealized P&L, P&L ratio, DTE) |
+| Headline | one tile each, the latest value (shown in any time range): net liquidation, unrealized P&L, SPX delta, theta per day, vega per vol point, volga (vega change per vol point), gamma, *need attention* (positions without greeks + long options at the alert delta), data age |
+| Account | available funds, cash, excess liquidity, initial and maintenance margin, buying power, cushion; SPX move today |
+| Risk | portfolio greeks now / after the SPX Δ=0 proposals / after the trade plan; stress P&L, beta-weighted and with all betas at 1; the VIX call hedge (calls held, allocation at VIXMO, close level) and what it would do |
+| By symbol | beta delta $ by symbol; today's P&L by symbol and its attribution (from SPX, unexplained, delta, gamma, theta, vega, residual); the Symbols table (beta, delta, delta $, beta delta $, gamma, theta, vega, volga) |
+| Positions summary | shares, short/long puts and calls, average strikes, weight now and target weight for SPX Δ=0, target beta delta $, share-equivalent change, side, and the net target contracts (display only) |
+| Options and spreads | every short, long, credit and debit vertical with quantity, DTE, delta, P&L of the premium, the take-profit price, and what the strategy's rules would do (roll / close / keep / by hand) |
+| Positions | quantity, cost, price, unrealized P&L, P&L ratio, DTE |
+| Trade plan | the configured trades sized to SPX Δ=0 and why (only while the trading strategy runs) |
 | Activity | VIX and VIXMO, orders per hour (dry-run orders included) |
+
+The monitor computes the actions and targets with the strategy's own rules
+(`thetagang_nt/rules.py`) and the `[strategy]` settings, so they show what the
+strategy would do even when it isn't running. Cash, margins, buying power,
+cushion and IB's daily P&L come from a small read-only IB connection inside
+the monitor (client id `ib.client_id + 101` in `--role monitor`), since
+NautilusTrader doesn't expose them.
 
 All metrics are named `thetagang_*`, so you can query them in Prometheus or
 add your own panels.

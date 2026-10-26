@@ -4,3 +4,4 @@ prometheus-client==0.26.0
 click>=8.1.3,<9
 exchange-calendars>=4.12
 tzdata
+ib_async>=2.0.1,<3  # the monitor's read-only side connection (thetagang_nt/ib_extra.py)

@@ -2,7 +2,7 @@
 delta by symbol, and the SPX delta = 0 proposals. Pure functions, no IB calls."""
 
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, NamedTuple
 
 import numpy as np
@@ -37,6 +37,27 @@ def bs_price(spot: float, strike: float, years: float, vol: float, right: str) -
     cdf = lambda x: 0.5 * (1 + math.erf(x / math.sqrt(2)))
     call = spot * cdf(d1) - strike * cdf(d1 - sd)
     return call if right.upper().startswith("C") else call - spot + strike
+
+
+def option_volga(g: Any, strike: float, years: float) -> float:
+    """Volga per share: how much vega ($ per vol point) changes per vol point,
+    vega x d1 x d2 / sigma (Black-Scholes, zero rate as the stress table);
+    0 when IB's greeks lack the inputs."""
+    try:
+        vega, spot, vol = float(g.vega), float(g.undPrice), float(g.impliedVol)
+    except (TypeError, ValueError, AttributeError):
+        return 0.0
+    if not all(math.isfinite(x) for x in (vega, spot, vol)):
+        return 0.0
+    if vol <= 0 or spot <= 0 or strike <= 0 or years <= 0:
+        return 0.0
+    sd = vol * math.sqrt(years)
+    d1 = (math.log(spot / strike) + sd * sd / 2) / sd
+    return vega * d1 * (d1 - sd) / vol / 100
+
+
+def option_years(item: PortfolioItem) -> float:
+    return max(option_dte(item.contract.lastTradeDateOrContractMonth), 1) / 365
 
 
 def zero_delta_targets(
@@ -204,6 +225,7 @@ class Totals:
     gamma: float = 0.0  # SPX delta change per 1-point SPX move
     theta: float = 0.0
     vega: float = 0.0
+    volga: float = 0.0  # vega change ($ per vol point) per vol point
 
 
 @dataclass
@@ -216,6 +238,7 @@ class Book:
     prices: dict[str, float]  # symbol -> underlying price
     option_items: dict[str, list[PortfolioItem]]  # all option positions, by symbol
     missing: int  # options without greeks
+    volga_by_symbol: dict[str, float] = field(default_factory=dict)
 
 
 def valid_greeks(g: Any) -> bool:
@@ -313,7 +336,10 @@ def aggregate_book(
             t.gamma += g.gamma * size * (beta * g.undPrice / spx_price) ** 2
             t.theta += g.theta * size
             t.vega += g.vega * size
-            years = max(option_dte(i.contract.lastTradeDateOrContractMonth), 1) / 365
+            years = option_years(i)
+            volga = option_volga(g, i.contract.strike, years) * size
+            t.volga += volga
+            book.volga_by_symbol[symbol] = book.volga_by_symbol.get(symbol, 0.0) + volga
             book.legs.append(
                 (
                     beta,
@@ -366,6 +392,7 @@ def greeks_table(book: Book, after: Totals, spx_price: float) -> Table:
         ("Gamma (SPX delta / pt)", now.gamma, after.gamma, ffmt, 4),
         ("Theta ($/day)", now.theta, after.theta, dfmt, 0),
         ("Vega ($/vol pt)", now.vega, after.vega, dfmt, 0),
+        ("Volga ($ vega/vol pt)", now.volga, after.volga, dfmt, 0),
     ]
     for name, now_value, after_value, fmt, digits in rows:
         # round away float noise so "after" shows 0 instead of -0

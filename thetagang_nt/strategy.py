@@ -87,7 +87,30 @@ LAST_RUN = Gauge(
 )
 # config the alert rules need (Prometheus can't read the TOML)
 DRY_RUN = Gauge("thetagang_strategy_dry_run", "1 while orders are only logged")
-DELTA_BAND = Gauge("thetagang_strategy_delta_band", "No new trades while |SPX delta| <= this")
+DELTA_BAND = Gauge(
+    "thetagang_strategy_delta_band", "No new trades while |SPX delta| <= this"
+)
+# the trade plan, for the dashboard (the old "Discretionary trades" table)
+PLAN = Gauge(
+    "thetagang_plan_units",
+    "Contracts (spreads: spreads) the plan opens per configured trade",
+    ["trade", "contracts", "note"],
+)
+PLAN_UNIT = Gauge(
+    "thetagang_plan_unit_spx_delta", "SPX delta added per unit", ["trade"]
+)
+PLAN_STATUS = Gauge("thetagang_plan_status", "Why the plan is what it is", ["status"])
+AFTER = Gauge(
+    "thetagang_greeks_after_trades",
+    "Portfolio greeks after the planned trades (SPX beta-weighted)",
+    ["greek"],
+)
+
+
+def plan_status(status: str) -> None:
+    PLAN_STATUS.clear()
+    PLAN_STATUS.labels(status=status).set(1)
+
 
 ComboLegs = list[tuple[InstrumentId, int]]  # (leg, +1 buy / -1 sell per unit)
 
@@ -192,6 +215,7 @@ class Discretionary(Strategy):
             return
         if acted:
             self.log.warning("Rolls/closes this run change SPX delta: new trades wait")
+            plan_status("rolls/closes this run: new trades wait")
             return
         await self._open_trades(legs, today, busy)
 
@@ -539,9 +563,13 @@ class Discretionary(Strategy):
 
     async def _open_trades(self, legs: list[Leg], today: date, busy: set[str]) -> None:
         cfg = self.config
+        PLAN.clear()
+        PLAN_UNIT.clear()
+        AFTER.clear()
         spx = price(self.cache, SPX)
         if not spx:
             self.log.warning("No SPX price: no new trades")
+            plan_status("no SPX price")
             return
         raw = self.cache.get(BETAS_KEY)
         betas = json.loads(raw) if raw else {}
@@ -551,27 +579,59 @@ class Discretionary(Strategy):
             self.log.warning(
                 f"{len(book.missing)} position(s) without greeks: no trades"
             )
+            plan_status(f"{len(book.missing)} position(s) without greeks: no trades")
             return
         if abs(now) <= cfg.delta_band:
             self.log.info(f"SPX delta {now:+.2f} within the band of {cfg.delta_band:g}")
+            plan_status(f"SPX delta {now:+.2f} within the band of {cfg.delta_band:g}")
             return
-        plans: list[tuple[TradeConfig, Plan, ComboLegs, float]] = []
+        plans: list[tuple[TradeConfig, Plan, ComboLegs, float, dict[str, float]]] = []
         for t in cfg.trades:
-            plan, combo, combo_price = Plan(t.weight, t.max_contracts), [], 0.0
+            plan, combo, combo_price, unit = (
+                Plan(t.weight, t.max_contracts),
+                [],
+                0.0,
+                {},
+            )
             if t.symbol in busy or self._no_trading(t.symbol):
                 plan.note = "open orders or no_trading"
             else:
                 try:
-                    combo, combo_price, plan.unit_spx = await self._price_trade(
+                    combo, combo_price, unit = await self._price_trade(
                         t, spx, betas.get(t.symbol, 1.0), today
                     )
+                    plan.unit_spx = unit["beta_delta_dollars"] / spx
                     plan.priced = True
                 except (NoContract, TimeoutError) as e:
                     plan.note = f"skipped: {e}"
-            plans.append((t, plan, combo, combo_price))
-        size_plans([p for _, p, _, _ in plans], need=-now)
+            plans.append((t, plan, combo, combo_price, unit))
+        size_plans([p for _, p, _, _, _ in plans], need=-now)
         self.log.info(f"SPX delta {now:+.2f}: sizing {len(plans)} trade(s) toward 0")
-        for t, plan, combo, combo_price in plans:
+        after = {
+            "beta_delta_dollars": book.beta_dollars,
+            "delta_dollars": book.plain_dollars,
+            "gamma": book.gamma,
+            "theta": book.theta,
+            "vega": book.vega,
+            "volga": book.volga,
+        }
+        for t, plan, combo, _, unit in plans:
+            name = f"{t.symbol} {t.structure}"
+            contracts = " / ".join(
+                f"{'+' if r > 0 else '-'}{i.symbol.value}" for i, r in combo
+            )
+            PLAN.labels(trade=name, contracts=contracts or "-", note=plan.note).set(
+                plan.units
+            )
+            if plan.priced:
+                PLAN_UNIT.labels(trade=name).set(plan.unit_spx)
+            for greek, value in unit.items():
+                after[greek] += plan.units * value
+        AFTER.labels(greek="spx_delta").set(after["beta_delta_dollars"] / spx)
+        for greek, value in after.items():
+            AFTER.labels(greek=greek).set(value)
+        plan_status(f"SPX delta {now:+.2f} -> {after['beta_delta_dollars'] / spx:+.2f}")
+        for t, plan, combo, combo_price, _ in plans:
             self.log.info(
                 f"{t.symbol} {t.structure}: {plan.units} unit(s) at "
                 f"{plan.unit_spx:+.3f} SPX delta each. {plan.note}"
@@ -583,25 +643,40 @@ class Discretionary(Strategy):
 
     async def _price_trade(
         self, t: TradeConfig, spx: float, beta: float, today: date
-    ) -> tuple[ComboLegs, float, float]:
-        """(combo legs, price per unit, SPX delta per unit) of one configured trade."""
+    ) -> tuple[ComboLegs, float, dict[str, float]]:
+        """(combo legs, price per unit, greeks added per unit) of one configured
+        trade: delta $, beta delta $, SPX gamma, theta, vega."""
         right, sign, second = STRUCTURES[t.structure]
         main = await self._find(t.symbol, right, t.delta, t.dte, None, 0.01)
-        picks = [(main.instrument_id, sign, main.delta, main.price)]
+        picks = [(main.instrument_id, sign, main.price)]
         if second is not None:
             direction, sign2 = second
             strike = main.strike + direction * t.width
             iid = self._option_at(t.symbol, right, main.expiry, strike)
             other = await self._price_of(iid)
-            ins = self.cache.instrument(iid) if iid else None
-            g = ins and option_greeks(self.cache, self.greeks, ins, today)
-            if other is None or not g:
-                raise NoContract(f"no quote/greeks for the second leg at {strike:g}")
-            picks.append((iid, sign2, g.delta, other))
+            if iid is None or other is None:
+                raise NoContract(f"no quote for the second leg at {strike:g}")
+            picks.append((iid, sign2, other))
         und = price(self.cache, underlying_id(t.symbol))
-        unit_spx = sum(s * d * 100 * und * beta / spx for _, s, d, _ in picks)
-        combo_price = sum(s * p for _, s, _, p in picks)
-        return [(iid, s) for iid, s, _, _ in picks], combo_price, unit_spx
+        unit = dict.fromkeys(
+            ("beta_delta_dollars", "delta_dollars", "gamma", "theta", "vega", "volga"),
+            0.0,
+        )
+        for iid, s, _ in picks:
+            g = option_greeks(
+                self.cache, self.greeks, self.cache.instrument(iid), today
+            )
+            if g is None:
+                raise NoContract(f"no greeks for {iid.symbol.value}")
+            size = s * 100
+            unit["delta_dollars"] += g.delta * size * und
+            unit["beta_delta_dollars"] += g.delta * size * und * beta
+            unit["gamma"] += g.gamma * size * (beta * und / spx) ** 2
+            unit["theta"] += g.theta * size
+            unit["vega"] += g.vega * size
+            unit["volga"] += g.volga * size
+        combo_price = sum(s * p for _, s, p in picks)
+        return [(iid, s) for iid, s, _ in picks], combo_price, unit
 
     # ------------------------------------------------------ chain scanning
 

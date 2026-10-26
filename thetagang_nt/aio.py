@@ -30,9 +30,11 @@ def spawn(actor: Actor, coro: Coroutine[Any, Any, Any], name: str) -> None:
     def start() -> None:
         task = _loop.create_task(coro, name=name)
         task.add_done_callback(
-            lambda t: t.cancelled()
-            or t.exception() is None
-            or actor.log.exception(f"{name} failed", t.exception())
+            lambda t: (
+                t.cancelled()
+                or t.exception() is None
+                or actor.log.exception(f"{name} failed", t.exception())
+            )
         )
 
     try:

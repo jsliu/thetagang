@@ -21,7 +21,7 @@ from nautilus_trader.model.greeks import GreeksCalculator
 from nautilus_trader.model.identifiers import InstrumentId, Venue
 from nautilus_trader.model.instruments import Equity, OptionContract
 
-from thetagang_nt.rules import Leg
+from thetagang_nt.rules import Leg, volga
 
 VENUE = Venue("SMART")
 SPX = InstrumentId.from_str("^SPX.SMART")
@@ -32,6 +32,9 @@ INDEX_CONTRACTS = [
 ]
 VIX_ROOT = "^VIX"  # the underlying Nautilus gives VIX options
 RATE = 0.0425  # GreeksCalculator's default flat rate
+# An implied vol this low means the solver failed (e.g. IB's -1 "no quote"
+# price): those greeks come back as zeros and must count as missing.
+MIN_VOL = 1e-4
 
 
 def is_index(symbol: str) -> bool:
@@ -126,6 +129,7 @@ class Greeks:
     underlying: float
     vol: float
     price: float
+    volga: float = 0.0  # vega change ($ per vol point) per vol point
 
 
 def _ok(*values: float | None) -> bool:
@@ -164,13 +168,27 @@ def option_greeks(
 ) -> Greeks | None:
     """Nautilus GreeksCalculator greeks implied from the option's mid. VIX options
     price off their expiry's VIX future, not the index: Black-76 (carry 0) on the
-    parity forward (or `forward`), through the same Rust pricer."""
+    parity forward (or `forward`), through the same Rust pricer. None, counted
+    as missing greeks, without a usable option price or implied vol."""
+    if price(cache, ins.id) is None:  # no two-sided quote or last trade
+        return None
     if ins.underlying != VIX_ROOT:
         g = calc.instrument_greeks(ins.id)
-        if g is None or not _ok(g.delta, g.gamma, g.theta, g.vega):
+        if g is None or not _ok(g.delta, g.gamma, g.theta, g.vega, g.vol):
             return None
+        if g.vol < MIN_VOL:
+            return None
+        strike, years = float(ins.strike_price), years_to(ins, today)
+        g_volga = volga(g.vega, g.underlying_price, strike, years, g.vol, RATE)
         return Greeks(
-            g.delta, g.gamma, g.theta, g.vega, g.underlying_price, g.vol, g.price
+            g.delta,
+            g.gamma,
+            g.theta,
+            g.vega,
+            g.underlying_price,
+            g.vol,
+            g.price,
+            g_volga,
         )
     opt, und = price(cache, ins.id), forward or index_forward(cache, ins)
     if opt is None or und is None:
@@ -178,9 +196,11 @@ def option_greeks(
     is_call = ins.option_kind == OptionKind.CALL
     strike = float(ins.strike_price)
     g = imply_vol_and_greeks(und, RATE, 0.0, is_call, strike, years_to(ins, today), opt)
-    if not _ok(g.delta, g.gamma, g.theta, g.vega):
+    if not _ok(g.delta, g.gamma, g.theta, g.vega, g.vol) or g.vol < MIN_VOL:
         return None
-    return Greeks(g.delta, g.gamma, g.theta, g.vega, und, g.vol, g.price)
+    years = years_to(ins, today)
+    g_volga = volga(g.vega, und, strike, years, g.vol, 0.0)  # Black-76: carry 0
+    return Greeks(g.delta, g.gamma, g.theta, g.vega, und, g.vol, g.price, g_volga)
 
 
 # ------------------------------------------------------------------- book
@@ -195,6 +215,7 @@ class SymbolRisk:
     gamma: float = 0.0  # share delta change per $1 underlying move
     theta: float = 0.0
     vega: float = 0.0
+    volga: float = 0.0
     price: float = 0.0
 
 
@@ -209,6 +230,7 @@ class Book:
     gamma: float = 0.0  # SPX delta change per SPX point
     theta: float = 0.0
     vega: float = 0.0
+    volga: float = 0.0
     by_symbol: dict[str, SymbolRisk] = field(default_factory=dict)
     greeks: dict[InstrumentId, Greeks] = field(default_factory=dict)
     missing: list[InstrumentId] = field(default_factory=list)
@@ -237,6 +259,7 @@ def build_book(
                 book.missing.append(leg.instrument_id)
                 continue
             delta, gamma, theta, vega, und = leg.qty, 0.0, 0.0, 0.0, leg.mid
+            vol_ = 0.0
         else:
             g = option_greeks(cache, calc, cache.instrument(leg.instrument_id), today)
             if g is None:
@@ -246,11 +269,13 @@ def build_book(
             size = leg.qty * leg.multiplier
             delta, gamma, und = g.delta * size, g.gamma * size, g.underlying
             theta, vega = g.theta * size, g.vega * size
+            vol_ = g.volga * size
         row.price = und
         row.delta_shares += delta
         row.gamma += gamma
         row.theta += theta
         row.vega += vega
+        row.volga += vol_
         row.plain_dollars += delta * und
         row.beta_dollars += delta * und * beta
         book.plain_dollars += delta * und
@@ -258,6 +283,7 @@ def build_book(
         book.gamma += gamma * (beta * und / spx) ** 2 if spx else 0.0
         book.theta += theta
         book.vega += vega
+        book.volga += vol_
     return book
 
 

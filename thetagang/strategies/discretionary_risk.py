@@ -38,6 +38,8 @@ from thetagang.risk import (
     contract_greeks,
     daily_pnl_by_symbol,
     greeks_table,
+    option_volga,
+    option_years,
     per_contract,
     position_greeks,
     side_weight,
@@ -93,6 +95,7 @@ class DiscretionaryRiskMixin:
     zero_delta: dict[str, tuple[str, ...]]
     position_greeks: dict[int, tuple[float, float, float, float]]
     symbol_greeks: dict[str, tuple[float, float, float, float] | None]
+    symbol_volga: dict[str, float]
     contract_greeks: dict[int, tuple[float, float, float, float]]
     beta_cache: dict[str, float]
     beta_cache_day: date | None
@@ -187,6 +190,7 @@ class DiscretionaryRiskMixin:
         self.position_greeks, self.symbol_greeks, self.contract_greeks = {}, {}, {}
         items, spx_price, betas, greeks = await self.fetch_risk_inputs()
         book = aggregate_book(items, betas, greeks, spx_price)
+        self.symbol_volga = book.volga_by_symbol
         self.position_greeks = position_greeks(items, greeks)
         self.symbol_greeks = symbol_greeks(items, self.position_greeks)
         self.contract_greeks = contract_greeks(items, greeks)
@@ -481,14 +485,17 @@ class DiscretionaryRiskMixin:
                 )
                 continue
             symbol_items = [i for i in items if i.contract.symbol == symbol]
-            traded, trade, (gamma, theta, vega), resize = self._symbol_adjustment(
-                symbol_items, shares, greeks, betas[symbol], spx_price
+            traded, trade, (gamma, theta, vega, volga), resize = (
+                self._symbol_adjustment(
+                    symbol_items, shares, greeks, betas[symbol], spx_price
+                )
             )
             if resize is not None:
                 self.resizes.append(resize)
             after.gamma += gamma
             after.theta += theta
             after.vega += vega
+            after.volga += volga
             after.plain_delta_dollars += traded * price
             after.delta_dollars += traded * price * betas[symbol]
             self.zero_delta[symbol] = (*weights, f"{shares:+,.0f}", trade)
@@ -501,7 +508,7 @@ class DiscretionaryRiskMixin:
         greeks: dict[int, Any],
         beta: float,
         spx_price: float,
-    ) -> tuple[float, str, tuple[float, float, float], Resize | None]:
+    ) -> tuple[float, str, tuple[float, float, float, float], Resize | None]:
         """The trade toward `shares` of delta in one symbol: (share delta traded,
         description, gamma/theta/vega added, the trade itself). Resizes the
         position with the most delta; stock-only symbols trade shares; never flips
@@ -511,7 +518,22 @@ class DiscretionaryRiskMixin:
         if adjusters:
             main = max(adjusters, key=lambda a: a.exposure)
             units, trade = size_adjustment(main, shares)
-            added = (units * main.gamma, units * main.theta, units * main.vega)
+            # volga per unit: long leg minus short leg for a spread
+            signs = (-1, 1) if main.is_spread else (1,)
+            unit_volga = sum(
+                s
+                * option_volga(
+                    greeks[i.contract.conId], i.contract.strike, option_years(i)
+                )
+                * float(i.contract.multiplier or 100)
+                for s, i in zip(signs, main.legs)
+            )
+            added = (
+                units * main.gamma,
+                units * main.theta,
+                units * main.vega,
+                units * unit_volga,
+            )
             resize = Resize(symbol, units, adjuster=main) if units else None
             return units * main.delta, trade, added, resize
         stock = [i for i in symbol_items if i.contract.secType == "STK"]
@@ -528,13 +550,13 @@ class DiscretionaryRiskMixin:
             traded = max(traded, -int(max(stock[0].position - covering, 0)))
             resize = Resize(symbol, traded, stock=stock[0]) if traded else None
             text = f"{traded:+d} shares" if traded else "0"
-            return traded, text, (0.0, 0.0, 0.0), resize
+            return traded, text, (0.0, 0.0, 0.0, 0.0), resize
         reason = (
             "none (calendar/diagonal legs)"
             if self.has_calendar_or_diagonal_legs(symbol_items)
             else "none (delta < 0.01)"
         )
-        return 0.0, reason, (0.0, 0.0, 0.0), None
+        return 0.0, reason, (0.0, 0.0, 0.0, 0.0), None
 
     # ----------------------------------------------------------------- tables
 
@@ -567,6 +589,7 @@ class DiscretionaryRiskMixin:
                 "  Gamma: how much that delta changes for a $1 move in the stock.\n"
                 "  Theta: $ per day from time decay (positive means you earn it).\n"
                 "  Vega: $ change for a 1-point rise in implied volatility.\n"
+                "  Volga: change in that vega ($) for a 1-point rise in implied volatility.\n"
                 "n/a: an option in the symbol has no greeks from IB."
             ),
             caption_justify="left",
@@ -577,19 +600,21 @@ class DiscretionaryRiskMixin:
             "Gamma",
             "Theta",
             "Vega",
+            "Volga",
             "Target weight (SPX Δ=0)",
         ):
             table.add_column(column, justify="left" if column == "Symbol" else "right")
         for symbol in self.config.portfolio.symbols:
             g = self.symbol_greeks.get(symbol)
             cells = (
-                ["n/a"] * 4
+                ["n/a"] * 5
                 if g is None
                 else [
                     f"{g[0]:+,.1f}",
                     f"{g[1]:+,.2f}",
                     dfmt(g[2], 0),
                     dfmt(g[3], 0),
+                    dfmt(self.symbol_volga.get(symbol, 0.0), 0),
                 ]
             )
             table.add_row(symbol, *cells, self.zero_delta.get(symbol, ("n/a",) * 5)[1])

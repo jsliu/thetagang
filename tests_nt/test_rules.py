@@ -147,8 +147,203 @@ def test_roles_split_monitoring_from_trading() -> None:
     monitor, strategy, cid = split(app, "monitor")
     assert strategy is None and monitor.publish and cid == 12  # can never trade
     monitor, strategy, cid = split(app, "trade")
-    assert strategy is app.strategy and not monitor.publish and cid == 11  # no doubled metrics
+    assert (
+        strategy is app.strategy and not monitor.publish and cid == 11
+    )  # no doubled metrics
     monitor, strategy, cid = split(app, "all")
     assert strategy is app.strategy and monitor.publish and cid == 11
     with pytest.raises(ValueError, match="role"):
         split(app, "everything")
+
+
+# ------------------------------------------- dashboard: proposals and actions
+
+from thetagang_nt.rules import (  # noqa: E402
+    position_actions,
+    side_weight,
+    size_adjustment,
+    stock_trade,
+    symbol_adjustment,
+    vix_hedge_action,
+    zero_delta_targets,
+)
+
+TODAY = date(2026, 11, 2)  # EXP is 46 days out
+
+
+def test_zero_delta_targets_zero_both_totals() -> None:
+    now = {"A": 50_000.0, "B": -10_000.0, "C": 20_000.0}
+    betas = {"A": 1.5, "B": 0.8, "C": 1.0}
+    target = zero_delta_targets(now, betas)
+    assert sum(target.values()) == pytest.approx(0, abs=1e-6)
+    assert sum(betas[s] * v for s, v in target.items()) == pytest.approx(0, abs=1e-6)
+    assert side_weight(-300.0, 1000.0) == (pytest.approx(0.3), "short")
+    assert side_weight(0.1, 1000.0) == (0.0, "")
+
+
+def test_net_target_contracts_never_flip_or_sell_covering_shares() -> None:
+    put = opt("P", 30, -2, 1.0, 0.5)  # short 2 puts: +50 share delta per contract
+    unit = {put.instrument_id: (-50.0, 0.0, 1.0, -2.0, 0.5)}
+    traded, text, _ = symbol_adjustment(
+        [put], -500.0, unit
+    )  # wants -500: only 2 to buy back
+    assert traded == -100.0 and text == "+2 P30"
+    shares, call = stock(200), opt("C", 40, -1, 1.0, 0.5)
+    traded, text, _ = symbol_adjustment(
+        [shares, call], -500.0, {}
+    )  # call has no greeks
+    assert traded == -100 and text == "-100 shares"  # 100 of the 200 cover the call
+    assert stock_trade(-300, 100) == -100 and stock_trade(50, 100) == 50
+
+
+def test_actions_follow_roll_when_and_show_take_profit() -> None:
+    rw = RollWhen(pnl=0.9, dte=10, min_pnl=0.7, close_at_pnl=0.9)
+
+    def act(*legs: Leg, deltas: dict | None = None) -> dict:
+        found = position_actions(list(legs), 40.0, rw, 0.8, 0.8, deltas or {}, TODAY)
+        return {a.name: a for a in found}
+
+    shorts = act(opt("P", 30, -1, 1.0, 0.05), opt("C", 50, -1, 2.0, 1.5))
+    assert shorts["AA 20261218 30P"].action == "roll"  # 95% of the premium captured
+    assert shorts["AA 20261218 30P"].take_profit == pytest.approx(
+        0.1
+    )  # buy back at <= 10% of 1.0
+    assert shorts["AA 20261218 50C"].action == "keep"  # 25% captured
+    long_call = act(opt("C", 60, 2, 1.0, 1.2), deltas={"C60": 0.85})
+    assert long_call["AA 20261218 60C"].action.startswith("roll or close by hand")
+    # a short and a long call of different sizes are a diagonal: left alone, as before
+    mixed = act(opt("C", 50, -1, 2.0, 1.5), opt("C", 60, 2, 1.0, 1.2))
+    assert {a.action for a in mixed.values()} == {"by hand (calendar/diagonal)"}
+
+
+def test_spread_actions_and_index_options_are_left_alone() -> None:
+    rw = RollWhen(pnl=0.9, dte=10, min_pnl=0.7, close_at_pnl=0.9)
+    # debit put spread: paid 2 for a 5 wide spread now worth 4.5 -> past the 80% take-profit (4.4)
+    debit = position_actions(
+        [opt("P", 40, 1, 3.0, 5.0), opt("P", 35, -1, 1.0, 0.5)],
+        38.0,
+        rw,
+        0.8,
+        0.8,
+        {},
+        TODAY,
+    )
+    assert debit[0].kind == "debit spread" and debit[0].action == "close (take-profit)"
+    assert debit[0].take_profit == pytest.approx(4.4)
+    index_put = Leg("SPX P", "^SPX", "P", 6000.0, EXP, -1, 10.0, 1.0)
+    assert (
+        position_actions([index_put], 7000.0, rw, 0.8, 0.8, {}, TODAY)[0].action
+        == "by hand (index option)"
+    )
+
+
+def test_vix_hedge_action() -> None:
+    cfg = SimpleNamespace(
+        enabled=True,
+        close_hedges_when_vix_exceeds=30.0,
+        allocation=[SimpleNamespace(lower_bound=15.0, upper_bound=30.0, weight=0.01)],
+    )
+    assert vix_hedge_action(5, 35.0, 33.0, cfg)[0] == "sell all (VIX above threshold)"
+    assert vix_hedge_action(5, 20.0, 21.0, cfg)[0] == "keep"
+    assert vix_hedge_action(0, 20.0, 21.0, cfg) == ("buy calls (1.0% of net liq)", 0.01)
+    assert vix_hedge_action(0, 20.0, 40.0, cfg)[0] == "none (weight 0)"
+
+
+def test_a_metric_label_may_be_called_name() -> None:
+    """Regression: a `name` label once broke the whole monitor refresh."""
+    pytest.importorskip("nautilus_trader")
+    from thetagang_nt.monitor import _Families
+
+    f = _Families()
+    f.set("action", "help", 2.0, name="AA 270115P40", field="qty")
+    (sample,) = f.by_name["action"].samples
+    assert (
+        sample.labels == {"name": "AA 270115P40", "field": "qty"}
+        and sample.value == 2.0
+    )
+
+
+def test_volga_matches_nautilus_black_scholes() -> None:
+    """Volga = change in vega ($ per vol point) per vol point, checked by bumping
+    the vol in NautilusTrader's own Black-Scholes."""
+    nt = pytest.importorskip("nautilus_trader.core.nautilus_pyo3")
+    from thetagang_nt.rules import volga
+
+    spot, strike, years, vol, rate = 100.0, 120.0, 0.5, 0.30, 0.0425
+
+    def vega(v: float) -> float:
+        return nt.black_scholes_greeks(spot, rate, rate, v, True, strike, years).vega
+
+    expected = vega(vol + 0.005) - vega(vol - 0.005)  # per vol point
+    assert volga(vega(vol), spot, strike, years, vol, rate) == pytest.approx(
+        expected, rel=2e-3
+    )
+    assert volga(1.0, spot, strike, years, float("nan"), rate) == 0.0
+
+
+def test_dashboard_names_and_wording_follow_the_old_bot() -> None:
+    pytest.importorskip("nautilus_trader")
+    from thetagang_nt.monitor import action_text, take_profit_text
+    from thetagang_nt.rules import Action, option_label, spread_name
+
+    put, long_put = opt("P", 43, -1, 1.0, 0.5), opt("P", 40, 1, 0.4, 0.2)
+    assert option_label(put) == "AA 20261218 43P"
+    assert spread_name(put, long_put) == "AA 20261218 40/43P"
+    index_put = Leg("x", "^SPX", "P", 6000.0, EXP, -1, 10.0, 1.0)
+    assert option_label(index_put) == "SPX 20261218 6000P"
+    short = Action(
+        "short", "AA 20261218 43P", "AA", "P", -1, 40, 0.5, 0.1, "buy <=", "roll"
+    )
+    assert (
+        take_profit_text(short) == "buy <= $0.10"
+        and action_text(short.action) == "Roll"
+    )
+    hold = Action("long", "x", "AA", "C", 2, 40, None, None, "", "hold")
+    assert take_profit_text(hold) == "-"
+    alert = "roll or close by hand (|delta| >= 0.8)"
+    assert action_text(alert) == "Roll or close by hand (|Δ| >= 0.8)"
+
+
+def test_failed_implied_vol_counts_as_missing_greeks() -> None:
+    """Regression: with no quote, Nautilus returned IV 1e-8 and delta 0; that must
+    be "no greeks", never a zero-delta position."""
+    pytest.importorskip("nautilus_trader")
+    from thetagang_nt import portfolio
+
+    from datetime import datetime, timezone
+
+    expiry = datetime(2026, 12, 18, 21, tzinfo=timezone.utc)
+    ins = SimpleNamespace(
+        underlying="AA", id="AA C40", strike_price=40.0, expiration_utc=expiry
+    )
+    failed = SimpleNamespace(
+        delta=0.0,
+        gamma=0.0,
+        theta=0.0,
+        vega=0.0,
+        vol=1e-8,
+        underlying_price=40.0,
+        price=0.0,
+    )
+    good = SimpleNamespace(
+        delta=0.4,
+        gamma=0.05,
+        theta=-0.02,
+        vega=0.08,
+        vol=0.35,
+        underlying_price=40.0,
+        price=1.2,
+    )
+
+    def run(mid: float | None, g: SimpleNamespace) -> object:
+        calc = SimpleNamespace(instrument_greeks=lambda iid: g)
+        original = portfolio.price
+        portfolio.price = lambda cache, iid: mid
+        try:
+            return portfolio.option_greeks(None, calc, ins, date(2026, 11, 2))
+        finally:
+            portfolio.price = original
+
+    assert run(1.2, failed) is None  # the solver failed
+    assert run(None, good) is None  # no price of its own
+    assert run(1.2, good).delta == 0.4

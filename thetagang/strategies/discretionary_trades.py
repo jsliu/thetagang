@@ -26,13 +26,21 @@ from thetagang.config import (
     DiscretionaryTradeConfig,
 )
 from thetagang.ibkr import IBKR, TickerField
+from thetagang.options import option_dte
 from thetagang.risk import (
     Adjuster,
     Book,
     Totals,
     is_debit_vertical,
+    option_volga,
     valid_greeks,
 )
+
+
+def _years(contract: Contract) -> float:
+    return max(option_dte(contract.lastTradeDateOrContractMonth), 1) / 365
+
+
 from thetagang.trading_operations import (
     NoValidContractsError,
     OptionChainScanner,
@@ -92,6 +100,7 @@ class PlannedTrade:
     unit_gamma: float = 0.0
     unit_theta: float = 0.0
     unit_vega: float = 0.0
+    unit_volga: float = 0.0
     units: int = 0
     note: str = ""
 
@@ -380,6 +389,7 @@ class DiscretionaryTradesMixin:
             after.gamma += p.units * p.unit_gamma
             after.theta += p.units * p.unit_theta
             after.vega += p.units * p.unit_vega
+            after.volga += p.units * p.unit_volga
             self.planned_orders.append(self._entry_order(p))
         return self._plan_table(plans, now, after.delta_dollars / spx_price), after
 
@@ -407,6 +417,9 @@ class DiscretionaryTradesMixin:
             plan.unit_gamma += g.gamma * size * (beta * g.undPrice / spx_price) ** 2
             plan.unit_theta += g.theta * size
             plan.unit_vega += g.vega * size
+            plan.unit_volga += (
+                option_volga(g, leg.contract.strike, _years(leg.contract)) * size
+            )
         plan.unit_plain_dollars = plan.unit_share_delta * plan.legs[0].greeks.undPrice
         plan.unit_beta_dollars = plan.unit_plain_dollars * beta
         plan.unit_spx = plan.unit_beta_dollars / spx_price
