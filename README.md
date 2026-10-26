@@ -9,7 +9,7 @@ This repository holds two programs that share the same ideas but not their code:
 | Built on | [NautilusTrader](https://nautilustrader.io) 1.231 | [ib_async](https://github.com/ib-api-reloaded/ib_async) |
 | Runs as | a long-running node: checks every few minutes | one pass per start: run it from a scheduler |
 | Strategies | discretionary (rolls, closes, SPX-delta trades), VIX call hedge | wheel, discretionary, regime rebalancing, VIX call hedge, tail hedge, cash management |
-| Monitoring | Prometheus metrics, also available from the independent `thetagang-monitor`; Grafana dashboard and Telegram alerts in the separate `monitoring` repo | risk tables printed to the terminal |
+| Monitoring | Prometheus metrics; Grafana dashboard and Telegram alerts in the separate `monitoring` repo | risk tables printed to the terminal |
 | Config | [`thetagang.nt.toml`](thetagang.nt.toml) | [`thetagang.toml`](thetagang.toml), [`thetagang.discretionary.toml`](thetagang.discretionary.toml) |
 | Python | 3.12+ (or Docker) | 3.11 – 3.14 |
 
@@ -101,10 +101,16 @@ the nearest expiry, then the largest |delta| at or below the target.
 
 ### Quickstart with Docker
 
-[`deploy/`](deploy/) runs the bot. The image holds only the dependencies; the
-repo is mounted read-only, so a code or config change needs only a restart.
-Dashboards and alerts come from the separate `monitoring` repo (see
-[Monitoring and alerts](#monitoring-and-alerts)).
+[`deploy/`](deploy/) runs thetagang-nt as two containers from one image:
+
+| Container | Runs | Started by |
+|---|---|---|
+| `thetagang-monitor` | the portfolio monitor (`--role monitor`): dashboard metrics on `:9464`; no strategy, so it never trades; IB client `ib.client_id + 1` | `docker compose up -d`, always on |
+| `thetagang-nt` | the trading strategy (`--role trade`): its own metrics (orders, dry run) on `:9465`; IB client `ib.client_id` | `docker compose --profile trading up -d`, only when you trade |
+
+The image holds only the dependencies; the repo is mounted read-only, so a
+code or config change needs only a restart. Dashboards and alerts come from
+the separate `monitoring` repo (see [Monitoring and alerts](#monitoring-and-alerts)).
 
 1. Copy the sample config (`*.local.toml` files are git-ignored) and edit it:
 
@@ -116,59 +122,43 @@ Dashboards and alerts come from the separate `monitoring` repo (see
    your `[strategy]` settings. Leave `ib.host = "127.0.0.1"`: in Docker the
    `IB_HOST` variable sends the bot to `host.docker.internal`.
 
-2. Start the bot:
+2. Start the monitor, and the strategy when you want it trading:
 
    ```console
    cd deploy
-   docker compose up -d --build
-   docker compose logs -f thetagang-nt
+   docker compose up -d --build                # the monitor only
+   docker compose --profile trading up -d      # also the trading strategy
+   docker compose logs -f thetagang-monitor    # or thetagang-nt
    ```
 
-3. Check its metrics at <http://localhost:9464/metrics>, and the dashboard
+3. Check the metrics at <http://localhost:9464/metrics>, and the dashboard
    in Grafana (next section).
 
 Day-to-day commands, run from `deploy/`:
 
 ```console
 THETAGANG_CONFIG=thetagang.nt.toml docker compose up -d   # another config, path from the repo root
-docker compose restart thetagang-nt                       # after a code or config change
-docker compose build thetagang-nt                         # after editing deploy/requirements.txt
-docker compose stop thetagang-nt                          # stop the bot
-docker compose down                                       # stop and remove the container
+docker compose restart thetagang-monitor                  # after a code or config change (and thetagang-nt)
+docker compose build                                      # after editing deploy/requirements.txt
+docker compose stop thetagang-nt                          # stop trading, keep monitoring
+docker compose --profile trading down                     # stop and remove both containers
 ```
 
-The bot container restarts by itself after a crash, but stays down after
-`docker compose stop`.
+Both containers restart by themselves after a crash or when Docker Desktop
+starts, but stay down after `docker compose stop`.
 
 ### Running without Docker
 
 ```console
 python3.12 -m venv .venv-nt && source .venv-nt/bin/activate
 pip install -e '.[nautilus]'
-thetagang-nt -c thetagang.nt.local.toml
+thetagang-nt -c thetagang.nt.local.toml --role monitor   # the portfolio monitor
+thetagang-nt -c thetagang.nt.local.toml --role trade     # the strategy (another terminal)
 ```
 
-Use an environment of its own: NautilusTrader upgrades pandas and other
-packages that the `thetagang` environment relies on. Monitoring works the
-same: the bot serves `:9464` on the host either way.
-
-### Standalone portfolio monitoring
-
-To serve the portfolio metrics without starting either trading program, install
-the monitor extra and run its separate command:
-
-```console
-uv sync --extra monitor
-thetagang-monitor --config thetagang.nt.toml
-```
-
-The monitor reads the `[ib]` and `[monitor]` settings from the same TOML file
-and serves Prometheus metrics at <http://localhost:9464/metrics> by default.
-It connects to IBKR in read-only mode, does not import NautilusTrader, and
-does not start `thetagang` or `thetagang-nt`. For an additional safeguard,
-enable the read-only API setting in TWS or IB Gateway. If a trading process
-uses the same TWS/Gateway, configure a different `ib.client_id` for the
-monitor so the API connections do not conflict.
+`--role all` (the default) runs both in one process, with every metric on
+`:9464`. Use an environment of its own: NautilusTrader upgrades pandas and
+other packages that the `thetagang` environment relies on.
 
 ### Configuration
 
@@ -245,7 +235,7 @@ add your own panels.
 - **The bot can't connect from Docker.** Check the API is enabled on the
   configured port, and that TWS accepts the connection (*Trusted IPs*, or
   allow connections from outside localhost).
-- **The dashboard shows no data.** Is the bot running (`docker compose ps`)
+- **The dashboard shows no data.** Is the monitor running (`docker compose ps`)
   and is the monitoring stack up (`./run.sh status` in `../monitoring`)? Prometheus' target page
   (<http://localhost:9090/targets>) shows the `thetagang` job's state.
 - **"No market data during competing live session".** The same IB user is

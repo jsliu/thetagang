@@ -65,12 +65,6 @@ name = "click"
 version = "8.3.1"
 source = { registry = "https://pypi.org/simple" }
 resolution-markers = [
-    "python_full_version >= '3.14' and sys_platform == 'win32'",
-    "python_full_version >= '3.14' and sys_platform == 'emscripten'",
-    "python_full_version >= '3.14' and sys_platform != 'emscripten' and sys_platform != 'win32'",
-    "python_full_version == '3.13.*' and sys_platform == 'win32'",
-    "python_full_version == '3.13.*' and sys_platform == 'emscripten'",
-    "python_full_version == '3.13.*' and sys_platform != 'emscripten' and sys_platform != 'win32'",
     "python_full_version < '3.12' and sys_platform == 'win32'",
     "python_full_version < '3.12' and sys_platform == 'emscripten'",
     "python_full_version < '3.12' and sys_platform != 'emscripten' and sys_platform != 'win32'",
@@ -88,6 +82,12 @@ name = "click"
 version = "8.5.0"
 source = { registry = "https://pypi.org/simple" }
 resolution-markers = [
+    "python_full_version >= '3.14' and sys_platform == 'win32'",
+    "python_full_version >= '3.14' and sys_platform == 'emscripten'",
+    "python_full_version >= '3.14' and sys_platform != 'emscripten' and sys_platform != 'win32'",
+    "python_full_version == '3.13.*' and sys_platform == 'win32'",
+    "python_full_version == '3.13.*' and sys_platform == 'emscripten'",
+    "python_full_version == '3.13.*' and sys_platform != 'emscripten' and sys_platform != 'win32'",
     "python_full_version == '3.12.*' and sys_platform == 'win32'",
     "python_full_version == '3.12.*' and sys_platform == 'emscripten'",
     "python_full_version == '3.12.*' and sys_platform != 'emscripten' and sys_platform != 'win32'",
@@ -102,8 +102,8 @@ name = "click-log"
 version = "0.4.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "click", version = "8.3.1", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version != '3.12.*'" },
-    { name = "click", version = "8.5.0", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version == '3.12.*'" },
+    { name = "click", version = "8.3.1", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.12'" },
+    { name = "click", version = "8.5.0", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.12'" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/32/32/228be4f971e4bd556c33d52a22682bfe318ffe57a1ddb7a546f347a90260/click-log-0.4.0.tar.gz", hash = "sha256:3970f8570ac54491237bcdb3d8ab5e3eef6c057df29f8c3d1151a51a9c23b975", size = 9985, upload-time = "2022-03-13T11:10:15.262Z" }
 wheels = [
@@ -242,8 +242,8 @@ dependencies = [
     { name = "pandas" },
     { name = "pyluach" },
     { name = "toolz" },
-    { name = "tzdata", version = "2025.3", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version != '3.12.*'" },
-    { name = "tzdata", version = "2026.5", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version == '3.12.*'" },
+    { name = "tzdata", version = "2025.3", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.12'" },
+    { name = "tzdata", version = "2026.5", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.12'" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/84/28/80b13e1c61ad10fb6b15c6005784a0df9b07953de05b3f1a4fda78447560/exchange_calendars-4.12.tar.gz", hash = "sha256:7d2049b624013eb67cb06feb4fd29825a8d53c0c03bf8e7f9d856c210f24eb8a", size = 4114218, upload-time = "2026-01-08T03:47:59.711Z" }
 wheels = [
@@ -255,8 +255,8 @@ name = "faker"
 version = "40.1.2"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "tzdata", version = "2025.3", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version != '3.12.*' and sys_platform == 'win32'" },
-    { name = "tzdata", version = "2026.5", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version == '3.12.*' and sys_platform == 'win32'" },
+    { name = "tzdata", version = "2025.3", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.12' and sys_platform == 'win32'" },
+    { name = "tzdata", version = "2026.5", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.12' and sys_platform == 'win32'" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/5e/77/1c3ff07b6739b9a1d23ca01ec0a90a309a33b78e345a3eb52f9ce9240e36/faker-40.1.2.tar.gz", hash = "sha256:b76a68163aa5f171d260fc24827a8349bc1db672f6a665359e8d0095e8135d30", size = 1949802, upload-time = "2026-01-13T20:51:49.917Z" }
 wheels = [
@@ -328,6 +328,12 @@ name = "ib-async"
 version = "2.0.1"
 source = { registry = "https://pypi.org/simple" }
 resolution-markers = [
+    "python_full_version >= '3.14' and sys_platform == 'win32'",
+    "python_full_version >= '3.14' and sys_platform == 'emscripten'",
+    "python_full_version >= '3.14' and sys_platform != 'emscripten' and sys_platform != 'win32'",
+    "python_full_version == '3.13.*' and sys_platform == 'win32'",
+    "python_full_version == '3.13.*' and sys_platform == 'emscripten'",
+    "python_full_version == '3.13.*' and sys_platform != 'emscripten' and sys_platform != 'win32'",
     "python_full_version == '3.12.*' and sys_platform == 'win32'",
     "python_full_version == '3.12.*' and sys_platform == 'emscripten'",
     "python_full_version == '3.12.*' and sys_platform != 'emscripten' and sys_platform != 'win32'",
@@ -346,12 +352,6 @@ name = "ib-async"
 version = "2.1.0"
 source = { registry = "https://pypi.org/simple" }
 resolution-markers = [
-    "python_full_version >= '3.14' and sys_platform == 'win32'",
-    "python_full_version >= '3.14' and sys_platform == 'emscripten'",
-    "python_full_version >= '3.14' and sys_platform != 'emscripten' and sys_platform != 'win32'",
-    "python_full_version == '3.13.*' and sys_platform == 'win32'",
-    "python_full_version == '3.13.*' and sys_platform == 'emscripten'",
-    "python_full_version == '3.13.*' and sys_platform != 'emscripten' and sys_platform != 'win32'",
     "python_full_version < '3.12' and sys_platform == 'win32'",
     "python_full_version < '3.12' and sys_platform == 'emscripten'",
     "python_full_version < '3.12' and sys_platform != 'emscripten' and sys_platform != 'win32'",
@@ -581,11 +581,6 @@ wheels = [
 name = "nautilus-trader"
 version = "1.231.0"
 source = { registry = "https://pypi.org/simple" }
-resolution-markers = [
-    "python_full_version == '3.12.*' and sys_platform == 'win32'",
-    "python_full_version == '3.12.*' and sys_platform == 'emscripten'",
-    "python_full_version == '3.12.*' and sys_platform != 'emscripten' and sys_platform != 'win32'",
-]
 dependencies = [
     { name = "click", version = "8.5.0", source = { registry = "https://pypi.org/simple" } },
     { name = "fsspec" },
@@ -620,30 +615,6 @@ ib = [
     { name = "defusedxml" },
     { name = "nautilus-ibapi" },
     { name = "protobuf" },
-]
-
-[[package]]
-name = "nautilus-trader"
-version = "2.0.0rc7"
-source = { registry = "https://pypi.org/simple" }
-resolution-markers = [
-    "python_full_version >= '3.14' and sys_platform == 'win32'",
-    "python_full_version >= '3.14' and sys_platform == 'emscripten'",
-    "python_full_version >= '3.14' and sys_platform != 'emscripten' and sys_platform != 'win32'",
-    "python_full_version == '3.13.*' and sys_platform == 'win32'",
-    "python_full_version == '3.13.*' and sys_platform == 'emscripten'",
-    "python_full_version == '3.13.*' and sys_platform != 'emscripten' and sys_platform != 'win32'",
-]
-sdist = { url = "https://files.pythonhosted.org/packages/ba/4c/6f9ff98720a68bbbb8cae9be320477cd7a5ecf8fea33319183c8e79d7da1/nautilus_trader-2.0.0rc7.tar.gz", hash = "sha256:4e4ec408fb4860d75685e6d071cdf27aed3c5a22ca303110872b764a8a3e768c", size = 12602736, upload-time = "2026-10-15T21:05:08.353Z" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/ec/13/8cd8fc0f0ffd8109f743ab4514a0c957eca4dfbcd9563d32e3bf0427df48/nautilus_trader-2.0.0rc7-cp313-cp313-macosx_11_0_arm64.whl", hash = "sha256:e2a4d072fd21108c2aa8939f517f6bb525011f204d3516046e927effb1aeb21e", size = 61733486, upload-time = "2026-10-15T20:50:20.841Z" },
-    { url = "https://files.pythonhosted.org/packages/bb/62/f6c2d90678298dbd3aaf0472e58141f423cef38b3932e239d4a13d1b2e2a/nautilus_trader-2.0.0rc7-cp313-cp313-manylinux_2_34_aarch64.whl", hash = "sha256:c232d1a9ce9715c3bbac346b4d18ed852abc804db863bf9c2086d8a6f7a5a392", size = 67497598, upload-time = "2026-10-15T20:50:28.32Z" },
-    { url = "https://files.pythonhosted.org/packages/6e/02/d4afa1eeb2579f0f1b13859eef7eddf9b2af3bc775af219643b92592da28/nautilus_trader-2.0.0rc7-cp313-cp313-manylinux_2_34_x86_64.whl", hash = "sha256:b3928f37d75d57508030a421dc762186ad1f9ffc5d5420d7daf1d2c6badb8044", size = 72042580, upload-time = "2026-10-15T20:50:35.451Z" },
-    { url = "https://files.pythonhosted.org/packages/58/b9/95a7fdf90097a3e53d24992310a9cb9846ba38661725661b0fa5d4d47b22/nautilus_trader-2.0.0rc7-cp313-cp313-win_amd64.whl", hash = "sha256:f12dc54e9bb760bcc6f20d1780582a02664ae539b9f12337ddc444c0547d9aeb", size = 66484614, upload-time = "2026-10-15T20:50:42.458Z" },
-    { url = "https://files.pythonhosted.org/packages/50/27/d748867f47da0bed5d984998f308f8f50e078aec1428efc174b2564c2cc5/nautilus_trader-2.0.0rc7-cp314-cp314-macosx_11_0_arm64.whl", hash = "sha256:91e179f4bd49680a5fbbb88c92eae84018918ca37c5a3bf41e6fac17c7306d46", size = 61720980, upload-time = "2026-10-15T20:50:48.942Z" },
-    { url = "https://files.pythonhosted.org/packages/74/9e/e0864b44698e5cf89f7f507c22894eb7de6b012a8e2e8568836c64e1332c/nautilus_trader-2.0.0rc7-cp314-cp314-manylinux_2_34_aarch64.whl", hash = "sha256:ccbbc9265d9f4deeb5fecb241e46f3a085f82eac4bfc47d20e49c05d13ace73f", size = 67503827, upload-time = "2026-10-15T21:02:03.546Z" },
-    { url = "https://files.pythonhosted.org/packages/d4/29/0d81ae5a363078fa5cb38f279be6a79fde5daf2ee90f0b18d7700de7758b/nautilus_trader-2.0.0rc7-cp314-cp314-manylinux_2_34_x86_64.whl", hash = "sha256:aa5b222fb449f624804cd2606c7814b62cb3bfc9d772ec7b5e726f1c34bfe10a", size = 72052736, upload-time = "2026-10-15T21:02:11.396Z" },
-    { url = "https://files.pythonhosted.org/packages/55/85/182e8744531d31d6e778fd23fce2f4ad72c58d044a957d30600b14176276/nautilus_trader-2.0.0rc7-cp314-cp314-win_amd64.whl", hash = "sha256:079a8f195e024274d86f380993f492e071c386ddb089c0e8905c71690a27429d", size = 66453152, upload-time = "2026-10-15T21:02:18.47Z" },
 ]
 
 [[package]]
@@ -759,8 +730,8 @@ source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "numpy" },
     { name = "python-dateutil" },
-    { name = "tzdata", version = "2025.3", source = { registry = "https://pypi.org/simple" }, marker = "(python_full_version != '3.12.*' and sys_platform == 'emscripten') or (python_full_version != '3.12.*' and sys_platform == 'win32')" },
-    { name = "tzdata", version = "2026.5", source = { registry = "https://pypi.org/simple" }, marker = "(python_full_version == '3.12.*' and sys_platform == 'emscripten') or (python_full_version == '3.12.*' and sys_platform == 'win32')" },
+    { name = "tzdata", version = "2025.3", source = { registry = "https://pypi.org/simple" }, marker = "(python_full_version < '3.12' and sys_platform == 'emscripten') or (python_full_version < '3.12' and sys_platform == 'win32')" },
+    { name = "tzdata", version = "2026.5", source = { registry = "https://pypi.org/simple" }, marker = "(python_full_version >= '3.12' and sys_platform == 'emscripten') or (python_full_version >= '3.12' and sys_platform == 'win32')" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/de/da/b1dc0481ab8d55d0f46e343cfe67d4551a0e14fcee52bd38ca1bd73258d8/pandas-3.0.0.tar.gz", hash = "sha256:0facf7e87d38f721f0af46fe70d97373a37701b1c09f7ed7aeeb292ade5c050f", size = 4633005, upload-time = "2026-01-21T15:52:04.726Z" }
 wheels = [
@@ -1341,12 +1312,12 @@ source = { editable = "." }
 dependencies = [
     { name = "alembic" },
     { name = "annotated-types" },
-    { name = "click", version = "8.3.1", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version != '3.12.*'" },
-    { name = "click", version = "8.5.0", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version == '3.12.*'" },
+    { name = "click", version = "8.3.1", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.12'" },
+    { name = "click", version = "8.5.0", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.12'" },
     { name = "click-log" },
     { name = "exchange-calendars" },
-    { name = "ib-async", version = "2.0.1", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version == '3.12.*'" },
-    { name = "ib-async", version = "2.1.0", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version != '3.12.*'" },
+    { name = "ib-async", version = "2.0.1", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.12'" },
+    { name = "ib-async", version = "2.1.0", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.12'" },
     { name = "more-itertools" },
     { name = "numpy" },
     { name = "polyfactory" },
@@ -1360,12 +1331,8 @@ dependencies = [
 ]
 
 [package.optional-dependencies]
-monitor = [
-    { name = "prometheus-client" },
-]
 nautilus = [
-    { name = "nautilus-trader", version = "1.231.0", source = { registry = "https://pypi.org/simple" }, extra = ["ib"], marker = "python_full_version == '3.12.*'" },
-    { name = "nautilus-trader", version = "2.0.0rc7", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.13'" },
+    { name = "nautilus-trader", extra = ["ib"], marker = "python_full_version >= '3.12'" },
     { name = "prometheus-client" },
 ]
 
@@ -1390,10 +1357,9 @@ requires-dist = [
     { name = "exchange-calendars", specifier = ">=4.12" },
     { name = "ib-async", specifier = ">=2.0.1,<3" },
     { name = "more-itertools", specifier = ">=9.1,<12.0" },
-    { name = "nautilus-trader", extras = ["ib"], marker = "python_full_version >= '3.12' and extra == 'nautilus'", specifier = ">=1.231.0" },
+    { name = "nautilus-trader", extras = ["ib"], marker = "python_full_version >= '3.12' and extra == 'nautilus'", specifier = "==1.231.0" },
     { name = "numpy", specifier = ">=1.26,<3.0" },
     { name = "polyfactory", specifier = ">=2.18.1,<4" },
-    { name = "prometheus-client", marker = "extra == 'monitor'", specifier = ">=0.21,<1" },
     { name = "prometheus-client", marker = "extra == 'nautilus'", specifier = ">=0.21,<1" },
     { name = "pydantic", specifier = ">=2.10.2,<3" },
     { name = "python-dateutil", specifier = ">=2.8.1,<3" },
@@ -1403,7 +1369,7 @@ requires-dist = [
     { name = "sqlalchemy", specifier = ">=2.0,<3" },
     { name = "tomlkit", specifier = ">=0.14.0,<1" },
 ]
-provides-extras = ["monitor", "nautilus"]
+provides-extras = ["nautilus"]
 
 [package.metadata.requires-dev]
 dev = [
@@ -1552,12 +1518,6 @@ name = "tzdata"
 version = "2025.3"
 source = { registry = "https://pypi.org/simple" }
 resolution-markers = [
-    "python_full_version >= '3.14' and sys_platform == 'win32'",
-    "python_full_version >= '3.14' and sys_platform == 'emscripten'",
-    "python_full_version >= '3.14' and sys_platform != 'emscripten' and sys_platform != 'win32'",
-    "python_full_version == '3.13.*' and sys_platform == 'win32'",
-    "python_full_version == '3.13.*' and sys_platform == 'emscripten'",
-    "python_full_version == '3.13.*' and sys_platform != 'emscripten' and sys_platform != 'win32'",
     "python_full_version < '3.12' and sys_platform == 'win32'",
     "python_full_version < '3.12' and sys_platform == 'emscripten'",
     "python_full_version < '3.12' and sys_platform != 'emscripten' and sys_platform != 'win32'",
@@ -1572,6 +1532,12 @@ name = "tzdata"
 version = "2026.5"
 source = { registry = "https://pypi.org/simple" }
 resolution-markers = [
+    "python_full_version >= '3.14' and sys_platform == 'win32'",
+    "python_full_version >= '3.14' and sys_platform == 'emscripten'",
+    "python_full_version >= '3.14' and sys_platform != 'emscripten' and sys_platform != 'win32'",
+    "python_full_version == '3.13.*' and sys_platform == 'win32'",
+    "python_full_version == '3.13.*' and sys_platform == 'emscripten'",
+    "python_full_version == '3.13.*' and sys_platform != 'emscripten' and sys_platform != 'win32'",
     "python_full_version == '3.12.*' and sys_platform == 'win32'",
     "python_full_version == '3.12.*' and sys_platform == 'emscripten'",
     "python_full_version == '3.12.*' and sys_platform != 'emscripten' and sys_platform != 'win32'",
