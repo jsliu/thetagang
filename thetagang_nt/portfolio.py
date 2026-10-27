@@ -19,10 +19,61 @@ from nautilus_trader.core.nautilus_pyo3 import (
 from nautilus_trader.model.currencies import USD
 from nautilus_trader.model.enums import OptionKind, PriceType
 from nautilus_trader.model.greeks import GreeksCalculator
-from nautilus_trader.model.identifiers import InstrumentId, Venue
+from nautilus_trader.model.identifiers import (
+    InstrumentId,
+    Venue,
+    generic_spread_id_to_list,
+    is_generic_spread_id,
+)
 from nautilus_trader.model.instruments import Equity, OptionContract
 
-from thetagang_nt.rules import Leg, volga
+from thetagang_nt.rules import Leg, Unit, option_label, target_resizes, volga
+
+# ------------------------------------------------------------ the trade plan
+
+ComboLegs = list[tuple[InstrumentId, int]]  # (leg, +1 buy / -1 sell per unit)
+
+
+@dataclass
+class Planned:
+    """One order of the trade plan: `qty` units of `combo` at `price` (net mid
+    per unit, negative = credit; None = not priced), adding `add` to the
+    portfolio greeks (SPX beta-weighted, as Book)."""
+
+    name: str
+    symbol: str
+    combo: ComboLegs
+    qty: int
+    price: float | None
+    note: str = ""
+    spx_per_unit: float | None = None
+    add: dict[str, float] = field(default_factory=dict)
+    want: int = 0  # units before the guards (shown when qty is 0: place by hand)
+
+
+def order_text(cache: Cache, combo: ComboLegs, qty: int) -> str:
+    """The order to enter, leg by leg in the old bot's names:
+    'BUY 10 AA 20270115 40P / SELL 10 AA 20270115 35P' (no quantity when 0)."""
+    parts = []
+    for iid, ratio in combo:
+        leg = leg_of(cache, iid, 1, 0.0)
+        name = option_label(leg) if leg is not None else iid.symbol.value
+        side = "BUY" if ratio > 0 else "SELL"
+        parts.append(f"{side} {qty} {name}" if qty else f"{side} {name}")
+    return " / ".join(parts)
+
+
+def order_cost(cache: Cache, combo: ComboLegs, qty: int, price: float) -> float:
+    """qty x net price x multiplier: + pays (debit), - receives (credit)."""
+    ins = cache.instrument(combo[0][0]) if combo else None
+    return qty * price * (float(ins.multiplier) if ins is not None else 1.0)
+
+
+def legs_of(instrument_id: InstrumentId) -> list[tuple[InstrumentId, int]]:
+    if is_generic_spread_id(instrument_id):
+        return list(generic_spread_id_to_list(instrument_id))
+    return [(instrument_id, 1)]
+
 
 VENUE = Venue("SMART")
 SPX = InstrumentId.from_str("^SPX.SMART")
@@ -101,28 +152,25 @@ def held_legs(cache: Cache) -> list[Leg]:
         avg = sum(p.avg_px_open * abs(p.signed_qty) for p in held) / sum(
             abs(p.signed_qty) for p in held
         )
-        if isinstance(ins, OptionContract):
-            right = "C" if ins.option_kind == OptionKind.CALL else "P"
-            symbol, strike = ins.underlying, float(ins.strike_price)
-            expiry = ins.expiration_utc.date()
-        elif isinstance(ins, Equity):
-            right, symbol, strike, expiry = "", iid.symbol.value, 0.0, None
-        else:
-            continue  # CFDs, futures, ...: not managed
-        legs.append(
-            Leg(
-                iid,
-                symbol,
-                right,
-                strike,
-                expiry,
-                qty,
-                avg,
-                price(cache, iid),
-                float(ins.multiplier),
-            )
-        )
+        leg = leg_of(cache, iid, qty, avg)
+        if leg is not None:  # CFDs, futures, ...: not managed
+            legs.append(leg)
     return legs
+
+
+def leg_of(cache: Cache, iid: InstrumentId, qty: float, avg: float) -> Leg | None:
+    """A Leg for `qty` of a stock or option in the cache; None for anything else."""
+    ins = cache.instrument(iid)
+    if isinstance(ins, OptionContract):
+        right = "C" if ins.option_kind == OptionKind.CALL else "P"
+        symbol, strike = ins.underlying, float(ins.strike_price)
+        expiry = ins.expiration_utc.date()
+    elif isinstance(ins, Equity):
+        right, symbol, strike, expiry = "", iid.symbol.value, 0.0, None
+    else:
+        return None
+    mult = float(ins.multiplier)
+    return Leg(iid, symbol, right, strike, expiry, qty, avg, price(cache, iid), mult)
 
 
 # ------------------------------------------------------------------ greeks
@@ -297,6 +345,87 @@ def build_book(
     return book
 
 
+def contract_units(legs: list[Leg], book: Book, spx: float) -> dict[InstrumentId, Unit]:
+    """Per contract held long: share delta, SPX gamma, theta, vega, volga."""
+    out = {}
+    for leg in legs:
+        g, row = book.greeks.get(leg.instrument_id), book.by_symbol.get(leg.symbol)
+        if g is None or row is None:
+            continue
+        m = leg.multiplier
+        out[leg.instrument_id] = (
+            g.delta * m,
+            g.gamma * m * (row.beta * g.underlying / spx) ** 2,
+            g.theta * m,
+            g.vega * m,
+            g.volga * m,
+        )
+    return out
+
+
+def target_plan(
+    cache: Cache,
+    legs: list[Leg],
+    book: Book,
+    spx: float,
+    skip: set[str],
+    busy: set[str],
+) -> list[Planned]:
+    """The resize plan (place_target_orders): one order per symbol toward its SPX
+    delta = 0 target, priced at the legs' mid. Never adds short options (no margin
+    check), never touches symbols in `skip` or with open orders (`busy`)."""
+    unit = contract_units(legs, book, spx)
+    out = []
+    for r in target_resizes(legs, book, unit, skip):
+        if not r.units:
+            continue
+        row, qty, note = book.by_symbol[r.symbol], abs(r.units), ""
+        if r.symbol in busy:
+            qty, note = 0, "open orders: next run"
+        elif r.adds_short:
+            qty, note = 0, "adds short options (no margin check): by hand"
+        mids = [price(cache, iid) for iid, _ in r.combo]
+        px = None
+        if all(m is not None for m in mids):
+            px = sum(s * m for (_, s), m in zip(r.combo, mids, strict=True))
+        elif qty:
+            note = "no quote"
+        gamma, theta, vega, volga_ = r.greeks if qty else (0.0, 0.0, 0.0, 0.0)
+        delta = r.delta if qty else 0.0
+        out.append(
+            Planned(
+                r.text,
+                r.symbol,
+                list(r.combo),
+                qty,
+                px,
+                note,
+                r.delta / abs(r.units) * row.price * row.beta / spx,
+                {
+                    "beta_delta_dollars": delta * row.price * row.beta,
+                    "delta_dollars": delta * row.price,
+                    "gamma": gamma,
+                    "theta": theta,
+                    "vega": vega,
+                    "volga": volga_,
+                },
+                abs(r.units),
+            )
+        )
+    return out
+
+
+def symbols_with_open_orders(cache: Cache) -> set[str]:
+    """Underlying symbols with a working order (any leg of a combo)."""
+    out = set()
+    for order in cache.orders_open():
+        for iid, _ in legs_of(order.instrument_id):
+            ins = cache.instrument(iid)
+            is_option = isinstance(ins, OptionContract)
+            out.add(ins.underlying if is_option else iid.symbol.value)
+    return out
+
+
 def stress_pnl(
     cache: Cache, legs: list[Leg], book: Book, move: float, use_beta: bool, today: date
 ) -> float:
@@ -315,14 +444,13 @@ def stress_pnl(
         g = book.greeks.get(leg.instrument_id)
         if g is None or not _ok(g.vol) or g.vol <= 0:
             continue
-        shocked = black_scholes_greeks(
-            g.underlying * (1 + m),
-            RATE,
-            RATE,
-            g.vol,
-            leg.right == "C",
-            leg.strike,
-            years_to(cache.instrument(leg.instrument_id), today),
+        years = years_to(cache.instrument(leg.instrument_id), today)
+        call = leg.right == "C"
+        # moved minus unmoved, both from the same model: no move, no P&L (the
+        # calculator's own price uses other conventions and would add an offset)
+        moved, now = (
+            black_scholes_greeks(spot, RATE, RATE, g.vol, call, leg.strike, years).price
+            for spot in (g.underlying * (1 + m), g.underlying)
         )
-        total += leg.qty * leg.multiplier * (shocked.price - g.price)
+        total += leg.qty * leg.multiplier * (moved - now)
     return total

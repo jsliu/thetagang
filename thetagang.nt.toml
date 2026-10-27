@@ -33,7 +33,7 @@ market_data_type = "REALTIME" # DELAYED_FROZEN shows last prices when markets ar
 interval_secs = 60
 metrics_port = 9464
 long_option_alert_delta = 0.8
-stress_moves = [-0.10, -0.05, 0.05, 0.10]
+stress_moves = [-0.10, -0.05, -0.01, 0.01, 0.05, 0.10]
 
 # Remove this whole section to run the monitor only.
 [strategy]
@@ -45,6 +45,16 @@ market_hours_only = true
 delta_band_theta_days = 2.0
 # capped at this share of net liq
 delta_band_nav_pct = 0.10
+# "auto": open the [[strategy.trades]] when off neutral; "manual": only show the
+# plan, and open trades with `thetagang-nt pretrade` (deploy/pretrade.sh)
+approve_trades = "auto"
+# the trade plan's way to SPX delta 0: false = open the [[strategy.trades]] below;
+# true = resize held positions toward the dashboard's "SPX delta = 0 targets"
+# (shares, one option, or a whole vertical per symbol; never adds short options).
+# One or the other: with true, remove the [[strategy.trades]].
+place_target_orders = false
+pretrade_metrics_port = 9466  # the Pre-trade dashboard, while pretrade asks y/N
+proposal_max_age_secs = 300   # answering later than this sends nothing
 minimum_credit = 0.0
 debit_spread_take_profit = 0.8
 debit_spread_max_roll_debit = 0.5
@@ -119,3 +129,5 @@ weight = 0.0
 # call_strike_limit = 120.0
 # delta = 0.3
 # max_dte = 250
+# ignore_missing_greeks = false   # true: its options with no quote count as zero
+#                                  # delta when sizing the trade plan, instead of blocking it

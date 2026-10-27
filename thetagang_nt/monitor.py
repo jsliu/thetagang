@@ -30,12 +30,17 @@ from thetagang_nt.portfolio import (
     VIXMO,
     Book,
     build_book,
+    contract_units,
     held_legs,
     is_index,
     net_liquidation,
+    order_cost,
+    order_text,
     price,
     stock_contract,
     stress_pnl,
+    symbols_with_open_orders,
+    target_plan,
     underlying_id,
 )
 from thetagang_nt.rules import (
@@ -43,7 +48,6 @@ from thetagang_nt.rules import (
     Action,
     Leg,
     RollWhen,
-    Unit,
     breakeven_move,
     compute_beta,
     delta_band_dollars,
@@ -434,25 +438,6 @@ class PortfolioMonitor(Actor):
                         field=field,
                     )
 
-    def _units(
-        self, legs: list[Leg], book: Book, spx: float
-    ) -> dict[InstrumentId, Unit]:
-        """Per contract held long: share delta, SPX gamma, theta, vega."""
-        out = {}
-        for leg in legs:
-            g, row = book.greeks.get(leg.instrument_id), book.by_symbol.get(leg.symbol)
-            if g is None or row is None:
-                continue
-            m = leg.multiplier
-            out[leg.instrument_id] = (
-                g.delta * m,
-                g.gamma * m * (row.beta * g.underlying / spx) ** 2,
-                g.theta * m,
-                g.vega * m,
-                g.volga * m,
-            )
-        return out
-
     def _no_trading(self, symbol: str) -> bool:
         sym = self._rules.symbols.get(symbol) if self._rules else None
         return bool(sym and sym.no_trading)
@@ -460,7 +445,7 @@ class PortfolioMonitor(Actor):
     def _proposals(self, f: _Families, legs: list[Leg], book: Book, spx: float) -> None:
         """SPX delta = 0 targets per symbol and the trade toward them (display
         only, as in the old positions summary), and the greeks after them."""
-        unit = self._units(legs, book, spx)
+        unit = contract_units(legs, book, spx)
         plain_now = {s: r.plain_dollars for s, r in book.by_symbol.items()}
         betas = {s: r.beta for s, r in book.by_symbol.items()}
         plain_target = zero_delta_targets(plain_now, betas)
@@ -504,15 +489,9 @@ class PortfolioMonitor(Actor):
                 if self._no_trading(s):
                     trade = "none (no_trading)"
                 else:
-                    traded, trade, (gamma, theta, vega, volga_) = symbol_adjustment(
+                    _, trade, _ = symbol_adjustment(
                         [x for x in legs if x.symbol == s], shares, unit
                     )
-                    after["gamma"] += gamma
-                    after["theta"] += theta
-                    after["vega"] += vega
-                    after["volga"] += volga_
-                    after["delta_dollars"] += traded * r.price
-                    after["beta_delta_dollars"] += traded * r.price * r.beta
             f.set(
                 "symbol_target",
                 "SPX delta = 0 target per symbol (display only)",
@@ -522,6 +501,38 @@ class PortfolioMonitor(Actor):
                 side_target=side_target,
                 trade=trade,
             )
+        # the resize plan, with the same guards as its orders (place_target_orders):
+        # rows for the Trade plan table, and "after resizing held" in the greeks
+        skip = {s for s in book.by_symbol if is_index(s) or self._no_trading(s)}
+        busy = symbols_with_open_orders(self.cache)
+        active = bool(self._rules and self._rules.place_target_orders)
+        for p in target_plan(self.cache, legs, book, spx, skip, busy):
+            f.set(
+                "target_plan_units",
+                "Resize plan per symbol: units (contracts, spreads or shares)",
+                p.qty,
+                trade=p.name,
+                contracts=order_text(self.cache, p.combo, p.qty or p.want) or "-",
+                note=p.note,
+                status="active" if active else "preview",
+            )
+            if p.price is not None:
+                f.set("target_plan_price", "Net mid per unit", p.price, trade=p.name)
+                f.set(
+                    "target_plan_cost",
+                    "Units x net mid x multiplier (+ debit, - credit)",
+                    order_cost(self.cache, p.combo, p.qty, p.price),
+                    trade=p.name,
+                )
+            if p.spx_per_unit is not None:
+                f.set(
+                    "target_plan_unit_spx_delta",
+                    "SPX delta per unit of a resize",
+                    p.spx_per_unit,
+                    trade=p.name,
+                )
+            for greek, value in p.add.items():
+                after[greek] += value
         now = {
             "beta_delta_dollars": book.beta_dollars,
             "delta_dollars": book.plain_dollars,
@@ -671,7 +682,6 @@ class PortfolioMonitor(Actor):
                     vega.get(leg.symbol, 0.0)
                     + g.vega * leg.qty * leg.multiplier * (g.vol - base) * 100
                 )
-        total: dict[str, float] = {}
         for s, r in book.by_symbol.items():
             if s not in pnl:
                 continue
@@ -690,7 +700,7 @@ class PortfolioMonitor(Actor):
                 - parts["theta"]
                 - parts["vega"]
             )
-            for part, value in parts.items():
+            for part, value in parts.items():  # per symbol only: the dashboard sums
                 f.set(
                     "symbol_pnl",
                     "Today's P&L by symbol and its attribution",
@@ -698,12 +708,3 @@ class PortfolioMonitor(Actor):
                     symbol=s,
                     part=part,
                 )
-                total[part] = total.get(part, 0.0) + value
-        for part, value in total.items():
-            f.set(
-                "symbol_pnl",
-                "Today's P&L by symbol and its attribution",
-                value,
-                symbol="Total",
-                part=part,
-            )

@@ -28,8 +28,6 @@ from nautilus_trader.model.events import OrderAccepted
 from nautilus_trader.model.identifiers import (
     ClientOrderId,
     InstrumentId,
-    generic_spread_id_to_list,
-    is_generic_spread_id,
     new_generic_spread_id,
 )
 from nautilus_trader.model.instruments import Instrument, OptionContract
@@ -47,14 +45,22 @@ from thetagang_nt.portfolio import (
     VIX,
     VIX_ROOT,
     VIXMO,
+    Book,
+    ComboLegs,
+    Planned,
     bid,
     build_book,
     held_legs,
     is_index,
+    legs_of,
     net_liquidation,
     option_greeks,
+    order_cost,
+    order_text,
     price,
     stock_contract,
+    symbols_with_open_orders,
+    target_plan,
     underlying_id,
 )
 from thetagang_nt.rules import (
@@ -62,6 +68,7 @@ from thetagang_nt.rules import (
     Candidate,
     Leg,
     Plan,
+    blocking_missing,
     close_if_unable_to_roll,
     credit_pnl,
     debit_pnl,
@@ -98,10 +105,17 @@ PLAN = Gauge(
 PLAN_UNIT = Gauge(
     "thetagang_plan_unit_spx_delta", "SPX delta added per unit", ["trade"]
 )
+PLAN_PRICE = Gauge("thetagang_plan_price", "Net mid per unit", ["trade"])
+PLAN_COST = Gauge(
+    "thetagang_plan_cost", "Units x net mid x multiplier (+ debit, - credit)", ["trade"]
+)
 PLAN_STATUS = Gauge("thetagang_plan_status", "Why the plan is what it is", ["status"])
-AFTER = Gauge(
-    "thetagang_greeks_after_trades",
-    "Portfolio greeks after the planned trades (SPX beta-weighted)",
+# what the new-trades plan adds, not the result: the dashboard adds it to the
+# monitor's "now", so both columns share one clock (0 contracts change nothing).
+# The resize plan's rows and greeks come from the monitor (same rules).
+CHANGE = Gauge(
+    "thetagang_plan_greeks_change",
+    "Portfolio greeks the planned trades add (SPX beta-weighted)",
     ["greek"],
 )
 
@@ -109,9 +123,6 @@ AFTER = Gauge(
 def plan_status(status: str) -> None:
     PLAN_STATUS.clear()
     PLAN_STATUS.labels(status=status).set(1)
-
-
-ComboLegs = list[tuple[InstrumentId, int]]  # (leg, +1 buy / -1 sell per unit)
 
 
 class NoContract(Exception):
@@ -127,12 +138,6 @@ def _nyse() -> Any:  # building the calendar takes a second: once
 
 def market_open(now: datetime) -> bool:
     return bool(_nyse().is_open_on_minute(pd.Timestamp(now).floor("min")))
-
-
-def legs_of(instrument_id: InstrumentId) -> list[tuple[InstrumentId, int]]:
-    if is_generic_spread_id(instrument_id):
-        return list(generic_spread_id_to_list(instrument_id))
-    return [(instrument_id, 1)]
 
 
 class Discretionary(Strategy):
@@ -209,7 +214,7 @@ class Discretionary(Strategy):
             acted |= await self._vix_hedge(legs, today, busy)
         except Exception as e:  # noqa: BLE001
             self.log.error(f"VIX hedge failed: {e!r}")
-        if not self.config.trades:
+        if not (self.config.trades or self.config.place_target_orders):
             return
         if acted:
             self.log.warning("Rolls/closes this run change SPX delta: new trades wait")
@@ -218,13 +223,22 @@ class Discretionary(Strategy):
         await self._open_trades(legs, today, busy)
 
     def _symbols_with_open_orders(self) -> set[str]:
-        out = set()
-        for order in self.cache.orders_open():
-            for iid, _ in legs_of(order.instrument_id):
-                ins = self.cache.instrument(iid)
-                is_option = isinstance(ins, OptionContract)
-                out.add(ins.underlying if is_option else iid.symbol.value)
-        return out
+        return symbols_with_open_orders(self.cache)
+
+    def _blocking_missing(self, book: Book) -> list[InstrumentId]:
+        """Positions without greeks that stop the plan (ignore_missing_greeks
+        symbols count as zero delta instead, with a warning)."""
+        missing = []
+        for iid in book.missing:
+            ins = self.cache.instrument(iid)
+            is_option = isinstance(ins, OptionContract)
+            missing.append((iid, ins.underlying if is_option else iid.symbol.value))
+        exempt = {s for s, c in self.config.symbols.items() if c.ignore_missing_greeks}
+        blocking = blocking_missing(missing, exempt)
+        ignored = [i.symbol.value for i in book.missing if i not in blocking]
+        if ignored:
+            self.log.warning(f"No greeks, counted as zero delta: {', '.join(ignored)}")
+        return blocking
 
     def _no_trading(self, symbol: str) -> bool:
         s = self.config.symbols.get(symbol)
@@ -556,21 +570,29 @@ class Discretionary(Strategy):
         cfg = self.config
         PLAN.clear()
         PLAN_UNIT.clear()
-        AFTER.clear()
+        PLAN_PRICE.clear()
+        PLAN_COST.clear()
+        CHANGE.clear()
         spx = price(self.cache, SPX)
         if not spx:
             self.log.warning("No SPX price: no new trades")
             plan_status("no SPX price")
             return
         raw = self.cache.get(BETAS_KEY)
-        betas = json.loads(raw) if raw else {}
+        if (
+            raw is None
+        ):  # without betas every beta is 1: a wrong (even flipped) SPX delta
+            self.log.warning("Betas not loaded yet: no new trades this run")
+            plan_status("betas not loaded yet (first run after a start): no trades")
+            return
+        betas = json.loads(raw)
         book = build_book(self.cache, self.greeks, legs, betas, spx, today)
         now = book.spx_delta
-        if book.missing:
-            self.log.warning(
-                f"{len(book.missing)} position(s) without greeks: no trades"
-            )
-            plan_status(f"{len(book.missing)} position(s) without greeks: no trades")
+        blocking = self._blocking_missing(book)
+        if blocking:
+            names = ", ".join(i.symbol.value for i in blocking)
+            self.log.warning(f"{len(blocking)} position(s) without greeks: no trades")
+            plan_status(f"no trades: no greeks (no quote) for {names}")
             return
         nlv = net_liquidation(self.cache)
         if not nlv:
@@ -588,8 +610,94 @@ class Discretionary(Strategy):
             self.log.info(msg)
             plan_status(msg)
             return
+        planned = await self._plan(legs, book, spx, betas, today, busy)
+        after = {
+            "beta_delta_dollars": book.beta_dollars,
+            "delta_dollars": book.plain_dollars,
+            "gamma": book.gamma,
+            "theta": book.theta,
+            "vega": book.vega,
+            "volga": book.volga,
+        }
+        change = dict.fromkeys(after, 0.0)
+        for p in planned:
+            for greek, value in p.add.items():
+                after[greek] += value
+                change[greek] += value
+        if not cfg.place_target_orders:  # the resize plan's rows come from the monitor
+            for p in planned:
+                order = order_text(self.cache, p.combo, p.qty) or "-"
+                PLAN.labels(trade=p.name, contracts=order, note=p.note).set(p.qty)
+                if p.spx_per_unit is not None:
+                    PLAN_UNIT.labels(trade=p.name).set(p.spx_per_unit)
+                if p.price is not None:
+                    PLAN_PRICE.labels(trade=p.name).set(p.price)
+                    cost = order_cost(self.cache, p.combo, p.qty, p.price)
+                    PLAN_COST.labels(trade=p.name).set(cost)
+            CHANGE.labels(greek="spx_delta").set(change["beta_delta_dollars"] / spx)
+            for greek, value in change.items():
+                CHANGE.labels(greek=greek).set(value)
+        manual = cfg.approve_trades == "manual"
+        mode = "resize held positions" if cfg.place_target_orders else "new trades"
+        plan_status(
+            f"{mode}: SPX delta {now:+.2f} -> {after['beta_delta_dollars'] / spx:+.2f}"
+            + (": awaiting approval (thetagang-nt pretrade)" if manual else "")
+        )
+        action = "resize to target" if cfg.place_target_orders else "open trade"
+        for p in planned:
+            self.log.info(f"{p.name}: {p.qty} unit(s). {p.note}")
+            if p.qty and p.price is not None and not manual:
+                await self._submit(p.symbol, action, p.combo, p.qty, p.price)
+
+    async def _plan(
+        self,
+        legs: list[Leg],
+        book: Book,
+        spx: float,
+        betas: dict[str, float],
+        today: date,
+        busy: set[str],
+    ) -> list[Planned]:
+        """The trade plan toward SPX delta 0: the [[strategy.trades]], sized
+        together, or with place_target_orders the held positions resized toward
+        the positions summary's targets."""
+        if self.config.place_target_orders:
+            return self._target_plan(legs, book, spx, busy)
+        out = []
+        sized = await self._size_trades(spx, betas, book.spx_delta, today, busy)
+        for t, plan, combo, combo_price, unit in sized:
+            out.append(
+                Planned(
+                    f"{t.symbol} {t.structure}",
+                    t.symbol,
+                    combo,
+                    plan.units,
+                    combo_price if plan.priced else None,
+                    plan.note,
+                    plan.unit_spx if plan.priced else None,
+                    {greek: plan.units * v for greek, v in unit.items()},
+                )
+            )
+        return out
+
+    def _target_plan(
+        self, legs: list[Leg], book: Book, spx: float, busy: set[str]
+    ) -> list[Planned]:
+        skip = {s for s in book.by_symbol if is_index(s) or self._no_trading(s)}
+        return target_plan(self.cache, legs, book, spx, skip, busy)
+
+    async def _size_trades(
+        self,
+        spx: float,
+        betas: dict[str, float],
+        now: float,
+        today: date,
+        busy: set[str],
+    ) -> list[tuple[TradeConfig, Plan, ComboLegs, float, dict[str, float]]]:
+        """Price each [[strategy.trades]] entry and size them together so SPX
+        delta `now` goes to 0: (trade, plan, combo legs, price, greeks per unit)."""
         plans: list[tuple[TradeConfig, Plan, ComboLegs, float, dict[str, float]]] = []
-        for t in cfg.trades:
+        for t in self.config.trades:
             plan, combo, combo_price, unit = (
                 Plan(t.weight, t.max_contracts),
                 [],
@@ -610,39 +718,7 @@ class Discretionary(Strategy):
             plans.append((t, plan, combo, combo_price, unit))
         size_plans([p for _, p, _, _, _ in plans], need=-now)
         self.log.info(f"SPX delta {now:+.2f}: sizing {len(plans)} trade(s) toward 0")
-        after = {
-            "beta_delta_dollars": book.beta_dollars,
-            "delta_dollars": book.plain_dollars,
-            "gamma": book.gamma,
-            "theta": book.theta,
-            "vega": book.vega,
-            "volga": book.volga,
-        }
-        for t, plan, combo, _, unit in plans:
-            name = f"{t.symbol} {t.structure}"
-            contracts = " / ".join(
-                f"{'+' if r > 0 else '-'}{i.symbol.value}" for i, r in combo
-            )
-            PLAN.labels(trade=name, contracts=contracts or "-", note=plan.note).set(
-                plan.units
-            )
-            if plan.priced:
-                PLAN_UNIT.labels(trade=name).set(plan.unit_spx)
-            for greek, value in unit.items():
-                after[greek] += plan.units * value
-        AFTER.labels(greek="spx_delta").set(after["beta_delta_dollars"] / spx)
-        for greek, value in after.items():
-            AFTER.labels(greek=greek).set(value)
-        plan_status(f"SPX delta {now:+.2f} -> {after['beta_delta_dollars'] / spx:+.2f}")
-        for t, plan, combo, combo_price, _ in plans:
-            self.log.info(
-                f"{t.symbol} {t.structure}: {plan.units} unit(s) at "
-                f"{plan.unit_spx:+.3f} SPX delta each. {plan.note}"
-            )
-            if plan.units:
-                await self._submit(
-                    t.symbol, f"open {t.structure}", combo, plan.units, combo_price
-                )
+        return plans
 
     async def _price_trade(
         self, t: TradeConfig, spx: float, beta: float, today: date
@@ -701,6 +777,20 @@ class Discretionary(Strategy):
                 return ins.id
         return None
 
+    async def _load_chain(self, symbol: str, min_days: int, max_days: int) -> None:
+        """Load the underlying and its options expiring in [min_days, max_days]."""
+        base = (
+            {"secType": "IND", "symbol": symbol[1:], "exchange": "CBOE"}
+            if is_index(symbol)
+            else stock_contract(symbol)
+        )
+        chain_range = {
+            "build_options_chain": True,
+            "min_expiry_days": min_days,
+            "max_expiry_days": max_days,
+        }
+        await aio.load_contracts(self, [base | chain_range])
+
     async def _price_of(self, iid: InstrumentId | None) -> float | None:
         if iid is None:
             return None
@@ -725,17 +815,7 @@ class Discretionary(Strategy):
         cfg, exclude, today = self.config, exclude or set(), self._today()
         min_days = max(dte, (not_before - today).days if not_before else 0)
         max_days = max_dte if max_dte and max_dte >= min_days else min_days + 60
-        base = (
-            {"secType": "IND", "symbol": symbol[1:], "exchange": "CBOE"}
-            if is_index(symbol)
-            else stock_contract(symbol)
-        )
-        chain_range = {
-            "build_options_chain": True,
-            "min_expiry_days": min_days,
-            "max_expiry_days": max_days,
-        }
-        await aio.load_contracts(self, [base | chain_range])
+        await self._load_chain(symbol, min_days, max_days)
         und = await self._price_of(underlying_id(symbol))
         if und is None:
             raise NoContract(f"no {symbol} price")

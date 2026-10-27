@@ -41,7 +41,7 @@ publishes Prometheus metrics on port 9464:
 - per symbol: 1-year beta vs SPX, delta (shares and $), gamma, theta, vega
 - per position: quantity, cost basis, price, unrealized P&L, P&L as a share of
   the premium, days to expiry, delta, implied volatility
-- stress P&L for each SPX move in `monitor.stress_moves` (default ±5%, ±10%),
+- stress P&L for each SPX move in `monitor.stress_moves` (default ±1% (a typical day), ±5%, ±10%),
   with each stock moving by beta × the SPX move, and with every beta set to 1
 - SPX, VIX and VIXMO levels, open orders, and long options whose |delta| has
   reached `long_option_alert_delta`
@@ -69,15 +69,31 @@ through the account symbol by symbol:
    `close_hedges_when_vix_exceeds`. With no hedge held, it buys calls near
    `delta` and `target_dte` for `weight` × net liquidation, taking the
    weight from the first allocation band containing VIXMO.
-4. **New trades** in `[[strategy.trades]]` are sized together so the
-   account's SPX delta goes to 0, split by `weight`, in whole contracts,
-   never in the wrong direction, and capped by `max_contracts`. They wait
+4. **The trade plan** brings the account's SPX delta to 0 in one of two ways,
+   chosen in the config (one or the other, not both):
+   - **new trades** (default): the `[[strategy.trades]]` are sized together,
+     split by `weight`, in whole contracts, never in the wrong direction, and
+     capped by `max_contracts`;
+   - **resizing what you hold** (`place_target_orders = true`): each symbol
+     moves toward its "SPX Δ=0 target" from the positions summary, by trading
+     shares, one option, or a whole vertical as one combo, never flipping a
+     position. A resize that would add short options (sell more of a short
+     option or open credit spreads) isn't placed, since nothing checks margin
+     for it; the plan shows it as "by hand". Index options are left alone.
+
+   Either way the plan waits
    when anything was rolled or closed in the same run, while the account is
-   SPX delta neutral, and while any position has no greeks. Neutral means
+   SPX delta neutral, and while any position has no greeks. An option with no
+   quote at IB (an illiquid strike) has no greeks and so blocks the plan every
+   day; set `ignore_missing_greeks = true` under `[strategy.symbols.<SYM>]` to
+   count that symbol's unquoted options as zero delta instead (the dashboard
+   still lists them under Attention). Neutral means
    |beta delta $| is within the band: a typical 1% SPX day may cost at most
    `delta_band_theta_days` days of theta, capped at `delta_band_nav_pct` of net
    liq. The dashboard colours SPX delta and beta delta $ green within the band,
-   orange up to twice it, and red beyond.
+   orange up to twice it, and red beyond. With `approve_trades = "manual"` the
+   strategy only shows this plan; you open trades with
+   [`pretrade`](#pre-trade-preview-trades-then-send-them).
 
 Rolls and spread closes are sent as one IB combo order (a Nautilus
 `OptionSpread`), priced at the net mid. An order still unfilled after
@@ -111,6 +127,7 @@ the nearest expiry, then the largest |delta| at or below the target.
 |---|---|---|
 | `thetagang-monitor` | the portfolio monitor (`--role monitor`): dashboard metrics on `:9464`; no strategy, so it never trades; IB client `ib.client_id + 1` | `docker compose up -d`, always on |
 | `thetagang-nt` | the trading strategy (`--role trade`): its own metrics (orders, dry run) on `:9465`; IB client `ib.client_id` | `docker compose --profile trading up -d`, only when you trade |
+| `pretrade` | one-off and interactive: previews trades, sends them if you answer `y`; metrics on `:9466` while it asks; IB client `ib.client_id + 2` | `./pretrade.sh` (see [Pre-trade](#pre-trade-preview-trades-then-send-them)) |
 
 The image holds only the dependencies; the repo is mounted read-only, so a
 code or config change needs only a restart. Dashboards and alerts come from
@@ -151,6 +168,61 @@ docker compose --profile trading down                     # stop and remove both
 Both containers restart by themselves after a crash or when Docker Desktop
 starts, but stay down after `docker compose stop`.
 
+### Pre-trade: preview trades, then send them
+
+`pretrade` shows what trades would do to the portfolio before you send them.
+It connects to IB, prices the trades at the live mid, and recomputes the whole
+book (held positions + the proposal) with the same code as the dashboard. Then
+it prints **Now / After / Change** for SPX delta, beta delta $, the neutral band
+and neutrality, theta, vega, volga, gamma P&L, net carry, the break-even move
+and the stress P&L, and asks before sending anything:
+
+```console
+cd deploy
+./pretrade.sh                                        # the strategy's trade plan: new trades or target resizes
+./pretrade.sh "sell 2 AA 20261218 40P"               # ad hoc: sell 2 AA Dec-18 40 puts
+./pretrade.sh "buy 100 MS"                           # 100 shares
+./pretrade.sh "buy 1 AA 20261218 40P/23P"            # a put debit spread: buy the 40 put, sell the 23 put
+./pretrade.sh "sell 1 SPY 20261218 700/690P"         # a put credit spread (the right after the last strike covers both)
+./pretrade.sh "sell 2 AA 20261218 40P" "buy 100 MS"  # several trades at once, judged together
+```
+
+```text
+Proposed trades:
+  MS                                     100 x   183.49 debit  $   +18,349
+                                       +MS
+  Total (+ cost, - credit)             $+18,349
+
+                                   Now         After        Change
+  SPX delta                     +12.12        +15.50         +3.38
+  Beta delta $                $+93,005     $+118,965      $+25,960
+  Neutrality               off neutral   off neutral
+  ...
+  Stress SPX -10%              $-4,034       $-6,630       $-2,596
+Send (DRY RUN) these 1 order(s)? [y/N]
+```
+
+Each ad-hoc trade is `buy|sell QTY SYMBOL [YYYYMMDD STRIKE(C|P)[/STRIKE(C|P)]]`.
+QTY is shares for stock and contracts (or spreads) for options. A spread goes
+out as one IB combo order: its first strike is bought on a `buy` and sold on a
+`sell`, the second the other way. Without arguments it proposes the
+strategy's trade plan (new trades, or with `place_target_orders` the resizes
+of what you hold), which needs greeks for every position, so run that during
+market hours.
+
+On `y`, the trades are re-priced at the mid of that moment and sent through the
+strategy's own order code, so `dry_run` still applies. Nothing is sent on any
+other answer, or when you answer more than `proposal_max_age_secs` (5 min)
+later. While it waits, the **thetagang pre-trade** dashboard in Grafana shows
+the same numbers.
+
+To approve every new trade yourself, set `approve_trades = "manual"` in
+`[strategy]`: the running strategy still rolls, closes and runs the VIX hedge,
+but only shows its trade plan (status "awaiting approval") instead of opening
+it.
+
+Without Docker: `thetagang-nt -c thetagang.nt.local.toml pretrade "sell 2 AA 20261218 40P"`.
+
 ### Running without Docker
 
 ```console
@@ -175,12 +247,13 @@ lists every key with a comment.
 | `[node]` | trader id, log level, optional log directory, optional Redis cache |
 | `[ib]` | host, port, client id, `account_id`, `market_data_type` (`REALTIME`, or `DELAYED_FROZEN` for last prices while markets are closed). Add `[ib.gateway]` to have Nautilus start IB Gateway in Docker |
 | `[monitor]` | refresh interval, metrics address and port, long-option alert delta, stress moves |
-| `[strategy]` | `dry_run`, run interval, `market_hours_only`, `delta_band_theta_days`, `delta_band_nav_pct`, `minimum_credit`, debit-spread take-profit and maximum roll debit, `reprice_after_secs`, `chain_strikes`, `chain_expirations`, quote timeout |
+| `[strategy]` | `dry_run`, run interval, `market_hours_only`, `delta_band_theta_days`, `delta_band_nav_pct`, `approve_trades` (`auto`/`manual`), `pretrade_metrics_port`, `proposal_max_age_secs`, `minimum_credit`, debit-spread take-profit and maximum roll debit, `reprice_after_secs`, `chain_strikes`, `chain_expirations`, quote timeout |
 | `[strategy.roll_target]` | what a roll moves into: `dte`, `max_dte`, `delta` |
 | `[strategy.roll_when]` | `pnl`, `dte`, `min_pnl`, `max_dte`, `close_at_pnl`, `close_if_unable_to_roll`; `.calls` and `.puts` set `itm`, `always_when_itm`, `credit_only` |
+| `place_target_orders` (in `[strategy]`) | `true`: the trade plan resizes held positions toward their SPX Δ=0 targets instead of opening `[[strategy.trades]]` (use one or the other) |
 | `[[strategy.trades]]` | `symbol`, `structure` (`long_call`, `short_call`, `long_put`, `short_put`, `put_credit_spread`, `call_credit_spread`, `put_debit_spread`, `call_debit_spread`), `delta`, `dte`, `width` (spreads only), `weight`, `max_contracts` |
 | `[strategy.vix_call_hedge]` | `enabled`, `delta`, `target_dte`, `close_hedges_when_vix_exceeds`, `ignore_dte`, and `[[…allocation]]` bands (`lower_bound` ≤ VIXMO < `upper_bound`, first match wins, `weight` × net liquidation) |
-| `[strategy.symbols.<SYM>]` | `no_trading`, `put_strike_limit`, `call_strike_limit`, `delta`, `max_dte` |
+| `[strategy.symbols.<SYM>]` | `no_trading`, `put_strike_limit`, `call_strike_limit`, `delta`, `max_dte`, `ignore_missing_greeks` |
 
 Remove the whole `[strategy]` section to run the monitor only. The roll,
 discretionary and VIX keys mean the same as in `thetagang`, so values can be

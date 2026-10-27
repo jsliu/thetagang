@@ -19,6 +19,7 @@ from thetagang_nt.rules import (
     expected_move,
     gamma_pnl,
     neutrality,
+    parse_trade,
     pick_contract,
     position_rows,
     roll_strike_limit,
@@ -399,3 +400,119 @@ def test_positions_are_grouped_like_the_old_bot():
         ("ms1", 2, 1),  # then options by expiry
         ("ms2", 3, 1),
     ]
+
+
+def test_parse_trade_reads_the_readme_examples():
+    stock = parse_trade("buy 100 MS")
+    assert (stock.side, stock.qty, stock.symbol, stock.legs) == (1, 100, "MS", ())
+    put = parse_trade("sell 2 aa 20261218 40P")
+    assert (put.side, put.qty, put.symbol, put.expiry) == (
+        -1,
+        2,
+        "AA",
+        date(2026, 12, 18),
+    )
+    assert put.legs == (("P", 40.0, 1),)
+    spread = parse_trade("buy 1 AA 20261218 40P/23P")  # buy the 40 put, sell the 23 put
+    assert spread.legs == (("P", 40.0, 1), ("P", 23.0, -1))
+    assert parse_trade("sell 1 SPY 20261218 700/690P").legs == (
+        ("P", 700.0, 1),
+        ("P", 690.0, -1),
+    )
+    for bad in (
+        "buy MS",
+        "hold 1 MS",
+        "buy 0 MS",
+        "buy 1 MS 2026-12-18 40P",
+        "buy 1 MS 20261218 40X",
+    ):
+        with pytest.raises(ValueError):
+            parse_trade(bad)
+
+
+def test_pretrade_runs_beside_the_monitor_and_trader_and_approval_is_checked() -> None:
+    pytest.importorskip("nautilus_trader")
+    import msgspec
+
+    from thetagang_nt.config import DiscretionaryConfig, load, split
+
+    app = load("thetagang.nt.toml")
+    ids = {role: split(app, role)[2] for role in ("trade", "monitor", "pretrade")}
+    assert len(set(ids.values())) == 3  # three IB connections, three client ids
+    assert not split(app, "pretrade")[0].publish  # its metrics are pretrade's own
+    assert app.strategy.approve_trades == "auto"
+    with pytest.raises(msgspec.ValidationError):
+        msgspec.convert({"approve_trades": "maybe"}, DiscretionaryConfig)
+
+
+def test_target_orders_point_the_right_way_and_never_add_shorts() -> None:
+    from thetagang_nt.rules import symbol_resize
+
+    put = opt("P", 30, -2, 1.0, 0.5)  # short 2 puts: buying back adds share delta
+    unit = {put.instrument_id: (-50.0, 0.0, 1.0, -2.0, 0.5)}
+    r = symbol_resize("AA", [put], -100.0, unit)
+    assert (r.units, r.combo, r.adds_short) == (2, (("P30", 1),), False)  # buy 2 back
+    r = symbol_resize("AA", [put], 100.0, unit)  # wants more: sell more puts
+    assert (r.units, r.combo, r.adds_short) == (-2, (("P30", -1),), True)
+    shares = stock(200)
+    r = symbol_resize("AA", [shares], -50.4, {})
+    assert (r.units, r.combo, r.text) == (-50, (("AA", -1),), "-50 shares")
+    # a credit put spread (short 30, long 25), resized as whole spreads
+    short, long = opt("P", 30, -1, 1.0, 0.5), opt("P", 25, 1, 0.4, 0.2)
+    unit = {"P30": (-50.0, 0, 1.0, -2.0, 0), "P25": (-30.0, 0, -0.5, 1.0, 0)}
+    close = symbol_resize("AA", [short, long], -40.0, unit)  # one spread = +20 shares
+    assert close.units == -1 and close.combo == (("P30", 1), ("P25", -1))
+    assert not close.adds_short  # closing a spread buys the short back
+    more = symbol_resize("AA", [short, long], 40.0, unit)
+    assert more.units == 2 and more.adds_short  # opening credit spreads (+20 each)
+    assert more.combo == (("P30", -1), ("P25", 1))  # sell the short, buy the long
+
+
+def test_place_target_orders_or_trades_not_both() -> None:
+    pytest.importorskip("nautilus_trader")
+    import msgspec
+
+    from thetagang_nt.config import DiscretionaryConfig
+
+    trade = {"symbol": "AA", "structure": "short_put"}
+    assert msgspec.convert({"place_target_orders": True}, DiscretionaryConfig)
+    with pytest.raises(msgspec.ValidationError, match="not both"):
+        msgspec.convert(
+            {"place_target_orders": True, "trades": [trade]}, DiscretionaryConfig
+        )
+
+
+def test_ignore_missing_greeks_exempts_only_those_symbols() -> None:
+    from thetagang_nt.rules import blocking_missing
+
+    missing = [("DGRO 95C", "DGRO"), ("DXYZ 75C", "DXYZ"), ("AA 30P", "AA")]
+    assert blocking_missing(missing, set()) == ["DGRO 95C", "DXYZ 75C", "AA 30P"]
+    assert blocking_missing(missing, {"DGRO", "DXYZ"}) == ["AA 30P"]
+    assert blocking_missing(missing, {"DGRO", "DXYZ", "AA"}) == []
+
+
+def test_stress_is_zero_without_a_move_and_compares_like_with_like() -> None:
+    pytest.importorskip("nautilus_trader")
+    from datetime import UTC, datetime
+
+    from thetagang_nt.portfolio import Book, Greeks, SymbolRisk, stress_pnl
+
+    call = Leg("C40", "AA", "C", 40.0, EXP, 2, 1.0, 2.5)
+    # the calculator's own price (9.99) differs from the stress model's: it must
+    # not leak into the scenarios as a constant offset
+    greeks = Greeks(0.5, 0.05, -0.02, 0.06, 40.0, 0.35, 9.99)
+    book = Book(
+        spx=7000.0, by_symbol={"AA": SymbolRisk(beta=1.2)}, greeks={"C40": greeks}
+    )
+    expiry = datetime(EXP.year, EXP.month, EXP.day, tzinfo=UTC)
+    cache = SimpleNamespace(
+        instrument=lambda iid: SimpleNamespace(expiration_utc=expiry)
+    )
+    today = date(2026, 11, 2)
+    assert stress_pnl(cache, [call], book, 0.0, True, today) == pytest.approx(
+        0.0, abs=1e-9
+    )
+    up = stress_pnl(cache, [call], book, 0.01, True, today)
+    down = stress_pnl(cache, [call], book, -0.01, True, today)
+    assert up > 0 > down  # a long call gains on the way up
+    assert abs(up) < 2 * 100 * 0.6 * 40 * 0.012  # about delta x move, not thousands

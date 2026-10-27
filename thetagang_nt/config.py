@@ -117,6 +117,9 @@ class SymbolConfig(NautilusConfig, frozen=True):
     call_strike_limit: float | None = None  # never roll a call below this strike
     delta: float | None = None  # roll target delta override
     max_dte: int | None = None  # roll target max_dte override
+    # options here with no quote (so no greeks) count as zero delta when sizing
+    # the trade plan instead of blocking it; the dashboard still flags them
+    ignore_missing_greeks: bool = False
 
 
 class DiscretionaryConfig(StrategyConfig, frozen=True):
@@ -142,6 +145,26 @@ class DiscretionaryConfig(StrategyConfig, frozen=True):
     symbols: dict[str, SymbolConfig] = {}
     # --role trade only: the trading process's own metrics (orders, dry_run, trade plan)
     metrics_port: int = 9465
+    # "auto": open the [[strategy.trades]] when off SPX delta neutral; "manual":
+    # only show the plan, and open trades with `thetagang-nt pretrade`
+    approve_trades: str = "auto"
+    # the trade plan's way to SPX delta 0: false = open the [[strategy.trades]];
+    # true = resize what is held toward the positions summary's targets (shares,
+    # one option, or a whole vertical per symbol). One or the other, not both.
+    place_target_orders: bool = False
+    pretrade_metrics_port: int = 9466  # the pre-trade dashboard, while it asks
+    proposal_max_age_secs: int = 300  # a confirmation later than this sends nothing
+
+    def __post_init__(self) -> None:
+        if self.approve_trades not in ("auto", "manual"):
+            raise ValueError(
+                f"approve_trades must be auto or manual, not {self.approve_trades!r}"
+            )
+        if self.place_target_orders and self.trades:
+            raise ValueError(
+                "use either [[strategy.trades]] or place_target_orders, not both: "
+                "each hedges the whole SPX delta on its own"
+            )
 
 
 class MonitorConfig(ActorConfig, frozen=True):
@@ -152,7 +175,7 @@ class MonitorConfig(ActorConfig, frozen=True):
         True  # serve /metrics; off in --role trade, which only needs the betas
     )
     long_option_alert_delta: float = 0.8
-    stress_moves: tuple[float, ...] = (-0.10, -0.05, 0.05, 0.10)
+    stress_moves: tuple[float, ...] = (-0.10, -0.05, -0.01, 0.01, 0.05, 0.10)
 
 
 class IBConfig(NautilusConfig, frozen=True):
@@ -197,16 +220,19 @@ def split(
       client_id + 1 so it runs beside a trade process.
     trade: the strategy, with a monitor that only loads the betas it sizes with
       (no metrics, so the dashboard isn't doubled); the strategy's own metrics go
-      on strategy.metrics_port."""
+      on strategy.metrics_port.
+    pretrade (`thetagang-nt pretrade`): like trade, as client_id + 2 so it runs
+      beside both."""
     if role == "all":
         return app.monitor, app.strategy, app.ib.client_id
     if role == "monitor":
         return app.monitor, None, app.ib.client_id + 1
-    if role == "trade":
+    if role in ("trade", "pretrade"):
         if app.strategy is None:
-            raise ValueError("--role trade needs a [strategy] section")
+            raise ValueError(f"{role} needs a [strategy] section")
         quiet = msgspec.structs.replace(app.monitor, publish=False)
-        return quiet, app.strategy, app.ib.client_id
+        offset = 2 if role == "pretrade" else 0
+        return quiet, app.strategy, app.ib.client_id + offset
     raise ValueError(f"role must be one of {ROLES}, got {role!r}")
 
 

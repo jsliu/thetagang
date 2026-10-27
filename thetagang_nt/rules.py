@@ -441,6 +441,59 @@ def option_label(leg: Leg) -> str:
     return f"{symbol} {expiry} {leg.strike:g}{leg.right}"
 
 
+TRADE_FORMAT = "buy|sell QTY SYMBOL [YYYYMMDD STRIKE(C|P)[/STRIKE(C|P)]]"
+
+
+@dataclass(frozen=True)
+class TradeSpec:
+    """An ad-hoc trade typed for pre-trade: QTY shares, or QTY units of an option
+    or a vertical (legs: (right, strike, ratio); the first leg on the trade's side)."""
+
+    text: str
+    side: int  # +1 buy, -1 sell
+    qty: int
+    symbol: str
+    expiry: date | None = None
+    legs: tuple[tuple[str, float, int], ...] = ()
+
+
+def yyyymmdd(text: str) -> date:
+    if len(text) != 8 or not text.isdigit():
+        raise ValueError(text)
+    return date(int(text[:4]), int(text[4:6]), int(text[6:]))
+
+
+def parse_trade(text: str) -> TradeSpec:
+    """'buy 100 MS', 'sell 2 AA 20261218 40P', 'buy 1 AA 20261218 40P/23P' (buy
+    the 40 put, sell the 23 put: one combo); '40/23P' shares the right."""
+    words = text.split()
+    bad = ValueError(f"{text!r}: expected {TRADE_FORMAT!r}")
+    if len(words) not in (3, 5) or words[0].lower() not in ("buy", "sell"):
+        raise bad
+    try:
+        qty = int(words[1])
+        expiry = None if len(words) == 3 else yyyymmdd(words[3])
+    except ValueError:
+        raise bad from None
+    if qty < 1:
+        raise bad
+    side, symbol = (1 if words[0].lower() == "buy" else -1), words[2].upper()
+    if expiry is None:
+        return TradeSpec(text, side, qty, symbol)
+    parts = words[4].upper().split("/")
+    if len(parts) > 2 or parts[-1][-1:] not in ("C", "P"):
+        raise bad
+    legs = []
+    for ratio, part in zip((1, -1), parts, strict=False):
+        right = part[-1] if part[-1:] in ("C", "P") else parts[-1][-1]
+        try:
+            strike = float(part.rstrip("CP"))
+        except ValueError:
+            raise bad from None
+        legs.append((right, strike, ratio))
+    return TradeSpec(text, side, qty, symbol, expiry, tuple(legs))
+
+
 def position_rows(legs: list[Leg]) -> list[tuple[Leg, int, int]]:
     """Legs in the old bot's Portfolio positions order (by symbol; stock first,
     then options by expiry, right and strike), each with its row number and a
@@ -537,26 +590,50 @@ def option_adjusters(legs: list[Leg], unit: dict[Any, Unit]) -> list[Adjuster]:
     return found
 
 
-def symbol_adjustment(
-    legs: list[Leg], shares: float, unit: dict[Any, Unit]
-) -> tuple[float, str, tuple[float, float, float, float]]:
-    """The trade toward `shares` of delta in one symbol: (share delta traded,
-    description, gamma/theta/vega/volga added). Resizes the position with the most
-    delta; stock-only symbols trade shares, never selling shares that cover
-    short calls; never flips a position."""
+@dataclass(frozen=True)
+class Resize:
+    """The trade toward a symbol's SPX delta = 0 target (the positions summary's
+    "Net target contracts"): `units` of `combo` (signed legs of one unit:
+    shares, one option, or a whole vertical), with the share delta and the
+    gamma/theta/vega/volga it adds."""
+
+    symbol: str
+    units: int  # >0 buy / open more spreads, <0 sell / close spreads
+    text: str
+    combo: tuple[tuple[Any, int], ...] = ()  # (instrument, +1/-1) per unit
+    delta: float = 0.0
+    greeks: tuple[float, float, float, float] = (0.0, 0.0, 0.0, 0.0)
+    adds_short: bool = False  # sells more of a short option / opens credit spreads
+
+
+def symbol_resize(
+    symbol: str, legs: list[Leg], shares: float, unit: dict[Any, Unit]
+) -> Resize:
+    """The trade toward `shares` of delta in one symbol. Resizes the position with
+    the most delta; stock-only symbols trade shares, never selling shares that
+    cover short calls; never flips a position."""
     adjusters = option_adjusters(legs, unit)
     if adjusters:
         main = max(adjusters, key=lambda a: a.exposure)
         units, text = size_adjustment(main, shares)
-        return (
-            units * main.delta,
+        if main.is_spread:  # one more spread: buy the long leg, sell the short
+            short, long = main.legs
+            combo = ((short.instrument_id, -1), (long.instrument_id, 1))
+            adds_short = units > 0 and not is_debit_vertical(short, long)
+        else:
+            combo = ((main.legs[0].instrument_id, 1),)
+            adds_short = units < 0 and main.legs[0].qty < 0
+        if units < 0:  # sell / close: every leg the other way
+            combo = tuple((iid, -r) for iid, r in combo)
+        greeks = (main.gamma, main.theta, main.vega, main.volga)
+        return Resize(
+            symbol,
+            units,
             text,
-            (
-                units * main.gamma,
-                units * main.theta,
-                units * main.vega,
-                units * main.volga,
-            ),
+            combo,
+            units * main.delta,
+            tuple(units * g for g in greeks),
+            adds_short,
         )
     stock = [leg for leg in legs if not leg.is_option]
     if stock:
@@ -568,10 +645,43 @@ def symbol_adjustment(
         )
         traded = max(traded, -int(max(stock[0].qty - covering, 0)))
         text = f"{traded:+d} shares" if traded else "0"
-        return traded, text, (0.0, 0.0, 0.0, 0.0)
+        sign = 1 if traded >= 0 else -1
+        return Resize(symbol, traded, text, ((stock[0].instrument_id, sign),), traded)
     _, _, mixed = split_option_legs(legs)
     reason = "none (calendar/diagonal legs)" if mixed else "none (delta < 0.01)"
-    return 0.0, reason, (0.0, 0.0, 0.0, 0.0)
+    return Resize(symbol, 0, reason)
+
+
+def symbol_adjustment(
+    legs: list[Leg], shares: float, unit: dict[Any, Unit]
+) -> tuple[float, str, tuple[float, float, float, float]]:
+    """symbol_resize as the positions summary shows it: (share delta traded,
+    description, gamma/theta/vega/volga added)."""
+    r = symbol_resize(legs[0].symbol if legs else "", legs, shares, unit)
+    return r.delta, r.text, r.greeks
+
+
+def blocking_missing(missing: list[tuple[Any, str]], exempt: set[str]) -> list[Any]:
+    """The positions without greeks that stop the trade plan: (position,
+    symbol) pairs, except in the symbols exempted by ignore_missing_greeks."""
+    return [position for position, symbol in missing if symbol not in exempt]
+
+
+def target_resizes(
+    legs: list[Leg], book: Any, unit: dict[Any, Unit], skip: set[str]
+) -> list[Resize]:
+    """The positions summary's SPX delta = 0 targets as trades, one per symbol
+    (symbols in `skip`, e.g. no_trading, get none)."""
+    plain_now = {s: r.plain_dollars for s, r in book.by_symbol.items()}
+    betas = {s: r.beta for s, r in book.by_symbol.items()}
+    plain_target = zero_delta_targets(plain_now, betas)
+    out = []
+    for s, r in book.by_symbol.items():
+        if s in skip or r.price <= 1e-9:
+            continue
+        shares = (plain_target[s] - plain_now[s]) / r.price
+        out.append(symbol_resize(s, [x for x in legs if x.symbol == s], shares, unit))
+    return out
 
 
 def weighted_strike(legs: list[Leg], right: str, short: bool) -> float | None:

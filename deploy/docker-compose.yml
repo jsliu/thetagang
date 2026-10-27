@@ -1,11 +1,13 @@
-# thetagang-nt in Docker, as two processes from one image:
+# thetagang-nt in Docker, as processes from one image:
 #   thetagang-monitor  the portfolio: metrics on the host's 127.0.0.1:9464, never trades. Always on.
 #   thetagang-nt       the trading strategy (profile "trading"): started only on request; its own
 #                      metrics (orders, dry_run) on 127.0.0.1:9465.
+#   pretrade           one-off and interactive (./pretrade.sh): previews trades, sends on y; its
+#                      metrics (the Pre-trade dashboard) on 127.0.0.1:9466 while it asks.
 # Dashboards and Telegram alerts are the separate monitoring repo (../../monitoring: ./run.sh up),
 # which scrapes both (Grafana: http://localhost:3000, folder "thetagang").
 # Both talk to TWS on the host (host.docker.internal; TWS: Configure > API > Settings must allow the
-# connection), the monitor as ib.client_id + 1.
+# connection), the monitor as ib.client_id + 1, pretrade as + 2.
 #   docker compose up -d --build                       # the monitor only
 #   docker compose --profile trading up -d             # the monitor and the trading strategy
 #   docker compose stop thetagang-nt                   # stop trading, keep monitoring
@@ -34,3 +36,13 @@ services:
     profiles: ["trading"]
     command: ["python", "-m", "thetagang_nt.node", "-c", "${THETAGANG_CONFIG:-thetagang.nt.local.toml}", "--role", "trade"]
     ports: ["127.0.0.1:9465:9465"]   # /metrics: orders, dry_run, trade plan
+
+  # one-off, interactive: ./pretrade.sh ["sell 2 AA 20261218 40P" ...]
+  pretrade:
+    <<: *thetagang
+    profiles: ["pretrade"]
+    restart: "no"
+    stdin_open: true                  # it asks y/N before sending
+    tty: true
+    entrypoint: ["python", "-m", "thetagang_nt.node", "-c", "${THETAGANG_CONFIG:-thetagang.nt.local.toml}", "pretrade"]
+    ports: ["127.0.0.1:9466:9466"]   # /metrics: the Pre-trade dashboard, while it asks
