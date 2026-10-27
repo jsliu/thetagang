@@ -16,6 +16,7 @@ from nautilus_trader.core.nautilus_pyo3 import (
     black_scholes_greeks,
     imply_vol_and_greeks,
 )
+from nautilus_trader.model.currencies import USD
 from nautilus_trader.model.enums import OptionKind, PriceType
 from nautilus_trader.model.greeks import GreeksCalculator
 from nautilus_trader.model.identifiers import InstrumentId, Venue
@@ -48,6 +49,15 @@ def underlying_id(symbol: str) -> InstrumentId:
 
 def stock_contract(symbol: str) -> dict[str, str]:
     return {"secType": "STK", "symbol": symbol, "exchange": "SMART", "currency": "USD"}
+
+
+def net_liquidation(cache: Cache) -> float | None:
+    """The first account's USD net liquidation."""
+    for acc in cache.accounts():
+        total = acc.balance_total(USD)
+        if total is not None:
+            return total.as_double()
+    return None
 
 
 def price(cache: Cache, instrument_id: InstrumentId) -> float | None:

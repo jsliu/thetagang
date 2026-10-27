@@ -318,6 +318,52 @@ def compute_beta(
     return float(np.cov(a, b)[0][1] / np.var(b, ddof=1))
 
 
+TYPICAL_SPX_DAY = 0.01  # a typical daily SPX move
+DRIFT_BANDS = 2.0  # beyond this many bands: too far from neutral
+NEUTRALITY = ("neutral", "drifting", "off neutral")
+
+
+def delta_band_dollars(
+    theta: float, net_liq: float, theta_days: float, nav_pct: float
+) -> float:
+    """|Beta delta $| that still counts as SPX delta neutral: a typical 1% SPX
+    day may cost at most `theta_days` days of theta, capped at `nav_pct` of net
+    liq. Without theta (no options, or greeks missing) only the cap applies."""
+    cap = nav_pct * net_liq
+    if not theta:
+        return cap
+    return min(theta_days * abs(theta) / TYPICAL_SPX_DAY, cap)
+
+
+def expected_move(vix: float | None) -> float:
+    """The expected (one standard deviation) daily SPX move, a fraction: VIX
+    spread over 252 trading days; TYPICAL_SPX_DAY without a VIX price."""
+    return vix / 100 / 252**0.5 if vix and vix > 0 else TYPICAL_SPX_DAY
+
+
+def gamma_pnl(gamma: float, spx: float, move: float = TYPICAL_SPX_DAY) -> float:
+    """P&L from gamma alone when SPX moves `move` either way: 1/2 x gamma x
+    (move x SPX)^2, gamma in SPX delta per SPX point. Negative when short gamma:
+    what staying delta neutral costs on such a day."""
+    return 0.5 * gamma * (move * spx) ** 2
+
+
+def breakeven_move(theta: float, gamma: float, spx: float) -> float | None:
+    """The daily SPX move (a fraction) where gamma costs exactly a day's theta.
+    Only meaningful when earning theta and short gamma; else None."""
+    if theta <= 0 or gamma >= 0 or spx <= 0:
+        return None
+    return (2 * theta / -gamma) ** 0.5 / spx
+
+
+def neutrality(beta_dollars: float, band: float) -> str:
+    """'neutral' within the band, 'drifting' up to DRIFT_BANDS bands, else
+    'off neutral'."""
+    if abs(beta_dollars) <= band:
+        return NEUTRALITY[0]
+    return NEUTRALITY[1] if abs(beta_dollars) <= DRIFT_BANDS * band else NEUTRALITY[2]
+
+
 # ------------------------------------------- SPX delta = 0 proposals (display)
 
 
@@ -393,6 +439,22 @@ def option_label(leg: Leg) -> str:
         return symbol
     expiry = leg.expiry.strftime("%Y%m%d") if leg.expiry else ""
     return f"{symbol} {expiry} {leg.strike:g}{leg.right}"
+
+
+def position_rows(legs: list[Leg]) -> list[tuple[Leg, int, int]]:
+    """Legs in the old bot's Portfolio positions order (by symbol; stock first,
+    then options by expiry, right and strike), each with its row number and a
+    0/1 stripe that alternates per symbol, for shading the groups."""
+    ordered = sorted(
+        legs,
+        key=lambda x: (x.symbol, x.is_option, x.expiry or date.min, x.right, x.strike),
+    )
+    rows, group, last = [], -1, None
+    for row, leg in enumerate(ordered):
+        if leg.symbol != last:
+            group, last = group + 1, leg.symbol
+        rows.append((leg, row, group % 2))
+    return rows
 
 
 def spread_name(short: Leg, long: Leg) -> str:

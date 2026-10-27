@@ -6,7 +6,8 @@ Every `interval_secs` (market hours) it:
     (rolls and closes are one IB combo order: a Nautilus OptionSpread),
   - runs the VIX call hedge (buy per VIXMO allocation, sell above a VIX level),
   - opens the configured trades, sized to bring SPX beta-weighted delta to 0,
-    when nothing was rolled this run and |SPX delta| is outside delta_band.
+    when nothing was rolled this run and the account is off SPX delta neutral
+    (|beta delta $| outside rules.delta_band_dollars).
 Unfilled orders are moved halfway to the mid once, after reprice_after_secs.
 With dry_run (the default) orders are logged and counted, never sent."""
 
@@ -22,7 +23,6 @@ from zoneinfo import ZoneInfo
 
 import pandas as pd
 from nautilus_trader.common.events import TimeEvent
-from nautilus_trader.model.currencies import USD
 from nautilus_trader.model.enums import OptionKind, OrderSide, TimeInForce
 from nautilus_trader.model.events import OrderAccepted
 from nautilus_trader.model.identifiers import (
@@ -51,6 +51,7 @@ from thetagang_nt.portfolio import (
     build_book,
     held_legs,
     is_index,
+    net_liquidation,
     option_greeks,
     price,
     stock_contract,
@@ -65,6 +66,7 @@ from thetagang_nt.rules import (
     credit_pnl,
     debit_pnl,
     debit_take_profit_value,
+    delta_band_dollars,
     is_debit_vertical,
     is_itm,
     pick_contract,
@@ -87,9 +89,6 @@ LAST_RUN = Gauge(
 )
 # config the alert rules need (Prometheus can't read the TOML)
 DRY_RUN = Gauge("thetagang_strategy_dry_run", "1 while orders are only logged")
-DELTA_BAND = Gauge(
-    "thetagang_strategy_delta_band", "No new trades while |SPX delta| <= this"
-)
 # the trade plan, for the dashboard (the old "Discretionary trades" table)
 PLAN = Gauge(
     "thetagang_plan_units",
@@ -147,7 +146,6 @@ class Discretionary(Strategy):
 
     def on_start(self) -> None:
         DRY_RUN.set(self.config.dry_run)
-        DELTA_BAND.set(self.config.delta_band)
         if self.config.dry_run:
             self.log.warning("dry_run: orders are logged, never sent")
         aio.spawn(self, self._boot(), "strategy boot")
@@ -533,7 +531,7 @@ class Discretionary(Strategy):
             self.log.warning("VIX hedge: no VIXMO price")
             return False
         weight = vix_hedge_weight(cfg.allocation, vixmo)
-        nlv = self._net_liquidation()
+        nlv = net_liquidation(self.cache)
         if weight <= 0 or not nlv:
             return False
         c = await self._find(
@@ -551,13 +549,6 @@ class Discretionary(Strategy):
             px,
         )
         return True
-
-    def _net_liquidation(self) -> float | None:
-        for acc in self.cache.accounts():
-            total = acc.balance_total(USD)
-            if total is not None:
-                return total.as_double()
-        return None
 
     # ---------------------------------------------------------- new trades
 
@@ -581,9 +572,21 @@ class Discretionary(Strategy):
             )
             plan_status(f"{len(book.missing)} position(s) without greeks: no trades")
             return
-        if abs(now) <= cfg.delta_band:
-            self.log.info(f"SPX delta {now:+.2f} within the band of {cfg.delta_band:g}")
-            plan_status(f"SPX delta {now:+.2f} within the band of {cfg.delta_band:g}")
+        nlv = net_liquidation(self.cache)
+        if not nlv:
+            self.log.warning("No net liquidation: no new trades")
+            plan_status("no net liquidation")
+            return
+        band = delta_band_dollars(
+            book.theta, nlv, cfg.delta_band_theta_days, cfg.delta_band_nav_pct
+        )
+        if abs(book.beta_dollars) <= band:
+            msg = (
+                f"beta delta ${book.beta_dollars:+,.0f} (SPX delta {now:+.2f})"
+                f" within the band of ${band:,.0f}"
+            )
+            self.log.info(msg)
+            plan_status(msg)
             return
         plans: list[tuple[TradeConfig, Plan, ComboLegs, float, dict[str, float]]] = []
         for t in cfg.trades:

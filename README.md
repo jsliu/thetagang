@@ -72,8 +72,12 @@ through the account symbol by symbol:
 4. **New trades** in `[[strategy.trades]]` are sized together so the
    account's SPX delta goes to 0, split by `weight`, in whole contracts,
    never in the wrong direction, and capped by `max_contracts`. They wait
-   when anything was rolled or closed in the same run, while |SPX delta| is
-   within `delta_band`, and while any position has no greeks.
+   when anything was rolled or closed in the same run, while the account is
+   SPX delta neutral, and while any position has no greeks. Neutral means
+   |beta delta $| is within the band: a typical 1% SPX day may cost at most
+   `delta_band_theta_days` days of theta, capped at `delta_band_nav_pct` of net
+   liq. The dashboard colours SPX delta and beta delta $ green within the band,
+   orange up to twice it, and red beyond.
 
 Rolls and spread closes are sent as one IB combo order (a Nautilus
 `OptionSpread`), priced at the net mid. An order still unfilled after
@@ -171,7 +175,7 @@ lists every key with a comment.
 | `[node]` | trader id, log level, optional log directory, optional Redis cache |
 | `[ib]` | host, port, client id, `account_id`, `market_data_type` (`REALTIME`, or `DELAYED_FROZEN` for last prices while markets are closed). Add `[ib.gateway]` to have Nautilus start IB Gateway in Docker |
 | `[monitor]` | refresh interval, metrics address and port, long-option alert delta, stress moves |
-| `[strategy]` | `dry_run`, run interval, `market_hours_only`, `delta_band`, `minimum_credit`, debit-spread take-profit and maximum roll debit, `reprice_after_secs`, `chain_strikes`, `chain_expirations`, quote timeout |
+| `[strategy]` | `dry_run`, run interval, `market_hours_only`, `delta_band_theta_days`, `delta_band_nav_pct`, `minimum_credit`, debit-spread take-profit and maximum roll debit, `reprice_after_secs`, `chain_strikes`, `chain_expirations`, quote timeout |
 | `[strategy.roll_target]` | what a roll moves into: `dte`, `max_dte`, `delta` |
 | `[strategy.roll_when]` | `pnl`, `dte`, `min_pnl`, `max_dte`, `close_at_pnl`, `close_if_unable_to_roll`; `.calls` and `.puts` set `itm`, `always_when_itm`, `credit_only` |
 | `[[strategy.trades]]` | `symbol`, `structure` (`long_call`, `short_call`, `long_put`, `short_put`, `put_credit_spread`, `call_credit_spread`, `put_debit_spread`, `call_debit_spread`), `delta`, `dte`, `width` (spreads only), `weight`, `max_contracts` |
@@ -202,7 +206,7 @@ Alerts are sent 09:30–16:00 New York time on weekdays, repeated at most every
 | data stale | no refresh for over 5 minutes (5 min) |
 | positions without greeks | any position has no greeks for 30 min: SPX delta is incomplete and new trades are blocked |
 | long option to roll by hand | a long option's \|delta\| reached `long_option_alert_delta` |
-| SPX delta out of band | \|SPX delta\| > `delta_band` for an hour with `dry_run = false` |
+| SPX delta out of band | \|beta delta $\| outside the neutral band for an hour with `dry_run = false` |
 | stress loss | a −10% SPX move (beta-weighted) would lose more than 5% of net liquidation (15 min) |
 | order sent | the bot sent a real (not dry-run) order in the last 10 minutes |
 

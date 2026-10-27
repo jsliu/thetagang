@@ -11,10 +11,16 @@ from thetagang_nt.rules import (
     Leg,
     Plan,
     RollWhen,
+    breakeven_move,
     compute_beta,
     credit_pnl,
     debit_take_profit_value,
+    delta_band_dollars,
+    expected_move,
+    gamma_pnl,
+    neutrality,
     pick_contract,
+    position_rows,
     roll_strike_limit,
     should_close,
     should_roll,
@@ -308,9 +314,9 @@ def test_failed_implied_vol_counts_as_missing_greeks() -> None:
     """Regression: with no quote, Nautilus returned IV 1e-8 and delta 0; that must
     be "no greeks", never a zero-delta position."""
     pytest.importorskip("nautilus_trader")
-    from thetagang_nt import portfolio
-
     from datetime import datetime, timezone
+
+    from thetagang_nt import portfolio
 
     expiry = datetime(2026, 12, 18, 21, tzinfo=timezone.utc)
     ins = SimpleNamespace(
@@ -347,3 +353,49 @@ def test_failed_implied_vol_counts_as_missing_greeks() -> None:
     assert run(1.2, failed) is None  # the solver failed
     assert run(None, good) is None  # no price of its own
     assert run(1.2, good).delta == 0.4
+
+
+def test_delta_band_is_theta_based_and_capped_by_net_liq():
+    # $300/day theta: a 1% SPX day may cost one day of theta -> $30k band
+    assert delta_band_dollars(300, 1_000_000, 1.0, 0.05) == pytest.approx(30_000)
+    assert delta_band_dollars(-300, 1_000_000, 2.0, 0.05) == pytest.approx(
+        50_000
+    )  # capped
+    assert delta_band_dollars(0, 1_000_000, 1.0, 0.05) == 50_000  # no theta: the cap
+    assert [neutrality(x, 30_000) for x in (-30_000, 45_000, -60_001)] == [
+        "neutral",
+        "drifting",
+        "off neutral",
+    ]
+
+
+def test_gamma_pnl_and_breakeven_move():
+    # short gamma -0.004 SPX delta per point at SPX 7,500: a 1% day (75 pts) costs 1/2 x 0.004 x 75^2
+    assert gamma_pnl(-0.004, 7_500) == pytest.approx(-11.25)
+    assert gamma_pnl(-0.004, 7_500, 0.02) == pytest.approx(
+        -45.0
+    )  # twice the move, 4x the cost
+    # $11.25 of theta is exactly paid for by a 1% day
+    assert breakeven_move(11.25, -0.004, 7_500) == pytest.approx(0.01)
+    assert breakeven_move(11.25, 0.004, 7_500) is None  # long gamma: no break-even
+    assert breakeven_move(0.0, -0.004, 7_500) is None  # no theta
+
+
+def test_expected_move_follows_vix():
+    assert expected_move(16) == pytest.approx(0.01, rel=0.01)  # VIX 16: about a 1% day
+    assert expected_move(30) == pytest.approx(0.0189, rel=0.01)
+    assert expected_move(None) == 0.01  # no VIX price: the fixed 1% day
+
+
+def test_positions_are_grouped_like_the_old_bot():
+    stock = Leg("ms", "MS", "", 0.0, None, 200, 183.0, 183.0, 1.0)
+    far = Leg("ms2", "MS", "C", 195.0, date(2026, 12, 18), -1, 0.15, 0.1)
+    near = Leg("ms1", "MS", "C", 192.5, date(2026, 10, 30), -1, 0.29, 0.2)
+    ewq = Leg("ewq", "EWQ", "C", 43.0, EXP, -10, 0.4, 0.3)
+    rows = position_rows([far, near, ewq, stock])
+    assert [(leg.instrument_id, row, stripe) for leg, row, stripe in rows] == [
+        ("ewq", 0, 0),
+        ("ms", 1, 1),  # stock first,
+        ("ms1", 2, 1),  # then options by expiry
+        ("ms2", 3, 1),
+    ]

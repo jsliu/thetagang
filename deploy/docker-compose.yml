@@ -33,4 +33,4 @@ services:
     <<: *thetagang
     profiles: ["trading"]
     command: ["python", "-m", "thetagang_nt.node", "-c", "${THETAGANG_CONFIG:-thetagang.nt.local.toml}", "--role", "trade"]
-    ports: ["127.0.0.1:9465:9465"]   # /metrics: orders, dry_run, delta_band
+    ports: ["127.0.0.1:9465:9465"]   # /metrics: orders, dry_run, trade plan

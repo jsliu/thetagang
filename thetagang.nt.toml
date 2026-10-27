@@ -40,7 +40,11 @@ stress_moves = [-0.10, -0.05, 0.05, 0.10]
 dry_run = true                # log orders, never send them
 interval_secs = 300
 market_hours_only = true
-delta_band = 1.0              # no new trades while |SPX delta| <= this
+# SPX delta neutral (no new trades) while |beta delta $| <= the band:
+# a 1% SPX day may cost at most this many days of theta,
+delta_band_theta_days = 2.0
+# capped at this share of net liq
+delta_band_nav_pct = 0.10
 minimum_credit = 0.0
 debit_spread_take_profit = 0.8
 debit_spread_max_roll_debit = 0.5

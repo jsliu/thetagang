@@ -32,20 +32,28 @@ from thetagang_nt.portfolio import (
     build_book,
     held_legs,
     is_index,
+    net_liquidation,
     price,
     stock_contract,
     stress_pnl,
     underlying_id,
 )
 from thetagang_nt.rules import (
+    NEUTRALITY,
     Action,
     Leg,
     RollWhen,
     Unit,
+    breakeven_move,
     compute_beta,
+    delta_band_dollars,
+    expected_move,
+    gamma_pnl,
     leg_name,
+    neutrality,
     option_label,
     position_actions,
+    position_rows,
     short_pnl,
     side_weight,
     symbol_adjustment,
@@ -55,6 +63,15 @@ from thetagang_nt.rules import (
 )
 
 BETAS_KEY = "thetagang.betas"
+
+
+def position_labels(leg: Leg) -> dict[str, str]:
+    """The labels every per-position metric shares, so the table joins them."""
+    return {
+        "instrument": option_label(leg),
+        "symbol": leg.symbol,
+        "kind": {"C": "call", "P": "put"}.get(leg.right, "stock"),
+    }
 
 
 class _Snapshot:
@@ -265,12 +282,13 @@ class PortfolioMonitor(Actor):
 
     def _positions(self, f: _Families, legs: list[Leg], today: date) -> None:
         unrealized = 0.0
-        for leg in legs:
-            labels = {
-                "instrument": option_label(leg),
-                "symbol": leg.symbol,
-                "kind": {"C": "call", "P": "put"}.get(leg.right, "stock"),
-            }
+        for leg, row, stripe in position_rows(legs):
+            labels = position_labels(leg)
+            und = price(self.cache, underlying_id(leg.symbol))
+            if und is not None:
+                f.set("position_underlying_price", "Underlying price", und, **labels)
+            f.set("position_row", "Row in the old bot's positions order", row, **labels)
+            f.set("position_stripe", "0/1, alternating per symbol", stripe, **labels)
             f.set("position_quantity", "Signed contracts or shares", leg.qty, **labels)
             f.set("position_avg_price", "Cost basis per share", leg.avg_px, **labels)
             if leg.mid is None:
@@ -305,6 +323,28 @@ class PortfolioMonitor(Actor):
         f.set("vega", "Vega ($ per vol point)", book.vega)
         f.set("volga", "Volga (vega $ change per vol point)", book.volga)
         f.set("options_missing_greeks", "Positions without greeks", len(book.missing))
+        day = expected_move(price(self.cache, VIX))
+        cost = gamma_pnl(book.gamma, book.spx, day)
+        f.set("expected_move", "Expected daily SPX move from VIX (fraction)", day)
+        f.set("gamma_pnl_expected", "Gamma P&L on an expected day ($)", cost)
+        f.set("net_carry", "Theta + expected-day gamma P&L ($/day)", book.theta + cost)
+        move = breakeven_move(book.theta, book.gamma, book.spx)
+        if move is not None:
+            f.set(
+                "breakeven_move", "SPX daily move where gamma costs a day's theta", move
+            )
+        nlv = net_liquidation(self.cache)
+        if nlv:
+            cfg = self._rules or DiscretionaryConfig()
+            band = delta_band_dollars(
+                book.theta, nlv, cfg.delta_band_theta_days, cfg.delta_band_nav_pct
+            )
+            f.set("delta_band_dollars", "Neutral while |beta delta $| <= this", band)
+            f.set(
+                "delta_neutrality",
+                "0 neutral, 1 drifting, 2 off neutral",
+                NEUTRALITY.index(neutrality(book.beta_dollars, band)),
+            )
         for s, r in book.by_symbol.items():
             f.set("symbol_beta", "1y beta vs SPX", r.beta, symbol=s)
             f.set(
@@ -327,12 +367,18 @@ class PortfolioMonitor(Actor):
         alert = self.config.long_option_alert_delta
         alerts = 0
         for leg in legs:
+            labels = position_labels(leg)
+            if not leg.is_option:  # per share, as IB quotes it: stock delta is 1
+                f.set("position_delta", "Delta per share", 1.0, **labels)
+                continue
             g = book.greeks.get(leg.instrument_id)
             if g is None:
                 continue
-            name = option_label(leg)
-            f.set("position_delta", "Option delta per share", g.delta, instrument=name)
-            f.set("position_iv", "Implied volatility", g.vol, instrument=name)
+            f.set("position_delta", "Delta per share", g.delta, **labels)
+            f.set("position_gamma", "Gamma per share", g.gamma, **labels)
+            f.set("position_theta", "Theta per share ($/day)", g.theta, **labels)
+            f.set("position_vega", "Vega per share ($ per vol point)", g.vega, **labels)
+            f.set("position_iv", "Implied volatility", g.vol, **labels)
             alerts += leg.qty > 0 and abs(g.delta) >= alert
         f.set("long_option_alerts", f"Long options with |delta| >= {alert}", alerts)
         for move in self.config.stress_moves:
@@ -572,12 +618,12 @@ class PortfolioMonitor(Actor):
             and x.qty > 0
             and x.dte(today) > cfg.ignore_dte
         )
-        action, weight = vix_hedge_action(
-            held, price(self.cache, VIX), price(self.cache, VIXMO), cfg
-        )
+        vixmo = price(self.cache, VIXMO)
+        action, weight = vix_hedge_action(held, price(self.cache, VIX), vixmo, cfg)
         f.set("vix_hedge_action", "What the VIX call hedge would do", 1, action=action)
         f.set("vix_hedge", "VIX call hedge", held, field="held_calls")
-        f.set("vix_hedge", "VIX call hedge", weight, field="weight")
+        if vixmo is not None:  # without VIXMO the weight is unknown, not 0
+            f.set("vix_hedge", "VIX call hedge", weight, field="weight")
         if cfg.close_hedges_when_vix_exceeds:
             f.set(
                 "vix_hedge",

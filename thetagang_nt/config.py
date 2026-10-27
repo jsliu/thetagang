@@ -123,7 +123,11 @@ class DiscretionaryConfig(StrategyConfig, frozen=True):
     dry_run: bool = True  # log orders instead of sending them
     interval_secs: int = 300
     market_hours_only: bool = True
-    delta_band: float = 1.0  # no new trades while |SPX delta| <= this
+    # SPX delta neutral (no new trades) while |beta delta $| <= the band: a 1%
+    # SPX day may cost at most delta_band_theta_days days of theta, capped at
+    # delta_band_nav_pct of net liq (rules.delta_band_dollars)
+    delta_band_theta_days: float = 2.0
+    delta_band_nav_pct: float = 0.10
     minimum_credit: float = 0.0
     debit_spread_take_profit: float = 0.8
     debit_spread_max_roll_debit: float = 0.5
@@ -136,7 +140,7 @@ class DiscretionaryConfig(StrategyConfig, frozen=True):
     trades: list[TradeConfig] = []
     vix_call_hedge: VixHedgeConfig = VixHedgeConfig()
     symbols: dict[str, SymbolConfig] = {}
-    # --role trade only: the trading process's own metrics (orders, dry_run, delta_band)
+    # --role trade only: the trading process's own metrics (orders, dry_run, trade plan)
     metrics_port: int = 9465
 
 
