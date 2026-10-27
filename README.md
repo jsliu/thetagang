@@ -179,7 +179,7 @@ and the stress P&L, and asks before sending anything:
 
 ```console
 cd deploy
-./pretrade.sh                                        # the strategy's trade plan: new trades or target resizes
+./pretrade.sh                                        # your [[pretrade.candidates]], side by side (else the strategy's plan)
 ./pretrade.sh "sell 2 AA 20261218 40P"               # ad hoc: sell 2 AA Dec-18 40 puts
 ./pretrade.sh "buy 100 MS"                           # 100 shares
 ./pretrade.sh "buy 1 AA 20261218 40P/23P"            # a put debit spread: buy the 40 put, sell the 23 put
@@ -202,13 +202,42 @@ Proposed trades:
 Send (DRY RUN) these 1 order(s)? [y/N]
 ```
 
+**Candidates.** List ideas to compare under `[[pretrade.candidates]]`, each a
+name and one or more trades in the `[[strategy.trades]]` format:
+
+```toml
+[[pretrade.candidates]]
+name = "SPY put spread"
+[[pretrade.candidates.trades]]
+symbol = "SPY"
+structure = "put_debit_spread"
+width = 10.0
+delta = 0.4
+dte = 45
+max_contracts = 5
+```
+
+Each candidate is sized **on its own** to bring SPX delta to 0 (its trades
+together, split by `weight`). `./pretrade.sh` then shows every candidate's
+orders and cost, and a table with **Now** and the portfolio after each
+candidate: SPX delta, beta delta $, neutrality, theta, vega, volga, gamma P&L,
+net carry, stress for each SPX move. It asks which one to send
+(`1`, `2`, … or Enter for none). The candidates never change what the strategy
+trades; it keeps to `[[strategy.trades]]`.
+
+The **thetagang pre-trade** dashboard always shows the comparison: the trading
+strategy re-sizes and compares the candidates every `refresh_mins` (15) during
+market hours, publishing only (it never sends one). While `./pretrade.sh` runs,
+the dashboard shows its fresher numbers instead. `refresh_mins = 0` under
+`[pretrade]` turns the background comparison off.
+
 Each ad-hoc trade is `buy|sell QTY SYMBOL [YYYYMMDD STRIKE(C|P)[/STRIKE(C|P)]]`.
 QTY is shares for stock and contracts (or spreads) for options. A spread goes
 out as one IB combo order: its first strike is bought on a `buy` and sold on a
-`sell`, the second the other way. Without arguments it proposes the
-strategy's trade plan (new trades, or with `place_target_orders` the resizes
-of what you hold), which needs greeks for every position, so run that during
-market hours.
+`sell`, the second the other way. Without arguments it proposes your
+candidates, or without any the strategy's trade plan (new trades, or with
+`place_target_orders` the resizes of what you hold); sizing needs greeks for
+every position, so run it during market hours.
 
 On `y`, the trades are re-priced at the mid of that moment and sent through the
 strategy's own order code, so `dry_run` still applies. Nothing is sent on any
@@ -253,6 +282,7 @@ lists every key with a comment.
 | `place_target_orders` (in `[strategy]`) | `true`: the trade plan resizes held positions toward their SPX Δ=0 targets instead of opening `[[strategy.trades]]` (use one or the other) |
 | `[[strategy.trades]]` | `symbol`, `structure` (`long_call`, `short_call`, `long_put`, `short_put`, `put_credit_spread`, `call_credit_spread`, `put_debit_spread`, `call_debit_spread`), `delta`, `dte`, `width` (spreads only), `weight`, `max_contracts` |
 | `[strategy.vix_call_hedge]` | `enabled`, `delta`, `target_dte`, `close_hedges_when_vix_exceeds`, `ignore_dte`, and `[[…allocation]]` bands (`lower_bound` ≤ VIXMO < `upper_bound`, first match wins, `weight` × net liquidation) |
+| `[[pretrade.candidates]]` | `name`, and `[[pretrade.candidates.trades]]` as in `[[strategy.trades]]`: ideas `pretrade` sizes and compares |
 | `[strategy.symbols.<SYM>]` | `no_trading`, `put_strike_limit`, `call_strike_limit`, `delta`, `max_dte`, `ignore_missing_greeks` |
 
 Remove the whole `[strategy]` section to run the monitor only. The roll,

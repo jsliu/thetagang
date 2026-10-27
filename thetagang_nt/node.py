@@ -38,6 +38,7 @@ def build(path: str, role: str = "all", adhoc: tuple[str, ...] = ()) -> TradingN
         config = PreTradeConfig(
             **msgspec.structs.asdict(strategy),
             adhoc=adhoc,
+            candidates=tuple(app.pretrade.candidates),
             stress_moves=app.monitor.stress_moves,
         )
         node.trader.add_strategy(PreTrade(config))
@@ -45,7 +46,7 @@ def build(path: str, role: str = "all", adhoc: tuple[str, ...] = ()) -> TradingN
     elif strategy is not None:
         from thetagang_nt.strategy import Discretionary
 
-        node.trader.add_strategy(Discretionary(strategy))
+        node.trader.add_strategy(Discretionary(strategy, pretrade=app.pretrade))
     if role == "trade":  # the strategy's own metrics; the monitor publishes none here
         start_http_server(strategy.metrics_port, monitor.metrics_addr)
     node.add_data_client_factory(IB, InteractiveBrokersLiveDataClientFactory)
@@ -84,7 +85,9 @@ def cli(ctx: click.Context, path: str, role: str) -> None:
 def pretrade(path: str, trades: tuple[str, ...]) -> None:
     """Show the portfolio's risk now and after TRADES, and send them if you say y.
 
-    Without TRADES: the [[strategy.trades]], sized to bring SPX delta to 0.
+    Without TRADES: each [[pretrade.candidates]] entry, sized on its own to bring
+    SPX delta to 0, side by side (you pick one to send); without candidates, the
+    strategy's own trade plan.
     Each TRADE: "buy 100 MS", "sell 2 AA 20261218 40P", or a vertical as one
     combo order, "buy 1 AA 20261218 40P/23P" (buy the 40 put, sell the 23)."""
     from thetagang_nt.rules import parse_trade

@@ -36,7 +36,7 @@ from nautilus_trader.trading.strategy import Strategy
 from prometheus_client import Counter, Gauge
 
 from thetagang_nt import aio
-from thetagang_nt.config import DiscretionaryConfig, TradeConfig
+from thetagang_nt.config import DiscretionaryConfig, PreTradeSectionConfig, TradeConfig
 from thetagang_nt.monitor import BETAS_KEY
 from thetagang_nt.portfolio import (
     INDEX_CONTRACTS,
@@ -78,6 +78,7 @@ from thetagang_nt.rules import (
     is_itm,
     pick_contract,
     roll_strike_limit,
+    scan_strikes,
     short_pnl,
     should_close,
     should_roll,
@@ -141,8 +142,13 @@ def market_open(now: datetime) -> bool:
 
 
 class Discretionary(Strategy):
-    def __init__(self, config: DiscretionaryConfig) -> None:
+    def __init__(
+        self, config: DiscretionaryConfig, pretrade: PreTradeSectionConfig | None = None
+    ) -> None:
         super().__init__(config)
+        self.pretrade = (
+            pretrade  # [pretrade]: the candidates compared in the background
+        )
         self.rw = config.roll_when.rules()
         self._busy = False
         self._repriced: set[ClientOrderId] = set()
@@ -151,6 +157,21 @@ class Discretionary(Strategy):
 
     def on_start(self) -> None:
         DRY_RUN.set(self.config.dry_run)
+        p = self.pretrade
+        if p is not None and p.candidates and p.refresh_mins > 0:
+            # a timer's first event is start + interval: the first run is an alert
+            first = self.clock.utc_now() + timedelta(minutes=3)  # betas load first
+            self.clock.set_time_alert("pretrade-first", first, self._on_pretrade_timer)
+            self.clock.set_timer(
+                "pretrade-refresh",
+                timedelta(minutes=p.refresh_mins),
+                callback=self._on_pretrade_timer,
+                start_time=first,
+            )
+            self.log.info(
+                f"Pretrade candidates compared at {first:%H:%M} UTC, then every "
+                f"{p.refresh_mins} min"
+            )
         if self.config.dry_run:
             self.log.warning("dry_run: orders are logged, never sent")
         aio.spawn(self, self._boot(), "strategy boot")
@@ -166,6 +187,32 @@ class Discretionary(Strategy):
             callback=self._on_timer,
         )
         await self._run()
+
+    def _on_pretrade_timer(self, _event: TimeEvent) -> None:
+        if self._busy:  # never beside a strategy run (both scan chains): retry soon
+            self.clock.set_time_alert(
+                f"pretrade-retry-{self.clock.timestamp_ns()}",
+                self.clock.utc_now() + timedelta(minutes=1),
+                self._on_pretrade_timer,
+            )
+            return
+        aio.spawn(self, self._compare_candidates(), "pretrade refresh")
+
+    async def _compare_candidates(self) -> None:
+        if self.config.market_hours_only and not market_open(self.clock.utc_now()):
+            return
+        from thetagang_nt import pretrade  # it builds on this module
+
+        self._busy = True
+        try:
+            self.log.info(
+                f"Comparing {len(self.pretrade.candidates)} pretrade candidate(s)"
+            )
+            await pretrade.refresh(self, self.pretrade.candidates)
+        except Exception as e:  # noqa: BLE001 - a failed comparison never stops trading
+            self.log.error(f"pretrade refresh failed: {e!r}")
+        finally:
+            self._busy = False
 
     def _on_timer(self, _event: TimeEvent) -> None:
         if not self._busy:
@@ -663,8 +710,21 @@ class Discretionary(Strategy):
         the positions summary's targets."""
         if self.config.place_target_orders:
             return self._target_plan(legs, book, spx, busy)
+        return await self._new_trades(self.config.trades, book, spx, betas, today, busy)
+
+    async def _new_trades(
+        self,
+        trades: list[TradeConfig],
+        book: Book,
+        spx: float,
+        betas: dict[str, float],
+        today: date,
+        busy: set[str],
+    ) -> list[Planned]:
+        """`trades` priced and sized together to bring SPX delta to 0, as orders
+        (the [[strategy.trades]], or one pretrade candidate)."""
         out = []
-        sized = await self._size_trades(spx, betas, book.spx_delta, today, busy)
+        sized = await self._size_trades(spx, betas, book.spx_delta, today, busy, trades)
         for t, plan, combo, combo_price, unit in sized:
             out.append(
                 Planned(
@@ -693,11 +753,13 @@ class Discretionary(Strategy):
         now: float,
         today: date,
         busy: set[str],
+        trades: list[TradeConfig] | None = None,
     ) -> list[tuple[TradeConfig, Plan, ComboLegs, float, dict[str, float]]]:
-        """Price each [[strategy.trades]] entry and size them together so SPX
-        delta `now` goes to 0: (trade, plan, combo legs, price, greeks per unit)."""
+        """Price each trade ([[strategy.trades]] by default) and size them together
+        so SPX delta `now` goes to 0: (trade, plan, combo legs, price, greeks per
+        unit)."""
         plans: list[tuple[TradeConfig, Plan, ComboLegs, float, dict[str, float]]] = []
-        for t in self.config.trades:
+        for t in self.config.trades if trades is None else trades:
             plan, combo, combo_price, unit = (
                 Plan(t.weight, t.max_contracts),
                 [],
@@ -830,12 +892,13 @@ class Discretionary(Strategy):
         expiries = expiries[: cfg.chain_expirations]
         scan: list[OptionContract] = []
         for expiry in expiries:
-            nearest_first = sorted(
-                (i for i in chain if i.expiration_utc.date() == expiry),
-                key=lambda i: float(i.strike_price),
-                reverse=right == "P",
-            )
-            scan += nearest_first[: cfg.chain_strikes]
+            by_strike = {
+                float(i.strike_price): i
+                for i in chain
+                if i.expiration_utc.date() == expiry
+            }
+            picked = scan_strikes(list(by_strike), und, cfg.chain_strikes)
+            scan += [by_strike[k] for k in picked]
         if not scan:
             raise NoContract(f"{symbol}: no {right} strikes/expirations in range")
         forwards = await self._vix_forwards(expiries, und) if symbol == VIX_ROOT else {}

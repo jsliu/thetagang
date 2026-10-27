@@ -377,8 +377,12 @@ def test_gamma_pnl_and_breakeven_move():
         -45.0
     )  # twice the move, 4x the cost
     # $11.25 of theta is exactly paid for by a 1% day
-    assert breakeven_move(11.25, -0.004, 7_500) == pytest.approx(0.01)
-    assert breakeven_move(11.25, 0.004, 7_500) is None  # long gamma: no break-even
+    kind, move = breakeven_move(11.25, -0.004, 7_500)  # short gamma, earning theta
+    assert kind == "max" and move == pytest.approx(0.01)  # bigger days lose
+    kind, move = breakeven_move(-11.25, 0.004, 7_500)  # long gamma, paying theta
+    assert kind == "min" and move == pytest.approx(0.01)  # smaller days lose
+    assert breakeven_move(11.25, 0.004, 7_500) is None  # every day wins
+    assert breakeven_move(-11.25, -0.004, 7_500) is None  # every day loses
     assert breakeven_move(0.0, -0.004, 7_500) is None  # no theta
 
 
@@ -516,3 +520,104 @@ def test_stress_is_zero_without_a_move_and_compares_like_with_like() -> None:
     down = stress_pnl(cache, [call], book, -0.01, True, today)
     assert up > 0 > down  # a long call gains on the way up
     assert abs(up) < 2 * 100 * 0.6 * 40 * 0.012  # about delta x move, not thousands
+
+
+def test_pretrade_candidates_load_and_are_checked() -> None:
+    pytest.importorskip("nautilus_trader")
+    import msgspec
+
+    from thetagang_nt.config import PreTradeSectionConfig
+    from thetagang_nt.pretrade import Proposal, sendable
+
+    trade = {"symbol": "AA", "structure": "put_debit_spread", "width": 5.0}
+    section = msgspec.convert(
+        {"candidates": [{"name": "AA spread", "trades": [trade]}]},
+        PreTradeSectionConfig,
+    )
+    assert section.candidates[0].trades[0].width == 5.0
+    with pytest.raises(msgspec.ValidationError, match="no trades"):
+        msgspec.convert({"candidates": [{"name": "empty"}]}, PreTradeSectionConfig)
+    with pytest.raises(msgspec.ValidationError, match="distinct"):
+        twice = {"name": "same", "trades": [trade]}
+        msgspec.convert({"candidates": [twice, twice]}, PreTradeSectionConfig)
+    priced = Proposal("a", "AA", [("x", 1)], 2, 1.5)
+    unpriced = Proposal("b", "AA", [("x", 1)], 2, None, "no quote")
+    zero = Proposal("c", "AA", [("x", 1)], 0, 1.5, "capped")
+    assert sendable([priced, unpriced, zero]) == [priced]
+
+
+def test_scan_reaches_out_of_the_money_on_a_fine_strike_grid() -> None:
+    from thetagang_nt.rules import scan_strikes
+
+    spy = [float(k) for k in range(700, 809)]  # $1 apart, up to 5% above 769.57
+    picked = scan_strikes(spy, 769.57, 15)
+    assert len(picked) <= 15 and picked == sorted(picked)
+    assert min(picked) <= 745 and max(picked) >= 790  # both sides of the money
+    aa = [float(k) for k in range(20, 60, 5)]  # a coarse grid: all of it
+    assert scan_strikes(aa, 41.0, 15) == aa
+
+
+def test_an_unanswered_prompt_times_out_and_an_answer_comes_back() -> None:
+    pytest.importorskip("nautilus_trader")
+    import asyncio
+    import builtins
+
+    from thetagang_nt.pretrade import ask_within
+
+    original = builtins.input
+    try:
+        builtins.input = lambda _prompt: "2"
+        assert asyncio.run(ask_within("which? ", 5)) == "2"
+        builtins.input = lambda _prompt: __import__("time").sleep(5) or "late"
+        assert asyncio.run(ask_within("which? ", 0.2)) is None  # gave up, did not hang
+    finally:
+        builtins.input = original
+
+
+def test_pnl_curve_spans_spx_and_is_zero_today() -> None:
+    pytest.importorskip("nautilus_trader")
+    from datetime import UTC, datetime
+
+    from thetagang_nt.portfolio import Book, Greeks, SymbolRisk
+    from thetagang_nt.pretrade import curve
+
+    call = Leg("C40", "AA", "C", 40.0, EXP, 2, 1.0, 2.5)
+    greeks = Greeks(0.5, 0.05, -0.02, 0.06, 40.0, 0.35, 2.5)
+    book = Book(
+        spx=7000.0, by_symbol={"AA": SymbolRisk(beta=1.2)}, greeks={"C40": greeks}
+    )
+    expiry = datetime(EXP.year, EXP.month, EXP.day, tzinfo=UTC)
+    cache = SimpleNamespace(
+        instrument=lambda iid: SimpleNamespace(expiration_utc=expiry)
+    )
+    points = curve(cache, [call], book, date(2026, 11, 2))
+    assert (
+        len(points) == 21
+        and min(points) == pytest.approx(6300)
+        and max(points) == pytest.approx(7700)
+    )
+    assert points[7000.0] == pytest.approx(0.0, abs=1e-9)
+    assert points[7700.0] > 0 > points[6300.0]  # a long call: up the curve to the right
+
+
+def test_vix_curve_is_zero_today_and_long_vega_gains_on_a_spike() -> None:
+    pytest.importorskip("nautilus_trader")
+    from datetime import UTC, datetime
+
+    from thetagang_nt.portfolio import Book, Greeks, SymbolRisk
+    from thetagang_nt.pretrade import vix_curve
+
+    call = Leg("C40", "AA", "C", 40.0, EXP, 2, 1.0, 2.5)
+    greeks = Greeks(0.5, 0.05, -0.02, 0.06, 40.0, 0.35, 2.5)
+    book = Book(
+        spx=7000.0, by_symbol={"AA": SymbolRisk(beta=1.2)}, greeks={"C40": greeks}
+    )
+    expiry = datetime(EXP.year, EXP.month, EXP.day, tzinfo=UTC)
+    cache = SimpleNamespace(
+        instrument=lambda iid: SimpleNamespace(expiration_utc=expiry)
+    )
+    points = vix_curve(cache, [call], book, 15.0, date(2026, 11, 2))
+    assert min(points) == pytest.approx(9.0) and max(points) == pytest.approx(35.0)
+    assert points[15.0] == pytest.approx(0.0, abs=1e-9)
+    assert points[35.0] > 0 > points[9.0]  # long vega: up the curve to the right
+    assert vix_curve(cache, [call], book, None, date(2026, 11, 2)) == {}

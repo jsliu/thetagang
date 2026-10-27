@@ -195,11 +195,39 @@ class NodeConfig(NautilusConfig, frozen=True):
     redis_port: int = 6379
 
 
+class CandidateConfig(NautilusConfig, frozen=True):
+    """One idea for `thetagang-nt pretrade` to compare: its trades are sized
+    together to bring SPX delta to 0, like the [[strategy.trades]]."""
+
+    name: str
+    trades: list[TradeConfig] = []
+
+    def __post_init__(self) -> None:
+        if not self.trades:
+            raise ValueError(f"pretrade candidate {self.name!r} has no trades")
+
+
+class PreTradeSectionConfig(NautilusConfig, frozen=True):
+    """[pretrade]: the candidates `thetagang-nt pretrade` compares, each sized on
+    its own; you pick the one to send."""
+
+    candidates: list[CandidateConfig] = []
+    # the trading strategy compares them in the background this often (market
+    # hours), so the Pre-trade dashboard always shows them; 0: only on demand
+    refresh_mins: int = 15
+
+    def __post_init__(self) -> None:
+        names = [c.name for c in self.candidates]
+        if len(set(names)) != len(names):
+            raise ValueError("pretrade candidates need distinct names")
+
+
 class AppConfig(NautilusConfig, frozen=True):
     node: NodeConfig = NodeConfig()
     ib: IBConfig = IBConfig()
     monitor: MonitorConfig = MonitorConfig()
     strategy: DiscretionaryConfig | None = None  # omit for monitor-only
+    pretrade: PreTradeSectionConfig = PreTradeSectionConfig()
 
 
 def load(path: str | Path) -> AppConfig:
@@ -262,7 +290,9 @@ def node_config(app: AppConfig, client_id: int | None = None) -> TradingNodeConf
             log_level_file=app.node.log_level if app.node.log_directory else None,
         ),
         cache=cache,
-        exec_engine=LiveExecEngineConfig(reconciliation=True),
+        # IB reports whole shares for a fractional position (17.738 -> 18): accept
+        # its fill instead of leaving a stand-in order open that blocks the symbol
+        exec_engine=LiveExecEngineConfig(reconciliation=True, allow_overfills=True),
         data_clients={
             IB: InteractiveBrokersDataClientConfig(
                 market_data_type=getattr(IBMarketDataTypeEnum, ib.market_data_type),

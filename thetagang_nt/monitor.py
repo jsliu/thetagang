@@ -332,10 +332,14 @@ class PortfolioMonitor(Actor):
         f.set("expected_move", "Expected daily SPX move from VIX (fraction)", day)
         f.set("gamma_pnl_expected", "Gamma P&L on an expected day ($)", cost)
         f.set("net_carry", "Theta + expected-day gamma P&L ($/day)", book.theta + cost)
-        move = breakeven_move(book.theta, book.gamma, book.spx)
-        if move is not None:
+        even = breakeven_move(book.theta, book.gamma, book.spx)
+        if even is not None:  # max: bigger days lose (short gamma); min: smaller do
+            kind, move = even
             f.set(
-                "breakeven_move", "SPX daily move where gamma costs a day's theta", move
+                "breakeven_move",
+                "SPX daily move where gamma P&L offsets a day's theta",
+                move,
+                kind=kind,
             )
         nlv = net_liquidation(self.cache)
         if nlv:

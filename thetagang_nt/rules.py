@@ -231,6 +231,16 @@ def valid_strike(
     return strike >= (strike_limit or underlying * 0.95)
 
 
+def scan_strikes(strikes: list[float], underlying: float, count: int) -> list[float]:
+    """The `count` strikes to quote for a delta pick: the 4 x count strikes nearest
+    the money, thinned evenly, so the scan spans deltas on both sides of the
+    money however fine the strike grid (SPY: $1 apart), sorted by strike."""
+    near = sorted(strikes, key=lambda k: abs(k - underlying))[: 4 * count]
+    near.sort()
+    step = max(1, math.ceil(len(near) / count))
+    return near[::step]
+
+
 def pick_contract(
     candidates: list[Candidate],
     right: str,
@@ -348,12 +358,14 @@ def gamma_pnl(gamma: float, spx: float, move: float = TYPICAL_SPX_DAY) -> float:
     return 0.5 * gamma * (move * spx) ** 2
 
 
-def breakeven_move(theta: float, gamma: float, spx: float) -> float | None:
-    """The daily SPX move (a fraction) where gamma costs exactly a day's theta.
-    Only meaningful when earning theta and short gamma; else None."""
-    if theta <= 0 or gamma >= 0 or spx <= 0:
+def breakeven_move(theta: float, gamma: float, spx: float) -> tuple[str, float] | None:
+    """The daily SPX move (a fraction) where gamma P&L offsets a day's theta:
+    ("max", m) when short gamma and earning theta (bigger days lose money),
+    ("min", m) when long gamma and paying theta (smaller days lose money);
+    None when theta and gamma don't offset (every day wins, or every day loses)."""
+    if spx <= 0 or not theta or not gamma or (theta > 0) == (gamma > 0):
         return None
-    return (2 * theta / -gamma) ** 0.5 / spx
+    return ("max" if theta > 0 else "min"), (2 * abs(theta) / abs(gamma)) ** 0.5 / spx
 
 
 def neutrality(beta_dollars: float, band: float) -> str:

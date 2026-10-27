@@ -131,3 +131,21 @@ weight = 0.0
 # max_dte = 250
 # ignore_missing_greeks = false   # true: its options with no quote count as zero
 #                                  # delta when sizing the trade plan, instead of blocking it
+
+# Ideas for `thetagang-nt pretrade` (deploy/pretrade.sh) to compare: each candidate's
+# trades are sized together to bring SPX delta to 0 (same keys as [[strategy.trades]]),
+# each candidate on its own; pretrade shows them side by side and sends the one you
+# pick. Without candidates, pretrade proposes the strategy's own trade plan.
+# The trading strategy also compares them every refresh_mins (market hours), so the
+# Pre-trade dashboard always shows them:
+# [pretrade]
+# refresh_mins = 15   # 0: only when you run pretrade
+# [[pretrade.candidates]]
+# name = "AA put spread"
+# [[pretrade.candidates.trades]]
+# symbol = "AA"
+# structure = "put_debit_spread"
+# width = 5.0
+# delta = 0.6
+# dte = 60
+# max_contracts = 10

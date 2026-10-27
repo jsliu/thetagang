@@ -454,3 +454,36 @@ def stress_pnl(
         )
         total += leg.qty * leg.multiplier * (moved - now)
     return total
+
+
+def vix_pnl(
+    cache: Cache, legs: list[Leg], book: Book, points: float, today: date
+) -> float:
+    """P&L if VIX moves by `points` with SPX unchanged: every option's implied
+    vol shifts by the same vol points; VIX options' underlying moves by `points`
+    at its current IV. Stocks don't move."""
+    total = 0.0
+    for leg in legs:
+        g = book.greeks.get(leg.instrument_id)
+        if not leg.is_option or g is None or not _ok(g.vol) or g.vol <= 0:
+            continue
+        years = years_to(cache.instrument(leg.instrument_id), today)
+        call = leg.right == "C"
+        # ponytail: parallel IV shift; single stocks' IV moves less than 1:1 with VIX,
+        # and VIX futures less than spot. Scale by a vol beta if that matters.
+        if leg.symbol == VIX_ROOT:
+            spots, vols = (
+                (max(g.underlying + points, 0.01), g.underlying),
+                (g.vol, g.vol),
+            )
+        else:
+            spots, vols = (
+                (g.underlying, g.underlying),
+                (max(g.vol + points / 100, 0.01), g.vol),
+            )
+        moved, now = (
+            black_scholes_greeks(s, RATE, RATE, v, call, leg.strike, years).price
+            for s, v in zip(spots, vols)
+        )
+        total += leg.qty * leg.multiplier * (moved - now)
+    return total
