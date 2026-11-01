@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 from datetime import date, timedelta
+from typing import Any
 
 from nautilus_trader.common.actor import Actor
 from nautilus_trader.core.datetime import unix_nanos_to_dt
@@ -31,16 +32,19 @@ from thetagang_nt.portfolio import (
     Book,
     build_book,
     contract_units,
+    curve,
     held_legs,
     is_index,
     net_liquidation,
     order_cost,
     order_text,
     price,
+    proposal_legs,
     stock_contract,
     stress_pnl,
     symbols_with_open_orders,
     target_plan,
+    vix_curve,
     underlying_id,
 )
 from thetagang_nt.rules import (
@@ -48,6 +52,7 @@ from thetagang_nt.rules import (
     Action,
     Leg,
     RollWhen,
+    breakeven,
     breakeven_move,
     compute_beta,
     delta_band_dollars,
@@ -58,6 +63,7 @@ from thetagang_nt.rules import (
     option_label,
     position_actions,
     position_rows,
+    realized_move,
     short_pnl,
     side_weight,
     symbol_adjustment,
@@ -213,6 +219,7 @@ class PortfolioMonitor(Actor):
             return
 
         summary, daily = await self._read_extras()
+        orders = await self._read_orders()
         f = _Families()
         for field, value in summary.items():
             f.set(
@@ -232,11 +239,25 @@ class PortfolioMonitor(Actor):
         if spx:
             book = build_book(self.cache, self.greeks, legs, self._betas, spx, today)
             self._risk(f, legs, book, today)
-            self._proposals(f, legs, book, spx)
+            self._proposals(f, legs, book, spx, today)
             self._actions(f, legs, book, today)
             if daily:
                 self._attribution(f, legs, book, daily, spx, today)
-        f.set("orders_open", "Open orders", len(self.cache.orders_open()))
+        if orders is None:  # no side connection: the orders this node knows
+            f.set("orders_open", "Open orders", len(self.cache.orders_open()))
+        else:
+            f.set("orders_open", "Open orders", len(orders))
+            for o in orders:
+                labels = {k: o[k] for k in ("id", "order", "type", "status", "client")}
+                for field in ("qty", "limit", "filled"):
+                    if o[field] is not None:
+                        f.set(
+                            "open_order",
+                            "Open orders at IB",
+                            o[field],
+                            field=field,
+                            **labels,
+                        )
         f.set("last_update_timestamp_seconds", "Last refresh", self.clock.timestamp())
         self._snapshot.families = list(f.by_name.values())
 
@@ -295,6 +316,14 @@ class PortfolioMonitor(Actor):
             f.set("position_stripe", "0/1, alternating per symbol", stripe, **labels)
             f.set("position_quantity", "Signed contracts or shares", leg.qty, **labels)
             f.set("position_avg_price", "Cost basis per share", leg.avg_px, **labels)
+            f.set(
+                "position_breakeven",
+                "Underlying price at expiry with no P&L (this leg alone; stock: cost)",
+                breakeven(leg.right, leg.strike, leg.avg_px)
+                if leg.is_option
+                else leg.avg_px,
+                **labels,
+            )
             if leg.mid is None:
                 continue
             size = leg.qty * leg.multiplier
@@ -372,6 +401,22 @@ class PortfolioMonitor(Actor):
             f.set("symbol_theta", "Theta ($/day)", r.theta, symbol=s)
             f.set("symbol_vega", "Vega ($ per vol point)", r.vega, symbol=s)
             f.set("symbol_volga", "Volga (vega $ per vol point)", r.volga, symbol=s)
+            # delta hedging this symbol on a typical day of its own (last month's
+            # realized move; at its implied vol the carry would be ~0 by pricing)
+            move = realized_move(self._closes.get(underlying_id(s), {}))
+            if move is None:
+                move = abs(r.beta) * day
+            hedge = gamma_pnl(r.gamma, r.price, move)
+            f.set("symbol_daily_move", "Typical daily move (fraction)", move, symbol=s)
+            f.set(
+                "symbol_gamma_pnl", "Gamma P&L of delta hedging, a day", hedge, symbol=s
+            )
+            f.set(
+                "symbol_net_carry",
+                "Theta + gamma P&L, a day",
+                r.theta + hedge,
+                symbol=s,
+            )
         alert = self.config.long_option_alert_delta
         alerts = 0
         for leg in legs:
@@ -411,6 +456,17 @@ class PortfolioMonitor(Actor):
             self._extras.close()  # reconnect next refresh
             return {}, {}
 
+    async def _read_orders(self) -> list[dict[str, Any]] | None:
+        """Every open order at IB, from any client; None without the side
+        connection (or when it fails)."""
+        if self._extras is None or not self._extras.ib.isConnected():
+            return None
+        try:
+            return await self._extras.open_orders()
+        except Exception as e:  # noqa: BLE001 - only the order list is lost
+            self.log.warning(f"Open orders unavailable: {e!r}")
+            return None
+
     def _summary(self, f: _Families, legs: list[Leg]) -> None:
         """Positions summary: shares, option counts and average strikes."""
         by_symbol: dict[str, list[Leg]] = {}
@@ -446,9 +502,12 @@ class PortfolioMonitor(Actor):
         sym = self._rules.symbols.get(symbol) if self._rules else None
         return bool(sym and sym.no_trading)
 
-    def _proposals(self, f: _Families, legs: list[Leg], book: Book, spx: float) -> None:
+    def _proposals(
+        self, f: _Families, legs: list[Leg], book: Book, spx: float, today: date
+    ) -> None:
         """SPX delta = 0 targets per symbol and the trade toward them (display
-        only, as in the old positions summary), and the greeks after them."""
+        only, as in the old positions summary), and the greeks and P&L curves
+        after them."""
         unit = contract_units(legs, book, spx)
         plain_now = {s: r.plain_dollars for s, r in book.by_symbol.items()}
         betas = {s: r.beta for s, r in book.by_symbol.items()}
@@ -505,12 +564,13 @@ class PortfolioMonitor(Actor):
                 side_target=side_target,
                 trade=trade,
             )
-        # the resize plan, with the same guards as its orders (place_target_orders):
+        # the resize plan (the strategy's trade plan), with the same guards as its orders:
         # rows for the Trade plan table, and "after resizing held" in the greeks
         skip = {s for s in book.by_symbol if is_index(s) or self._no_trading(s)}
         busy = symbols_with_open_orders(self.cache)
-        active = bool(self._rules and self._rules.place_target_orders)
-        for p in target_plan(self.cache, legs, book, spx, skip, busy):
+        active = bool(self._rules and self._rules.approve_trades == "auto")
+        planned = target_plan(self.cache, legs, book, spx, skip, busy)
+        for p in planned:
             f.set(
                 "target_plan_units",
                 "Resize plan per symbol: units (contracts, spreads or shares)",
@@ -560,6 +620,31 @@ class PortfolioMonitor(Actor):
                     value,
                     greek=greek,
                     scenario=scenario,
+                )
+        added = [leg for p in planned if p.qty for leg in proposal_legs(self.cache, p)]
+        resized = build_book(
+            self.cache, self.greeks, legs + added, self._betas, spx, today
+        )
+        vix = price(self.cache, VIX)
+        for scenario, held, b in (
+            ("now", legs, book),
+            ("resized", legs + added, resized),
+        ):
+            for level, pnl in curve(self.cache, held, b, today).items():
+                f.set(
+                    "pnl_curve",
+                    "Theoretical P&L at an SPX price (beta-weighted, options at current IV)",
+                    pnl,
+                    scenario=scenario,
+                    spx=f"{level:.0f}",
+                )
+            for level, pnl in vix_curve(self.cache, held, b, vix, today).items():
+                f.set(
+                    "vix_pnl_curve",
+                    "Theoretical P&L at a VIX level (SPX unchanged, every IV shifted)",
+                    pnl,
+                    scenario=scenario,
+                    vix=f"{level:.2f}",
                 )
 
     def _actions(self, f: _Families, legs: list[Leg], book: Book, today: date) -> None:
@@ -612,6 +697,7 @@ class PortfolioMonitor(Actor):
                     ("dte", a.dte),
                     ("pnl_ratio", a.pnl),
                     ("delta", None if spread else label_delta.get(a.name)),
+                    ("breakeven", a.breakeven),
                 ):
                     if value is not None:
                         f.set(

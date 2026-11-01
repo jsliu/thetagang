@@ -140,18 +140,15 @@ class DiscretionaryConfig(StrategyConfig, frozen=True):
     quote_timeout_secs: float = 10.0
     roll_target: TargetConfig = TargetConfig()
     roll_when: RollWhenConfig = RollWhenConfig()
-    trades: list[TradeConfig] = []
     vix_call_hedge: VixHedgeConfig = VixHedgeConfig()
     symbols: dict[str, SymbolConfig] = {}
     # --role trade only: the trading process's own metrics (orders, dry_run, trade plan)
     metrics_port: int = 9465
-    # "auto": open the [[strategy.trades]] when off SPX delta neutral; "manual":
-    # only show the plan, and open trades with `thetagang-nt pretrade`
+    # the trade plan resizes what is held toward the positions summary's SPX
+    # delta 0 targets (shares, one option, or a whole vertical per symbol).
+    # "auto": place it when off SPX delta neutral; "manual": only show it, and
+    # trade with `thetagang-nt pretrade`
     approve_trades: str = "auto"
-    # the trade plan's way to SPX delta 0: false = open the [[strategy.trades]];
-    # true = resize what is held toward the positions summary's targets (shares,
-    # one option, or a whole vertical per symbol). One or the other, not both.
-    place_target_orders: bool = False
     pretrade_metrics_port: int = 9466  # the pre-trade dashboard, while it asks
     proposal_max_age_secs: int = 300  # a confirmation later than this sends nothing
 
@@ -159,11 +156,6 @@ class DiscretionaryConfig(StrategyConfig, frozen=True):
         if self.approve_trades not in ("auto", "manual"):
             raise ValueError(
                 f"approve_trades must be auto or manual, not {self.approve_trades!r}"
-            )
-        if self.place_target_orders and self.trades:
-            raise ValueError(
-                "use either [[strategy.trades]] or place_target_orders, not both: "
-                "each hedges the whole SPX delta on its own"
             )
 
 
@@ -197,7 +189,7 @@ class NodeConfig(NautilusConfig, frozen=True):
 
 class CandidateConfig(NautilusConfig, frozen=True):
     """One idea for `thetagang-nt pretrade` to compare: its trades are sized
-    together to bring SPX delta to 0, like the [[strategy.trades]]."""
+    together to bring SPX delta to 0."""
 
     name: str
     trades: list[TradeConfig] = []

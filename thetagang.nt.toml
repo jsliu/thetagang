@@ -45,14 +45,11 @@ market_hours_only = true
 delta_band_theta_days = 2.0
 # capped at this share of net liq
 delta_band_nav_pct = 0.10
-# "auto": open the [[strategy.trades]] when off neutral; "manual": only show the
-# plan, and open trades with `thetagang-nt pretrade` (deploy/pretrade.sh)
+# The trade plan resizes held positions toward the dashboard's "SPX delta = 0
+# targets" (shares, one option, or a whole vertical per symbol; never adds short
+# options). "auto": place it when off neutral; "manual": only show it, and trade
+# with `thetagang-nt pretrade` (deploy/pretrade.sh)
 approve_trades = "auto"
-# the trade plan's way to SPX delta 0: false = open the [[strategy.trades]] below;
-# true = resize held positions toward the dashboard's "SPX delta = 0 targets"
-# (shares, one option, or a whole vertical per symbol; never adds short options).
-# One or the other: with true, remove the [[strategy.trades]].
-place_target_orders = false
 pretrade_metrics_port = 9466  # the Pre-trade dashboard, while pretrade asks y/N
 proposal_max_age_secs = 300   # answering later than this sends nothing
 minimum_credit = 0.0
@@ -84,17 +81,6 @@ close_if_unable_to_roll = true  # needs max_dte
   itm = true
   always_when_itm = false
   credit_only = false
-
-# Trades opened to bring SPX delta to 0. structure: long_call, short_call,
-# long_put, short_put, put_credit_spread, call_credit_spread, put_debit_spread,
-# call_debit_spread (spreads need width).
-[[strategy.trades]]
-symbol = "SPY"
-structure = "put_debit_spread"
-width = 10.0
-delta = 0.5
-dte = 60
-max_contracts = 5
 
 [strategy.vix_call_hedge]
 enabled = false
@@ -133,7 +119,9 @@ weight = 0.0
 #                                  # delta when sizing the trade plan, instead of blocking it
 
 # Ideas for `thetagang-nt pretrade` (deploy/pretrade.sh) to compare: each candidate's
-# trades are sized together to bring SPX delta to 0 (same keys as [[strategy.trades]]),
+# trades are sized together to bring SPX delta to 0 (structure: long_call,
+# short_call, long_put, short_put, put_credit_spread, call_credit_spread,
+# put_debit_spread, call_debit_spread; spreads need width),
 # each candidate on its own; pretrade shows them side by side and sends the one you
 # pick. Without candidates, pretrade proposes the strategy's own trade plan.
 # The trading strategy also compares them every refresh_mins (market hours), so the

@@ -328,6 +328,15 @@ def compute_beta(
     return float(np.cov(a, b)[0][1] / np.var(b, ddof=1))
 
 
+def realized_move(closes: dict[Any, float], days: int = 21) -> float | None:
+    """The typical (one standard deviation) daily move, a fraction, over the last
+    `days` daily log returns; None with fewer closes."""
+    recent = [closes[d] for d in sorted(closes)][-(days + 1) :]
+    if len(recent) < days + 1:
+        return None
+    return float(np.std(np.diff(np.log(recent)), ddof=1))
+
+
 TYPICAL_SPX_DAY = 0.01  # a typical daily SPX move
 DRIFT_BANDS = 2.0  # beyond this many bands: too far from neutral
 NEUTRALITY = ("neutral", "drifting", "off neutral")
@@ -721,6 +730,21 @@ class Action:
     take_profit: float | None
     take_profit_side: str  # "buy <=" (shorts, credit) or "sell >=" (debit)
     action: str
+    breakeven: float | None = None  # underlying price at expiry with no P&L
+
+
+def breakeven(right: str, strike: float, premium: float) -> float:
+    """Underlying price at expiry where one option leg makes nothing, long or
+    short: the strike plus (call) or minus (put) the premium per share."""
+    return strike + premium if right == "C" else strike - premium
+
+
+def vertical_breakeven(short: Leg, long: Leg) -> float:
+    """A vertical's breakeven at expiry: the lower strike plus the net premium
+    (calls), the higher strike minus it (puts), debit or credit alike."""
+    net = abs(short.avg_px - long.avg_px)
+    low, high = sorted((short.strike, long.strike))
+    return low + net if short.right == "C" else high - net
 
 
 def position_actions(
@@ -786,6 +810,7 @@ def position_actions(
                     target,
                     "sell >=",
                     action,
+                    vertical_breakeven(short, long),
                 )
             )
         else:
@@ -804,6 +829,7 @@ def position_actions(
                     tp,
                     "buy <=",
                     decide(short.right, short.strike, dte, pnl),
+                    vertical_breakeven(short, long),
                 )
             )
     for leg in unpaired:
@@ -842,6 +868,7 @@ def position_actions(
                     tp,
                     "buy <=",
                     decide(leg.right, leg.strike, dte, pnl),
+                    breakeven(leg.right, leg.strike, leg.avg_px),
                 )
             )
         else:
@@ -866,6 +893,7 @@ def position_actions(
                     f"roll or close by hand (|delta| >= {alert_delta:g})"
                     if alert
                     else "hold",
+                    breakeven(leg.right, leg.strike, leg.avg_px),
                 )
             )
     return out

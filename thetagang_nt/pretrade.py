@@ -5,7 +5,7 @@ What it proposes, first that applies:
 - ad-hoc TRADEs typed on the command line (rules.parse_trade: "sell 2 AA
   20261218 40P"), as one scenario;
 - each [[pretrade.candidates]] entry, sized on its own to bring SPX delta to 0
-  like the [[strategy.trades]]: alternatives to compare, you pick one;
+  alternatives to compare, you pick one;
 - the strategy's own trade plan (new trades, or the resizes of what you hold).
 Every "after" number comes from the same build_book / stress_pnl the monitor
 uses, run on the held legs plus the proposed ones. It prints now vs each
@@ -38,12 +38,13 @@ from thetagang_nt.portfolio import (
     ComboLegs,
     build_book,
     held_legs,
-    leg_of,
     net_liquidation,
     order_cost,
     order_text,
+    curve,
     price,
-    vix_pnl,
+    proposal_legs,
+    vix_curve,
     stock_contract,
     stress_pnl,
     underlying_id,
@@ -77,14 +78,12 @@ CURVE = Gauge(
     "options repriced at current IV)",
     ["scenario", "spx"],
 )
-CURVE_MOVES = tuple(i / 100 for i in range(-10, 11))  # SPX -10% .. +10%, 1% apart
 VIX_CURVE = Gauge(
     "thetagang_pretrade_vix_curve",
     "Theoretical P&L of each scenario's portfolio at a VIX level (SPX unchanged, "
     "every IV shifted by the VIX change)",
     ["scenario", "vix"],
 )
-VIX_MOVES = tuple(range(-10, 21))  # VIX points: -10 .. +20, floored at 9
 STATUS = Gauge("thetagang_pretrade_status", "Where the proposal stands", ["status"])
 CHOICE = Gauge(
     "thetagang_pretrade_choice",
@@ -286,8 +285,7 @@ class PreTrade(Discretionary):
                 self, cfg.candidates, book, spx, betas, today, busy
             )
         planned = await self._plan(legs, book, spx, betas, today, busy)
-        mode = "resize held" if cfg.place_target_orders else "strategy trades"
-        return {mode: [as_proposal(p) for p in planned]}
+        return {"resize held": [as_proposal(p) for p in planned]}
 
     def _check_greeks(self, book: Book) -> None:
         blocking = self._blocking_missing(book)
@@ -405,16 +403,6 @@ def rows(now: dict[str, float]) -> list[tuple[str, str, str]]:
     return MEASURES + stress + [("Cost (+ pay, - receive)", "cost", "${:+,.0f}")]
 
 
-def proposal_legs(cache: Any, p: Proposal) -> list[Leg]:
-    """A proposal as positions, at mid (so no P&L yet)."""
-    out = []
-    for iid, ratio in p.combo:
-        leg = leg_of(cache, iid, p.qty * ratio, price(cache, iid) or 0.0)
-        if leg is not None:
-            out.append(leg)
-    return out
-
-
 def compare(
     st: Any,
     legs: list[Leg],
@@ -443,27 +431,6 @@ def compare(
             for p in sendable(proposals)
         )
     return now, afters
-
-
-def curve(cache: Any, legs: list[Leg], book: Book, today: date) -> dict[float, float]:
-    """{SPX price: theoretical P&L} for CURVE_MOVES (the stress model)."""
-    return {
-        round(book.spx * (1 + m), 2): stress_pnl(cache, legs, book, m, True, today)
-        for m in CURVE_MOVES
-    }
-
-
-def vix_curve(
-    cache: Any, legs: list[Leg], book: Book, vix: float | None, today: date
-) -> dict[float, float]:
-    """{VIX level: theoretical P&L} for VIX_MOVES; empty without a VIX price."""
-    if not vix:
-        return {}
-    return {
-        round(vix + d, 2): vix_pnl(cache, legs, book, d, today)
-        for d in VIX_MOVES
-        if vix + d >= 9
-    }
 
 
 def publish(

@@ -10,6 +10,7 @@ import math
 from collections import defaultdict
 from dataclasses import dataclass, field
 from datetime import date
+from typing import Any
 
 from nautilus_trader.cache.cache import Cache
 from nautilus_trader.core.nautilus_pyo3 import (
@@ -371,7 +372,7 @@ def target_plan(
     skip: set[str],
     busy: set[str],
 ) -> list[Planned]:
-    """The resize plan (place_target_orders): one order per symbol toward its SPX
+    """The resize plan (the strategy's trade plan): one order per symbol toward its SPX
     delta = 0 target, priced at the legs' mid. Never adds short options (no margin
     check), never touches symbols in `skip` or with open orders (`busy`)."""
     unit = contract_units(legs, book, spx)
@@ -487,3 +488,39 @@ def vix_pnl(
         )
         total += leg.qty * leg.multiplier * (moved - now)
     return total
+
+
+CURVE_MOVES = tuple(i / 100 for i in range(-10, 11))  # SPX -10% .. +10%, 1% apart
+VIX_MOVES = tuple(range(-10, 21))  # VIX points: -10 .. +20, floored at 9
+
+
+def curve(cache: Cache, legs: list[Leg], book: Book, today: date) -> dict[float, float]:
+    """{SPX price: theoretical P&L} for CURVE_MOVES (the stress model)."""
+    return {
+        round(book.spx * (1 + m), 2): stress_pnl(cache, legs, book, m, True, today)
+        for m in CURVE_MOVES
+    }
+
+
+def vix_curve(
+    cache: Cache, legs: list[Leg], book: Book, vix: float | None, today: date
+) -> dict[float, float]:
+    """{VIX level: theoretical P&L} for VIX_MOVES; empty without a VIX price."""
+    if not vix:
+        return {}
+    return {
+        round(vix + d, 2): vix_pnl(cache, legs, book, d, today)
+        for d in VIX_MOVES
+        if vix + d >= 9
+    }
+
+
+def proposal_legs(cache: Cache, p: Any) -> list[Leg]:
+    """A proposal or planned order (anything with .combo and .qty) as positions,
+    at mid (so no P&L yet)."""
+    out = []
+    for iid, ratio in p.combo:
+        leg = leg_of(cache, iid, p.qty * ratio, price(cache, iid) or 0.0)
+        if leg is not None:
+            out.append(leg)
+    return out

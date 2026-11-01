@@ -55,8 +55,6 @@ from thetagang_nt.portfolio import (
     legs_of,
     net_liquidation,
     option_greeks,
-    order_cost,
-    order_text,
     price,
     stock_contract,
     symbols_with_open_orders,
@@ -97,28 +95,8 @@ LAST_RUN = Gauge(
 )
 # config the alert rules need (Prometheus can't read the TOML)
 DRY_RUN = Gauge("thetagang_strategy_dry_run", "1 while orders are only logged")
-# the trade plan, for the dashboard (the old "Discretionary trades" table)
-PLAN = Gauge(
-    "thetagang_plan_units",
-    "Contracts (spreads: spreads) the plan opens per configured trade",
-    ["trade", "contracts", "note"],
-)
-PLAN_UNIT = Gauge(
-    "thetagang_plan_unit_spx_delta", "SPX delta added per unit", ["trade"]
-)
-PLAN_PRICE = Gauge("thetagang_plan_price", "Net mid per unit", ["trade"])
-PLAN_COST = Gauge(
-    "thetagang_plan_cost", "Units x net mid x multiplier (+ debit, - credit)", ["trade"]
-)
+# the resize plan's rows and greeks come from the monitor (same rules)
 PLAN_STATUS = Gauge("thetagang_plan_status", "Why the plan is what it is", ["status"])
-# what the new-trades plan adds, not the result: the dashboard adds it to the
-# monitor's "now", so both columns share one clock (0 contracts change nothing).
-# The resize plan's rows and greeks come from the monitor (same rules).
-CHANGE = Gauge(
-    "thetagang_plan_greeks_change",
-    "Portfolio greeks the planned trades add (SPX beta-weighted)",
-    ["greek"],
-)
 
 
 def plan_status(status: str) -> None:
@@ -261,8 +239,6 @@ class Discretionary(Strategy):
             acted |= await self._vix_hedge(legs, today, busy)
         except Exception as e:  # noqa: BLE001
             self.log.error(f"VIX hedge failed: {e!r}")
-        if not (self.config.trades or self.config.place_target_orders):
-            return
         if acted:
             self.log.warning("Rolls/closes this run change SPX delta: new trades wait")
             plan_status("rolls/closes this run: new trades wait")
@@ -611,15 +587,10 @@ class Discretionary(Strategy):
         )
         return True
 
-    # ---------------------------------------------------------- new trades
+    # ---------------------------------------------------------- trade plan
 
     async def _open_trades(self, legs: list[Leg], today: date, busy: set[str]) -> None:
         cfg = self.config
-        PLAN.clear()
-        PLAN_UNIT.clear()
-        PLAN_PRICE.clear()
-        PLAN_COST.clear()
-        CHANGE.clear()
         spx = price(self.cache, SPX)
         if not spx:
             self.log.warning("No SPX price: no new trades")
@@ -658,43 +629,18 @@ class Discretionary(Strategy):
             plan_status(msg)
             return
         planned = await self._plan(legs, book, spx, betas, today, busy)
-        after = {
-            "beta_delta_dollars": book.beta_dollars,
-            "delta_dollars": book.plain_dollars,
-            "gamma": book.gamma,
-            "theta": book.theta,
-            "vega": book.vega,
-            "volga": book.volga,
-        }
-        change = dict.fromkeys(after, 0.0)
-        for p in planned:
-            for greek, value in p.add.items():
-                after[greek] += value
-                change[greek] += value
-        if not cfg.place_target_orders:  # the resize plan's rows come from the monitor
-            for p in planned:
-                order = order_text(self.cache, p.combo, p.qty) or "-"
-                PLAN.labels(trade=p.name, contracts=order, note=p.note).set(p.qty)
-                if p.spx_per_unit is not None:
-                    PLAN_UNIT.labels(trade=p.name).set(p.spx_per_unit)
-                if p.price is not None:
-                    PLAN_PRICE.labels(trade=p.name).set(p.price)
-                    cost = order_cost(self.cache, p.combo, p.qty, p.price)
-                    PLAN_COST.labels(trade=p.name).set(cost)
-            CHANGE.labels(greek="spx_delta").set(change["beta_delta_dollars"] / spx)
-            for greek, value in change.items():
-                CHANGE.labels(greek=greek).set(value)
+        after = book.spx_delta + sum(p.add["beta_delta_dollars"] for p in planned) / spx
         manual = cfg.approve_trades == "manual"
-        mode = "resize held positions" if cfg.place_target_orders else "new trades"
         plan_status(
-            f"{mode}: SPX delta {now:+.2f} -> {after['beta_delta_dollars'] / spx:+.2f}"
+            f"resize held positions: SPX delta {now:+.2f} -> {after:+.2f}"
             + (": awaiting approval (thetagang-nt pretrade)" if manual else "")
         )
-        action = "resize to target" if cfg.place_target_orders else "open trade"
         for p in planned:
             self.log.info(f"{p.name}: {p.qty} unit(s). {p.note}")
             if p.qty and p.price is not None and not manual:
-                await self._submit(p.symbol, action, p.combo, p.qty, p.price)
+                await self._submit(
+                    p.symbol, "resize to target", p.combo, p.qty, p.price
+                )
 
     async def _plan(
         self,
@@ -705,12 +651,9 @@ class Discretionary(Strategy):
         today: date,
         busy: set[str],
     ) -> list[Planned]:
-        """The trade plan toward SPX delta 0: the [[strategy.trades]], sized
-        together, or with place_target_orders the held positions resized toward
+        """The trade plan toward SPX delta 0: the held positions resized toward
         the positions summary's targets."""
-        if self.config.place_target_orders:
-            return self._target_plan(legs, book, spx, busy)
-        return await self._new_trades(self.config.trades, book, spx, betas, today, busy)
+        return self._target_plan(legs, book, spx, busy)
 
     async def _new_trades(
         self,
@@ -722,7 +665,7 @@ class Discretionary(Strategy):
         busy: set[str],
     ) -> list[Planned]:
         """`trades` priced and sized together to bring SPX delta to 0, as orders
-        (the [[strategy.trades]], or one pretrade candidate)."""
+        (one pretrade candidate)."""
         out = []
         sized = await self._size_trades(spx, betas, book.spx_delta, today, busy, trades)
         for t, plan, combo, combo_price, unit in sized:
@@ -753,13 +696,13 @@ class Discretionary(Strategy):
         now: float,
         today: date,
         busy: set[str],
-        trades: list[TradeConfig] | None = None,
+        trades: list[TradeConfig],
     ) -> list[tuple[TradeConfig, Plan, ComboLegs, float, dict[str, float]]]:
-        """Price each trade ([[strategy.trades]] by default) and size them together
+        """Price each trade and size them together
         so SPX delta `now` goes to 0: (trade, plan, combo legs, price, greeks per
         unit)."""
         plans: list[tuple[TradeConfig, Plan, ComboLegs, float, dict[str, float]]] = []
-        for t in self.config.trades if trades is None else trades:
+        for t in trades:
             plan, combo, combo_price, unit = (
                 Plan(t.weight, t.max_contracts),
                 [],

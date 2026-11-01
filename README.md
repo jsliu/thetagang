@@ -69,19 +69,15 @@ through the account symbol by symbol:
    `close_hedges_when_vix_exceeds`. With no hedge held, it buys calls near
    `delta` and `target_dte` for `weight` × net liquidation, taking the
    weight from the first allocation band containing VIXMO.
-4. **The trade plan** brings the account's SPX delta to 0 in one of two ways,
-   chosen in the config (one or the other, not both):
-   - **new trades** (default): the `[[strategy.trades]]` are sized together,
-     split by `weight`, in whole contracts, never in the wrong direction, and
-     capped by `max_contracts`;
-   - **resizing what you hold** (`place_target_orders = true`): each symbol
-     moves toward its "SPX Δ=0 target" from the positions summary, by trading
-     shares, one option, or a whole vertical as one combo, never flipping a
-     position. A resize that would add short options (sell more of a short
-     option or open credit spreads) isn't placed, since nothing checks margin
-     for it; the plan shows it as "by hand". Index options are left alone.
+4. **The trade plan** brings the account's SPX delta to 0 by resizing what
+   you hold: each symbol moves toward its "SPX Δ=0 target" from the positions
+   summary, by trading shares, one option, or a whole vertical as one combo,
+   never flipping a position. A resize that would add short options (sell more
+   of a short option or open credit spreads) isn't placed, since nothing checks
+   margin for it; the plan shows it as "by hand". Index options are left alone.
+   New positions are opened with [`pretrade`](#pre-trade-preview-trades-then-send-them).
 
-   Either way the plan waits
+   The plan waits
    when anything was rolled or closed in the same run, while the account is
    SPX delta neutral, and while any position has no greeks. An option with no
    quote at IB (an illiquid strike) has no greeks and so blocks the plan every
@@ -203,7 +199,7 @@ Send (DRY RUN) these 1 order(s)? [y/N]
 ```
 
 **Candidates.** List ideas to compare under `[[pretrade.candidates]]`, each a
-name and one or more trades in the `[[strategy.trades]]` format:
+name and one or more trades:
 
 ```toml
 [[pretrade.candidates]]
@@ -222,8 +218,8 @@ together, split by `weight`). `./pretrade.sh` then shows every candidate's
 orders and cost, and a table with **Now** and the portfolio after each
 candidate: SPX delta, beta delta $, neutrality, theta, vega, volga, gamma P&L,
 net carry, stress for each SPX move. It asks which one to send
-(`1`, `2`, … or Enter for none). The candidates never change what the strategy
-trades; it keeps to `[[strategy.trades]]`.
+(`1`, `2`, … or `0`/Enter for no trade). The candidates never change what the
+strategy trades; it only resizes what you hold.
 
 The **thetagang pre-trade** dashboard always shows the comparison: the trading
 strategy re-sizes and compares the candidates every `refresh_mins` (15) during
@@ -235,8 +231,8 @@ Each ad-hoc trade is `buy|sell QTY SYMBOL [YYYYMMDD STRIKE(C|P)[/STRIKE(C|P)]]`.
 QTY is shares for stock and contracts (or spreads) for options. A spread goes
 out as one IB combo order: its first strike is bought on a `buy` and sold on a
 `sell`, the second the other way. Without arguments it proposes your
-candidates, or without any the strategy's trade plan (new trades, or with
-`place_target_orders` the resizes of what you hold); sizing needs greeks for
+candidates, or without any the strategy's trade plan (the resizes of what you
+hold); sizing needs greeks for
 every position, so run it during market hours.
 
 On `y`, the trades are re-priced at the mid of that moment and sent through the
@@ -279,10 +275,8 @@ lists every key with a comment.
 | `[strategy]` | `dry_run`, run interval, `market_hours_only`, `delta_band_theta_days`, `delta_band_nav_pct`, `approve_trades` (`auto`/`manual`), `pretrade_metrics_port`, `proposal_max_age_secs`, `minimum_credit`, debit-spread take-profit and maximum roll debit, `reprice_after_secs`, `chain_strikes`, `chain_expirations`, quote timeout |
 | `[strategy.roll_target]` | what a roll moves into: `dte`, `max_dte`, `delta` |
 | `[strategy.roll_when]` | `pnl`, `dte`, `min_pnl`, `max_dte`, `close_at_pnl`, `close_if_unable_to_roll`; `.calls` and `.puts` set `itm`, `always_when_itm`, `credit_only` |
-| `place_target_orders` (in `[strategy]`) | `true`: the trade plan resizes held positions toward their SPX Δ=0 targets instead of opening `[[strategy.trades]]` (use one or the other) |
-| `[[strategy.trades]]` | `symbol`, `structure` (`long_call`, `short_call`, `long_put`, `short_put`, `put_credit_spread`, `call_credit_spread`, `put_debit_spread`, `call_debit_spread`), `delta`, `dte`, `width` (spreads only), `weight`, `max_contracts` |
 | `[strategy.vix_call_hedge]` | `enabled`, `delta`, `target_dte`, `close_hedges_when_vix_exceeds`, `ignore_dte`, and `[[…allocation]]` bands (`lower_bound` ≤ VIXMO < `upper_bound`, first match wins, `weight` × net liquidation) |
-| `[[pretrade.candidates]]` | `name`, and `[[pretrade.candidates.trades]]` as in `[[strategy.trades]]`: ideas `pretrade` sizes and compares |
+| `[[pretrade.candidates]]` | `name`, and `[[pretrade.candidates.trades]]`: `symbol`, `structure` (`long_call`, `short_call`, `long_put`, `short_put`, `put_credit_spread`, `call_credit_spread`, `put_debit_spread`, `call_debit_spread`), `delta`, `dte`, `width` (spreads only), `weight`, `max_contracts`: ideas `pretrade` sizes and compares |
 | `[strategy.symbols.<SYM>]` | `no_trading`, `put_strike_limit`, `call_strike_limit`, `delta`, `max_dte`, `ignore_missing_greeks` |
 
 Remove the whole `[strategy]` section to run the monitor only. The roll,
@@ -346,7 +340,9 @@ add your own panels.
   doesn't provide open interest.
 - **VIX allocation bands** match strictly `lower_bound` ≤ VIXMO <
   `upper_bound`, and a hedge close sells only long VIX calls.
-- **Not ported:** `place_target_orders`. No orders are cancelled at startup;
+- **The trade plan only resizes what you hold** (the old `place_target_orders`);
+  there is no `[[strategy.trades]]`: open new positions with `pretrade`.
+  No orders are cancelled at startup;
   the open-order check per symbol prevents duplicates instead.
 
 ### Troubleshooting

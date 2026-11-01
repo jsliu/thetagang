@@ -472,20 +472,6 @@ def test_target_orders_point_the_right_way_and_never_add_shorts() -> None:
     assert more.combo == (("P30", -1), ("P25", 1))  # sell the short, buy the long
 
 
-def test_place_target_orders_or_trades_not_both() -> None:
-    pytest.importorskip("nautilus_trader")
-    import msgspec
-
-    from thetagang_nt.config import DiscretionaryConfig
-
-    trade = {"symbol": "AA", "structure": "short_put"}
-    assert msgspec.convert({"place_target_orders": True}, DiscretionaryConfig)
-    with pytest.raises(msgspec.ValidationError, match="not both"):
-        msgspec.convert(
-            {"place_target_orders": True, "trades": [trade]}, DiscretionaryConfig
-        )
-
-
 def test_ignore_missing_greeks_exempts_only_those_symbols() -> None:
     from thetagang_nt.rules import blocking_missing
 
@@ -579,7 +565,7 @@ def test_pnl_curve_spans_spx_and_is_zero_today() -> None:
     from datetime import UTC, datetime
 
     from thetagang_nt.portfolio import Book, Greeks, SymbolRisk
-    from thetagang_nt.pretrade import curve
+    from thetagang_nt.portfolio import curve
 
     call = Leg("C40", "AA", "C", 40.0, EXP, 2, 1.0, 2.5)
     greeks = Greeks(0.5, 0.05, -0.02, 0.06, 40.0, 0.35, 2.5)
@@ -605,7 +591,7 @@ def test_vix_curve_is_zero_today_and_long_vega_gains_on_a_spike() -> None:
     from datetime import UTC, datetime
 
     from thetagang_nt.portfolio import Book, Greeks, SymbolRisk
-    from thetagang_nt.pretrade import vix_curve
+    from thetagang_nt.portfolio import vix_curve
 
     call = Leg("C40", "AA", "C", 40.0, EXP, 2, 1.0, 2.5)
     greeks = Greeks(0.5, 0.05, -0.02, 0.06, 40.0, 0.35, 2.5)
@@ -621,3 +607,33 @@ def test_vix_curve_is_zero_today_and_long_vega_gains_on_a_spike() -> None:
     assert points[15.0] == pytest.approx(0.0, abs=1e-9)
     assert points[35.0] > 0 > points[9.0]  # long vega: up the curve to the right
     assert vix_curve(cache, [call], book, None, date(2026, 11, 2)) == {}
+
+
+def test_breakeven_of_a_leg_and_a_vertical() -> None:
+    from thetagang_nt.rules import breakeven, vertical_breakeven
+
+    assert breakeven("C", 100.0, 3.0) == 103.0  # long or short call: strike + premium
+    assert breakeven("P", 100.0, 3.0) == 97.0
+    # put debit spread: buy 40P at 3, sell 35P at 1 -> 2 debit: 40 - 2
+    long_p = Leg("P40", "AA", "P", 40.0, EXP, 1, 3.0, None)
+    short_p = Leg("P35", "AA", "P", 35.0, EXP, -1, 1.0, None)
+    assert vertical_breakeven(short_p, long_p) == 38.0
+    # call credit spread: sell 50C at 2.5, buy 55C at 1 -> 1.5 credit: 50 + 1.5
+    short_c = Leg("C50", "AA", "C", 50.0, EXP, -1, 2.5, None)
+    long_c = Leg("C55", "AA", "C", 55.0, EXP, 1, 1.0, None)
+    assert vertical_breakeven(short_c, long_c) == 51.5
+
+
+def test_realized_move_is_the_stdev_of_recent_daily_returns() -> None:
+    from datetime import timedelta
+
+    from thetagang_nt.rules import realized_move
+
+    start = date(2026, 1, 1)
+    # alternating +1% / -1% days: a typical move of about 1%
+    closes, px = {}, 100.0
+    for i in range(30):
+        closes[start + timedelta(days=i)] = px
+        px *= 1.01 if i % 2 == 0 else 1 / 1.01
+    assert realized_move(closes) == pytest.approx(0.01, rel=0.05)
+    assert realized_move(dict(list(closes.items())[:10])) is None  # too little history
