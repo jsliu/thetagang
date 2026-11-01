@@ -637,3 +637,38 @@ def test_realized_move_is_the_stdev_of_recent_daily_returns() -> None:
         px *= 1.01 if i % 2 == 0 else 1 / 1.01
     assert realized_move(closes) == pytest.approx(0.01, rel=0.05)
     assert realized_move(dict(list(closes.items())[:10])) is None  # too little history
+
+
+def test_orders_placed_elsewhere_block_their_symbols_and_failure_trades_nothing() -> (
+    None
+):
+    pytest.importorskip("nautilus_trader")
+    import asyncio
+
+    from thetagang_nt.ib_extra import AccountExtras
+    from thetagang_nt.strategy import Discretionary
+
+    extras = AccountExtras("127.0.0.1", 7497, 999, None)
+
+    async def tws_orders() -> list[dict]:
+        return [{"symbol": "AXTI"}, {"symbol": "VIX"}, {"symbol": "BRK-B"}]
+
+    extras.open_orders = tws_orders  # type: ignore[method-assign]
+    assert asyncio.run(extras.order_symbols()) >= {"AXTI", "^VIX", "BRK-B"}
+
+    errors: list[str] = []
+    st = SimpleNamespace(
+        _extras=extras, _ib_busy=set(), log=SimpleNamespace(error=errors.append)
+    )
+    assert asyncio.run(Discretionary._load_ib_orders(st)) and "AXTI" in st._ib_busy
+
+    async def down() -> set[str]:
+        raise ConnectionError("TWS gone")
+
+    extras.order_symbols = down  # type: ignore[method-assign]
+    assert not asyncio.run(Discretionary._load_ib_orders(st))  # fail closed
+    assert errors and "nothing traded" in errors[0]
+    st._extras = None
+    assert asyncio.run(
+        Discretionary._load_ib_orders(st)
+    )  # no side connection: own orders only

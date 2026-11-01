@@ -94,7 +94,10 @@ through the account symbol by symbol:
 Rolls and spread closes are sent as one IB combo order (a Nautilus
 `OptionSpread`), priced at the net mid. An order still unfilled after
 `reprice_after_secs` is moved halfway to the current mid, once. A symbol with
-an open order is skipped that run. The strategy leaves alone index options
+an open order at IB is skipped that run, whoever placed it (the strategy,
+pretrade, or you in TWS: read over a read-only side connection, client id
+`ib.client_id` + 100); when those orders can't be read, the run trades nothing.
+The strategy leaves alone index options
 (SPX, NDX, …), calendar and diagonal legs, and symbols with `no_trading`.
 
 Contracts are chosen like this: load the chain for the first

@@ -279,6 +279,8 @@ class PreTrade(Discretionary):
                 "ad hoc": [await self._adhoc(parse_trade(t), today) for t in cfg.adhoc]
             }
         self._check_greeks(book)
+        if not await self._load_ib_orders():
+            raise NoContract("open orders at IB unknown: can't rule out a second order")
         busy = self._symbols_with_open_orders()
         if cfg.candidates:
             return await size_candidates(
@@ -503,6 +505,7 @@ async def refresh(st: Any, candidates: Any) -> None:
         STATUS.clear()
         STATUS.labels(status=f"{stamp}: not compared, no greeks for {names}").set(1)
         return
+    await st._load_ib_orders()  # publishing only: on failure, the last list
     busy = st._symbols_with_open_orders()
     scenarios = await size_candidates(st, candidates, book, spx, betas, today, busy)
     now, afters = compare(st, legs, book, scenarios, betas, spx, today)

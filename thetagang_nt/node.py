@@ -26,12 +26,15 @@ def build(path: str, role: str = "all", adhoc: tuple[str, ...] = ()) -> TradingN
             app, node=msgspec.structs.replace(app.node, log_level="ERROR")
         )
     node = TradingNode(node_config(app, client_id))
+    # the read-only side connection: account extras for the dashboard, and every
+    # open order at IB (TWS's too) so the strategy never doubles one
     extras = None
-    if monitor.publish:  # the read-only side connection, only where metrics are served
+    if monitor.publish or strategy is not None:
         extras = AccountExtras(
             app.ib.host, app.ib.port, client_id + EXTRA_CLIENT_OFFSET, app.ib.account_id
         )
-    node.trader.add_actor(PortfolioMonitor(monitor, rules=app.strategy, extras=extras))
+    shown = extras if monitor.publish else None
+    node.trader.add_actor(PortfolioMonitor(monitor, rules=app.strategy, extras=shown))
     if role == "pretrade":
         from thetagang_nt.pretrade import PreTrade, PreTradeConfig
 
@@ -41,12 +44,14 @@ def build(path: str, role: str = "all", adhoc: tuple[str, ...] = ()) -> TradingN
             candidates=tuple(app.pretrade.candidates),
             stress_moves=app.monitor.stress_moves,
         )
-        node.trader.add_strategy(PreTrade(config))
+        node.trader.add_strategy(PreTrade(config, extras=extras))
         start_http_server(strategy.pretrade_metrics_port, monitor.metrics_addr)
     elif strategy is not None:
         from thetagang_nt.strategy import Discretionary
 
-        node.trader.add_strategy(Discretionary(strategy, pretrade=app.pretrade))
+        node.trader.add_strategy(
+            Discretionary(strategy, pretrade=app.pretrade, extras=extras)
+        )
     if role == "trade":  # the strategy's own metrics; the monitor publishes none here
         start_http_server(strategy.metrics_port, monitor.metrics_addr)
     node.add_data_client_factory(IB, InteractiveBrokersLiveDataClientFactory)

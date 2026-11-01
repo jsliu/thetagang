@@ -8,6 +8,7 @@ failure only leaves these fields out of the dashboard."""
 
 from __future__ import annotations
 
+import asyncio
 import math
 import os
 from typing import Any
@@ -60,14 +61,23 @@ class AccountExtras:
         self.ib = IB()
         self._pnl: dict[int, Any] = {}  # conId -> live PnLSingle subscription
         self._labels: dict[int, str] = {}  # conId -> contract_label, combo legs
+        self._lock = asyncio.Lock()  # --role all: the monitor and strategy share it
+
+    async def connect(self) -> None:
+        async with self._lock:
+            if not self.ib.isConnected():
+                await self.ib.connectAsync(
+                    self.host,
+                    self.port,
+                    clientId=self.client_id,
+                    readonly=True,
+                    timeout=15,
+                )
+                self._pnl = {}
 
     async def read(self) -> tuple[dict[str, float], dict[str, float]]:
         """(account fields, IB daily P&L by position name)."""
-        if not self.ib.isConnected():
-            await self.ib.connectAsync(
-                self.host, self.port, clientId=self.client_id, readonly=True, timeout=15
-            )
-            self._pnl = {}
+        await self.connect()
         account = self.account or self.ib.managedAccounts()[0]
         summary: dict[str, float] = {}
         for v in await self.ib.accountSummaryAsync(account):
@@ -97,7 +107,8 @@ class AccountExtras:
 
     async def open_orders(self) -> list[dict[str, Any]]:
         """Every working order at IB, from any client: what it trades, type,
-        limit, quantity, filled, status. Call after read() (it connects)."""
+        limit, quantity, filled, status."""
+        await self.connect()
         out = []
         for t in await self.ib.reqAllOpenOrdersAsync():
             c, o, s = t.contract, t.order, t.orderStatus
@@ -116,6 +127,7 @@ class AccountExtras:
             out.append(
                 {
                     "order": text,
+                    "symbol": c.symbol.replace(" ", "-"),
                     "type": o.orderType,
                     "status": s.status,
                     "client": str(o.clientId),
@@ -126,6 +138,12 @@ class AccountExtras:
                 }
             )
         return out
+
+    async def order_symbols(self) -> set[str]:
+        """Underlying symbols with a working order at IB, from any client, as the
+        strategy names them (index roots also as "^VIX")."""
+        symbols = {o["symbol"] for o in await self.open_orders()}
+        return symbols | {f"^{s}" for s in symbols}
 
     async def _learn(self, con_ids: Any) -> None:
         unknown = [c for c in con_ids if c not in self._labels]

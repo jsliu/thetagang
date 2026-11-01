@@ -121,9 +121,16 @@ def market_open(now: datetime) -> bool:
 
 class Discretionary(Strategy):
     def __init__(
-        self, config: DiscretionaryConfig, pretrade: PreTradeSectionConfig | None = None
+        self,
+        config: DiscretionaryConfig,
+        pretrade: PreTradeSectionConfig | None = None,
+        extras: Any = None,
     ) -> None:
         super().__init__(config)
+        # a read-only IB connection (ib_extra.AccountExtras) for the orders this
+        # node can't see: TWS's and other clients'. None: only this node's.
+        self._extras = extras
+        self._ib_busy: set[str] = set()
         self.pretrade = (
             pretrade  # [pretrade]: the candidates compared in the background
         )
@@ -156,6 +163,8 @@ class Discretionary(Strategy):
 
     def on_stop(self) -> None:
         self.clock.cancel_timers()
+        if self._extras is not None:
+            self._extras.close()
 
     async def _boot(self) -> None:
         await aio.load_contracts(self, INDEX_CONTRACTS)
@@ -219,6 +228,9 @@ class Discretionary(Strategy):
         ids |= {underlying_id(s) for s in symbols} | {SPX, VIX, VIXMO}
         await aio.wait_for_prices(self, ids, self.config.quote_timeout_secs)
         legs = held_legs(self.cache)
+        if not await self._load_ib_orders():
+            plan_status("open orders at IB unknown: nothing traded this run")
+            return
         busy = self._symbols_with_open_orders()
 
         by_symbol: dict[str, list[Leg]] = defaultdict(list)
@@ -246,7 +258,22 @@ class Discretionary(Strategy):
         await self._open_trades(legs, today, busy)
 
     def _symbols_with_open_orders(self) -> set[str]:
-        return symbols_with_open_orders(self.cache)
+        """Symbols with a working order: this node's, and (from the last
+        _load_ib_orders) any other client's, TWS included."""
+        return symbols_with_open_orders(self.cache) | self._ib_busy
+
+    async def _load_ib_orders(self) -> bool:
+        """Every open order's symbol at IB; False when they can't be read, so a
+        run never sends a second order beside one placed in TWS."""
+        if self._extras is None:
+            return True
+        try:
+            self._ib_busy = await self._extras.order_symbols()
+            return True
+        except Exception as e:  # noqa: BLE001 - fail closed: trade nothing
+            self.log.error(f"Open orders at IB unavailable, nothing traded: {e!r}")
+            self._extras.close()  # reconnect next run
+            return False
 
     def _blocking_missing(self, book: Book) -> list[InstrumentId]:
         """Positions without greeks that stop the plan (ignore_missing_greeks
