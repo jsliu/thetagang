@@ -731,6 +731,22 @@ class Action:
     take_profit_side: str  # "buy <=" (shorts, credit) or "sell >=" (debit)
     action: str
     breakeven: float | None = None  # underlying price at expiry with no P&L
+    pnl_dollars: float | None = None  # unrealized P&L, USD
+    legs: tuple[tuple[str, int], ...] = ()  # a spread's (leg name, +1 long / -1 short)
+
+
+def dollar_pnl(*legs: Leg) -> float | None:
+    """Unrealized P&L in USD of these legs together; None if any has no quote."""
+    if any(leg.mid is None for leg in legs):
+        return None
+    return sum((leg.mid - leg.avg_px) * leg.qty * leg.multiplier for leg in legs)
+
+
+def long_pnl(leg: Leg) -> float | None:
+    """A long option's P&L as a share of the premium paid; None without a quote."""
+    if leg.mid is None or not leg.avg_px:
+        return None
+    return (leg.mid - leg.avg_px) / leg.avg_px
 
 
 def breakeven(right: str, strike: float, premium: float) -> float:
@@ -811,6 +827,8 @@ def position_actions(
                     "sell >=",
                     action,
                     vertical_breakeven(short, long),
+                    dollar_pnl(short, long),
+                    ((option_label(long), 1), (option_label(short), -1)),
                 )
             )
         else:
@@ -830,11 +848,13 @@ def position_actions(
                     "buy <=",
                     decide(short.right, short.strike, dte, pnl),
                     vertical_breakeven(short, long),
+                    dollar_pnl(short, long),
+                    ((option_label(long), 1), (option_label(short), -1)),
                 )
             )
     for leg in unpaired:
         dte = leg.dte(today)
-        if leg.right in mixed:
+        if leg.right in mixed:  # this leg's own figures: the pair has no single one
             out.append(
                 Action(
                     "calendar/diagonal",
@@ -843,10 +863,12 @@ def position_actions(
                     leg.right,
                     leg.qty,
                     dte,
-                    None,
+                    short_pnl(leg) if leg.qty < 0 else long_pnl(leg),
                     None,
                     "",
                     "by hand (calendar/diagonal)",
+                    breakeven(leg.right, leg.strike, leg.avg_px),
+                    dollar_pnl(leg),
                 )
             )
         elif leg.qty < 0:
@@ -869,15 +891,12 @@ def position_actions(
                     "buy <=",
                     decide(leg.right, leg.strike, dte, pnl),
                     breakeven(leg.right, leg.strike, leg.avg_px),
+                    dollar_pnl(leg),
                 )
             )
         else:
             delta = deltas.get(leg.instrument_id)
-            pnl = (
-                (leg.mid - leg.avg_px) / leg.avg_px
-                if leg.mid is not None and leg.avg_px
-                else None
-            )
+            pnl = long_pnl(leg)
             alert = delta is not None and abs(delta) >= alert_delta
             out.append(
                 Action(
@@ -894,6 +913,7 @@ def position_actions(
                     if alert
                     else "hold",
                     breakeven(leg.right, leg.strike, leg.avg_px),
+                    dollar_pnl(leg),
                 )
             )
     return out

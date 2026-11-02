@@ -417,8 +417,6 @@ class PortfolioMonitor(Actor):
                 r.theta + hedge,
                 symbol=s,
             )
-        alert = self.config.long_option_alert_delta
-        alerts = 0
         for leg in legs:
             labels = position_labels(leg)
             if not leg.is_option:  # per share, as IB quotes it: stock delta is 1
@@ -432,8 +430,6 @@ class PortfolioMonitor(Actor):
             f.set("position_theta", "Theta per share ($/day)", g.theta, **labels)
             f.set("position_vega", "Vega per share ($ per vol point)", g.vega, **labels)
             f.set("position_iv", "Implied volatility", g.vol, **labels)
-            alerts += leg.qty > 0 and abs(g.delta) >= alert
-        f.set("long_option_alerts", f"Long options with |delta| >= {alert}", alerts)
         for move in self.config.stress_moves:
             for basis, use_beta in (("beta", True), ("one", False)):
                 f.set(
@@ -659,10 +655,17 @@ class PortfolioMonitor(Actor):
             for x in legs
             if x.instrument_id in deltas
         }
+        alert, alerts = self.config.long_option_alert_delta, 0
         by_symbol: dict[str, list[Leg]] = {}
         for leg in legs:
             if leg.is_option and leg.symbol != VIX_ROOT:
                 by_symbol.setdefault(leg.symbol, []).append(leg)
+
+        def spread_delta(a: Any) -> float | None:  # per spread, as held
+            if not all(name in label_delta for name, _ in a.legs):
+                return None
+            return sum(sign * label_delta[name] for name, sign in a.legs)
+
         for s, items in by_symbol.items():
             und = price(self.cache, underlying_id(s))
             for a in position_actions(
@@ -675,6 +678,16 @@ class PortfolioMonitor(Actor):
                 today,
                 self._no_trading(s),
             ):
+                if a.action.startswith("roll or close by hand"):  # a standalone long
+                    alerts += 1
+                    f.set(
+                        "long_option_alert",
+                        "Delta of a standalone long option at or past the alert level",
+                        label_delta.get(a.name, 0.0),
+                        instrument=a.name,
+                        qty=f"{a.qty:g}",
+                        threshold=f"{alert:.2f}",
+                    )
                 spread = a.kind.endswith("spread")
                 table = "spreads" if spread else ("calls" if a.right == "C" else "puts")
                 if spread:
@@ -696,8 +709,9 @@ class PortfolioMonitor(Actor):
                     ("qty", abs(a.qty)),
                     ("dte", a.dte),
                     ("pnl_ratio", a.pnl),
-                    ("delta", None if spread else label_delta.get(a.name)),
+                    ("delta", spread_delta(a) if spread else label_delta.get(a.name)),
                     ("breakeven", a.breakeven),
+                    ("pnl_dollars", a.pnl_dollars),
                 ):
                     if value is not None:
                         f.set(
@@ -708,6 +722,11 @@ class PortfolioMonitor(Actor):
                             table=table,
                             field=field,
                         )
+        f.set(
+            "long_option_alerts",
+            f"Standalone long options with |delta| >= {alert}",
+            alerts,
+        )
         if rules is None:
             return
         cfg = rules.vix_call_hedge

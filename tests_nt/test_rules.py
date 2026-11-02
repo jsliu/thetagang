@@ -672,3 +672,35 @@ def test_orders_placed_elsewhere_block_their_symbols_and_failure_trades_nothing(
     assert asyncio.run(
         Discretionary._load_ib_orders(st)
     )  # no side connection: own orders only
+
+
+def test_calendar_legs_get_their_own_pnl_and_breakeven() -> None:
+    from datetime import timedelta
+
+    from thetagang_nt.rules import RollWhen, position_actions
+
+    near, far = date(2026, 11, 20), date(2027, 1, 15)
+    short = Leg("C50a", "AA", "C", 50.0, near, -1, 2.0, 1.0)  # sold at 2, now 1
+    long = Leg("C50b", "AA", "C", 50.0, far, 1, 4.0, 5.0)  # bought at 4, now 5
+    acts = {
+        a.name: a
+        for a in position_actions(
+            [short, long], 48.0, RollWhen(), 0.8, 0.8, {}, near - timedelta(days=10)
+        )
+    }
+    s, lg = acts["AA 20261120 50C"], acts["AA 20270115 50C"]
+    assert s.action == lg.action == "by hand (calendar/diagonal)"
+    assert (
+        s.pnl == pytest.approx(0.5) and s.breakeven == 52.0
+    )  # half the credit kept; 50 + 2
+    assert lg.pnl == pytest.approx(0.25) and lg.breakeven == 54.0  # +25%; 50 + 4
+
+
+def test_dollar_pnl_of_a_leg_and_a_spread() -> None:
+    from thetagang_nt.rules import dollar_pnl
+
+    long_p = Leg("P40", "AA", "P", 40.0, EXP, 2, 3.0, 4.0)  # +1 x 2 x 100
+    short_p = Leg("P35", "AA", "P", 35.0, EXP, -2, 1.0, 1.5)  # -0.5 x 2 x 100
+    assert dollar_pnl(long_p) == pytest.approx(200.0)
+    assert dollar_pnl(long_p, short_p) == pytest.approx(100.0)
+    assert dollar_pnl(Leg("C1", "AA", "C", 1.0, EXP, 1, 1.0, None)) is None
