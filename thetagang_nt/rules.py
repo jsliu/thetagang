@@ -8,6 +8,7 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass, field
 from datetime import date
+from collections import defaultdict
 from typing import Any
 
 import numpy as np
@@ -83,11 +84,17 @@ def short_call_shares(options: list[Leg]) -> float:
 
 
 def split_option_legs(
-    legs: list[Leg],
+    legs: list[Leg], groups: dict[str, tuple[str, ...]] | None = None
 ) -> tuple[list[tuple[Leg, Leg]], list[Leg], set[str]]:
     """One symbol's legs as (verticals, options not in one, rights whose leftovers
     mix shorts and longs = calendar/diagonal legs). Credit verticals pair first;
-    short calls covered by shares are never paired or treated as diagonal."""
+    short calls covered by shares are never paired or treated as diagonal. Legs
+    of a by-hand structure (hand_structures) are in none of them."""
+    held = {id(p) for s in hand_structures(legs, groups) for p in s.legs}
+    return _split([p for p in legs if id(p) not in held])
+
+
+def _split(legs: list[Leg]) -> tuple[list[tuple[Leg, Leg]], list[Leg], set[str]]:
     options = [p for p in legs if p.is_option]
     shares = sum(p.qty for p in legs if not p.is_option)
     pairs = find_verticals(options, debit=False)
@@ -107,6 +114,244 @@ def split_option_legs(
     if "C" in mixed and shares >= short_call_shares(unpaired):
         mixed.discard("C")
     return pairs, unpaired, mixed
+
+
+# ------------------------------------------------------------- structures
+# One symbol's option legs as the positions they form. Recognisers run in order,
+# each taking its legs out of the pool; add a structure with one more recogniser.
+# Phase 1: the bot manages verticals and single legs only; the others are shown
+# as one combined position and left to you ("by hand").
+
+BY_HAND = {"long butterfly", "short butterfly", "long straddle", "long strangle"}
+
+
+@dataclass(frozen=True)
+class Structure:
+    kind: str  # long call, credit spread, long butterfly, calendar, group, ...
+    legs: tuple[Leg, ...]
+    name: str = ""  # a manual group's name
+
+
+def _groups(options: list[Leg], groups: dict[str, tuple[str, ...]]) -> list[Structure]:
+    """[[strategy.structures]]: legs you grouped by hand, by contract label; a
+    group whose legs aren't all held is ignored."""
+    by_label = {option_label(p): p for p in options}
+    return [
+        Structure("group", tuple(by_label[x] for x in labels), name)
+        for name, labels in groups.items()
+        if labels and all(x in by_label for x in labels)
+    ]
+
+
+def _butterflies(options: list[Leg]) -> list[Structure]:
+    """Same right and expiry: +n / -2n / +n (long) or -n / +2n / -n (short) at
+    three strikes, the body between the wings."""
+    found: list[Structure] = []
+    used: set[int] = set()
+    by_key: dict[tuple[str, date | None], list[Leg]] = defaultdict(list)
+    for p in options:
+        by_key[(p.right, p.expiry)].append(p)
+    for same in by_key.values():
+        for body in sorted(same, key=lambda p: p.strike):
+            wing = -body.qty / 2
+            if id(body) in used or not wing:
+                continue
+            free = [p for p in same if id(p) not in used and math.isclose(p.qty, wing)]
+            lower = [p for p in free if p.strike < body.strike]
+            upper = [p for p in free if p.strike > body.strike]
+            if lower and upper:
+                lo = max(lower, key=lambda p: p.strike)
+                hi = min(upper, key=lambda p: p.strike)
+                used |= {id(lo), id(body), id(hi)}
+                kind = "long butterfly" if wing > 0 else "short butterfly"
+                found.append(Structure(kind, (lo, body, hi)))
+    return found
+
+
+def _straddles(options: list[Leg]) -> list[Structure]:
+    """A long put and a long call, same expiry and size: same strike = straddle."""
+    found: list[Structure] = []
+    calls = [p for p in options if p.right == "C" and p.qty > 0]
+    for put in (p for p in options if p.right == "P" and p.qty > 0):
+        match = [
+            c for c in calls if c.expiry == put.expiry and math.isclose(c.qty, put.qty)
+        ]
+        if match:
+            call = min(match, key=lambda c: abs(c.strike - put.strike))
+            calls.remove(call)
+            same = math.isclose(call.strike, put.strike)
+            found.append(
+                Structure("long straddle" if same else "long strangle", (put, call))
+            )
+    return found
+
+
+def outside_groups(
+    legs: list[Leg], groups: dict[str, tuple[str, ...]] | None
+) -> list[Leg]:
+    """`legs` without the manual groups' legs (the trade plan never resizes them)."""
+    held = {id(p) for s in _groups(legs, groups or {}) for p in s.legs}
+    return [p for p in legs if id(p) not in held]
+
+
+def _take(pool: list[Leg], found: list[Structure]) -> list[Structure]:
+    used = {id(p) for s in found for p in s.legs}
+    pool[:] = [p for p in pool if id(p) not in used]
+    return found
+
+
+def hand_structures(
+    legs: list[Leg], groups: dict[str, tuple[str, ...]] | None = None
+) -> list[Structure]:
+    """The structures the bot leaves to you: manual groups first, then
+    butterflies, then long straddles/strangles of longs no vertical or
+    calendar/diagonal holds."""
+    pool = [p for p in legs if p.is_option]
+    out = _take(pool, _groups(pool, groups or {}))
+    out += _take(pool, _butterflies(pool))
+    stock = [p for p in legs if not p.is_option]
+    _, unpaired, mixed = _split(pool + stock)
+    out += _take(pool, _straddles([p for p in unpaired if p.right not in mixed]))
+    return out
+
+
+def find_structures(
+    legs: list[Leg], groups: dict[str, tuple[str, ...]] | None = None
+) -> list[Structure]:
+    """Every option leg of one symbol in exactly one structure: the by-hand ones,
+    verticals, calendars/diagonals (a short and a long of one right and size at
+    two expiries), then single legs."""
+    out = hand_structures(legs, groups)
+    pairs, unpaired, mixed = split_option_legs(legs, groups)
+    for short, long in pairs:
+        kind = "debit spread" if is_debit_vertical(short, long) else "credit spread"
+        out.append(Structure(kind, (long, short)))
+    pool = list(unpaired)
+    for short in [p for p in unpaired if p.qty < 0 and p.right in mixed]:
+        match = [
+            p
+            for p in pool
+            if p.qty > 0
+            and p.right == short.right
+            and p.expiry != short.expiry
+            and math.isclose(p.qty, -short.qty)
+        ]
+        if match and short in pool:
+            long = min(match, key=lambda p: abs(p.strike - short.strike))
+            same = math.isclose(long.strike, short.strike)
+            out.append(Structure("calendar" if same else "diagonal", (long, short)))
+            pool.remove(long)
+            pool.remove(short)
+    names = {"C": "call", "P": "put"}
+    for p in pool:
+        side = "long" if p.qty > 0 else "short"
+        out.append(Structure(f"{side} {names[p.right]}", (p,)))
+    return out
+
+
+def structure_label(s: Structure) -> str:
+    """ "AA 20261218 +1x35P -2x40P +1x45P"; legs at several expiries carry theirs."""
+    legs = sorted(s.legs, key=lambda p: (p.expiry or date.min, p.strike, p.right))
+    expiries = {p.expiry for p in legs}
+    symbol = legs[0].symbol.lstrip("^")
+
+    def leg(p: Leg) -> str:
+        at = "" if len(expiries) == 1 else f"{p.expiry:%Y%m%d} "
+        return f"{at}{p.qty:+g}x{p.strike:g}{p.right}"
+
+    head = f"{symbol} {legs[0].expiry:%Y%m%d}" if len(expiries) == 1 else symbol
+    return " ".join([head] + [leg(p) for p in legs])
+
+
+@dataclass(frozen=True)
+class StructureFigures:
+    """One structure's combined figures, in $ for the whole position."""
+
+    qty: float  # structures held: the smallest leg size
+    dte: int  # to the nearest expiry
+    cost: float  # paid (+) or received (-)
+    value: float | None  # now, at mid
+    pnl: float | None
+    delta: float | None  # shares
+    gamma: float | None  # shares per $1 of the underlying
+    theta: float | None  # $ per day
+    vega: float | None  # $ per vol point
+    max_profit: float | None  # at expiry; inf: unlimited; None: several expiries
+    max_loss: float | None  # negative; -inf: unlimited
+    breakevens: tuple[float, ...] = ()  # underlying prices at expiry
+
+
+def _intrinsic(right: str, strike: float, price: float) -> float:
+    return max(price - strike, 0.0) if right == "C" else max(strike - price, 0.0)
+
+
+def structure_figures(
+    s: Structure, greeks: dict[Any, Any], today: date
+) -> StructureFigures:
+    """`greeks`: instrument id -> per-share greeks (delta, gamma, theta, vega).
+    Max profit/loss and breakevens come from the payoff at expiry, so only for
+    legs sharing one expiry."""
+    legs = s.legs
+    size = [p.qty * p.multiplier for p in legs]
+    cost = sum(n * p.avg_px for n, p in zip(size, legs))
+    value = (
+        None
+        if any(p.mid is None for p in legs)
+        else sum(n * p.mid for n, p in zip(size, legs))  # type: ignore[operator]
+    )
+    g = [greeks.get(p.instrument_id) for p in legs]
+
+    def total(attr: str) -> float | None:
+        if any(x is None for x in g):
+            return None
+        return sum(n * getattr(x, attr) for n, x in zip(size, g))
+
+    hi: float | None = None
+    lo: float | None = None
+    evens: list[float] = []
+    if len({p.expiry for p in legs}) == 1:
+        points = [0.0] + sorted({p.strike for p in legs})
+
+        def pnl_at(price: float) -> float:
+            return (
+                sum(
+                    n * _intrinsic(p.right, p.strike, price) for n, p in zip(size, legs)
+                )
+                - cost
+            )
+
+        at = [pnl_at(x) for x in points]
+        slope = sum(
+            n for n, p in zip(size, legs) if p.right == "C"
+        )  # past the top strike
+        hi, lo = max(at), min(at)
+        if slope > 0:
+            hi = math.inf
+        elif slope < 0:
+            lo = -math.inf
+        for (x0, y0), (x1, y1) in zip(zip(points, at), zip(points[1:], at[1:])):
+            if y0 == 0 and x0 > 0:
+                evens.append(x0)
+            elif y0 * y1 < 0:
+                evens.append(x0 + (x1 - x0) * y0 / (y0 - y1))
+        if at[-1] == 0:
+            evens.append(points[-1])
+        elif slope and at[-1] * slope < 0:
+            evens.append(points[-1] - at[-1] / slope)
+    return StructureFigures(
+        qty=min(abs(p.qty) for p in legs),
+        dte=min(p.dte(today) for p in legs),
+        cost=cost,
+        value=value,
+        pnl=None if value is None else value - cost,
+        delta=total("delta"),
+        gamma=total("gamma"),
+        theta=total("theta"),
+        vega=total("vega"),
+        max_profit=hi,
+        max_loss=lo,
+        breakevens=tuple(evens),
+    )
 
 
 # ------------------------------------------------------------------- P&L
@@ -165,7 +410,7 @@ class RollWhen:
 
 
 def should_roll(rw: RollWhen, right: str, itm: bool, dte: int, pnl: float) -> bool:
-    """[roll_when]: always_when_itm, itm, max_dte, then dte/min_pnl or pnl."""
+    """[credit.roll_when]: always_when_itm, itm, max_dte, then dte/min_pnl or pnl."""
     if itm and rw.always_when_itm.get(right, False):
         return True
     if itm and not rw.itm.get(right, True):
@@ -749,6 +994,11 @@ def long_pnl(leg: Leg) -> float | None:
     return (leg.mid - leg.avg_px) / leg.avg_px
 
 
+def long_take_profit_value(leg: Leg, gain: float) -> float | None:
+    """Option price that takes profit on a long: the premium paid x (1 + gain)."""
+    return leg.avg_px * (1 + gain) if leg.avg_px > 0 else None
+
+
 def breakeven(right: str, strike: float, premium: float) -> float:
     """Underlying price at expiry where one option leg makes nothing, long or
     short: the strike plus (call) or minus (put) the premium per share."""
@@ -768,13 +1018,15 @@ def position_actions(
     und: float | None,
     rw: RollWhen,
     debit_take_profit: float,
-    alert_delta: float,
-    deltas: dict[Any, float],
     today: date,
     no_trading: bool = False,
+    debit_roll_dte: int = 10,
+    long_take_profit_gain: float = 1.0,
+    groups: dict[str, tuple[str, ...]] | None = None,
 ) -> list[Action]:
     """The roll/close/keep decision for every option leg or vertical of one
-    symbol, by the same rules the strategy trades with. A roll can still fail
+    symbol, by the same rules the strategy trades with. Standalone longs follow
+    the debit spread rules: take profit, else roll once DTE <= debit_roll_dte. A roll can still fail
     when no contract fits; the strategy then closes or leaves it, as logged."""
     out: list[Action] = []
     symbol = legs[0].symbol if legs else ""
@@ -795,7 +1047,25 @@ def position_actions(
             return "close"
         return "keep"
 
-    pairs, unpaired, mixed = split_option_legs(legs)
+    for s in hand_structures(legs, groups):  # each leg's own figures
+        for leg in s.legs:
+            out.append(
+                Action(
+                    s.kind,
+                    option_label(leg),
+                    symbol,
+                    leg.right,
+                    leg.qty,
+                    leg.dte(today),
+                    short_pnl(leg) if leg.qty < 0 else long_pnl(leg),
+                    None,
+                    "",
+                    f"by hand ({s.name or s.kind})",
+                    breakeven(leg.right, leg.strike, leg.avg_px),
+                    dollar_pnl(leg),
+                )
+            )
+    pairs, unpaired, mixed = split_option_legs(legs, groups)
     for short, long in pairs:
         dte = short.dte(today)
         if is_debit_vertical(short, long):
@@ -810,7 +1080,7 @@ def position_actions(
                 action = "by hand (no quote)"
             elif value >= target:
                 action = "close (take-profit)"
-            elif dte <= rw.dte:
+            elif dte <= debit_roll_dte:
                 action = "roll"
             else:
                 action = "keep"
@@ -895,9 +1165,18 @@ def position_actions(
                 )
             )
         else:
-            delta = deltas.get(leg.instrument_id)
             pnl = long_pnl(leg)
-            alert = delta is not None and abs(delta) >= alert_delta
+            tp = long_take_profit_value(leg, long_take_profit_gain)
+            if no_trading or index:
+                action = "none (no_trading)" if no_trading else "by hand (index option)"
+            elif leg.mid is None or tp is None:
+                action = "by hand (no cost / no quote)"
+            elif leg.mid >= tp:
+                action = "close (take-profit)"
+            elif dte <= debit_roll_dte:
+                action = "roll"
+            else:
+                action = "keep"
             out.append(
                 Action(
                     "long",
@@ -907,11 +1186,9 @@ def position_actions(
                     leg.qty,
                     dte,
                     pnl,
-                    None,
-                    "",
-                    f"roll or close by hand (|delta| >= {alert_delta:g})"
-                    if alert
-                    else "hold",
+                    tp,
+                    "sell >=",
+                    action,
                     breakeven(leg.right, leg.strike, leg.avg_px),
                     dollar_pnl(leg),
                 )

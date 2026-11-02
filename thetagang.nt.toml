@@ -29,65 +29,99 @@ market_data_type = "REALTIME" # DELAYED_FROZEN shows last prices when markets ar
 # trading_mode = "paper"
 # read_only_api = false
 
-[monitor]
-interval_secs = 60
-metrics_port = 9464
-long_option_alert_delta = 0.8
-stress_moves = [-0.10, -0.05, -0.01, 0.01, 0.05, 0.10]
+[monitor]                     # the dashboard process (read-only, never trades)
+interval_secs = 60            # recompute positions, greeks and risk every 60 s
+metrics_port = 9464           # Prometheus scrapes the dashboard data here
+debit_option_alert_delta = 0.8 # a long option (standalone, or a debit spread's long leg)
+                               # with |delta| >= this: Telegram alert; a standalone one
+                               # also shows "roll or close by hand" in the Options tables
+stress_moves = [-0.10, -0.05, -0.01, 0.01, 0.05, 0.10]  # SPX moves in the Stress P&L table
 
-# Remove this whole section to run the monitor only.
-[strategy]
+# The strategy's rules. The dashboard (--role monitor, the docker default) only reads
+# them, for the Options tables' actions, the trade plan and the VIX hedge row; it never
+# trades. Orders are sent only by the trading process (--role trade or all).
+[strategy.trading]            # when and how the trading process acts
 dry_run = true                # log orders, never send them
-interval_secs = 300
-market_hours_only = true
-# SPX delta neutral (no new trades) while |beta delta $| <= the band:
-# a 1% SPX day may cost at most this many days of theta,
-delta_band_theta_days = 2.0
-# capped at this share of net liq
-delta_band_nav_pct = 0.10
+interval_secs = 300           # run the strategy every 5 min
+market_hours_only = true      # do nothing while the US market is closed
 # The trade plan resizes held positions toward the dashboard's "SPX delta = 0
 # targets" (shares, one option, or a whole vertical per symbol; never adds short
 # options). "auto": place it when off neutral; "manual": only show it, and trade
 # with `thetagang-nt pretrade` (deploy/pretrade.sh)
 approve_trades = "auto"
-pretrade_metrics_port = 9466  # the Pre-trade dashboard, while pretrade asks y/N
-proposal_max_age_secs = 300   # answering later than this sends nothing
-minimum_credit = 0.0
-debit_spread_take_profit = 0.8
-debit_spread_max_roll_debit = 0.5
+proposal_max_age_secs = 300   # answering pretrade later than this sends nothing
 reprice_after_secs = 60       # move unfilled orders halfway to mid, once
-chain_strikes = 15
-chain_expirations = 2
+pretrade_metrics_port = 9466  # the Pre-trade dashboard, while pretrade asks y/N
 
-[strategy.roll_target]        # what a roll moves into
-dte = 7
-max_dte = 60
-delta = 0.3
+# SPX delta neutral (no new trades) while |beta delta $| <= the band:
+[strategy.delta_band]
+theta_days = 2.0              # a 1% SPX day may cost at most this many days of theta,
+nav_pct = 0.10                # capped at this share of net liq
 
-[strategy.roll_when]
-pnl = 0.9
+[strategy.chain]              # how a contract is picked by delta from the option chain
+strikes = 15                  # strikes quoted per expiry
+expirations = 2               # expiries searched (the nearest ones in the DTE window)
+minimum_credit = 0.0          # least price per share of an option the bot picks (the new
+                              # leg of a roll, the VIX call); with credit_only, the least
+                              # net credit a roll must collect
+
+# ---- Standalone short calls/puts and credit spreads -------------------------
+[strategy.credit.roll_target] # what a roll moves into (a credit spread: its new short
+                              # leg; the long leg keeps the width). Per-symbol delta /
+                              # max_dte in [strategy.symbols.X] override it.
+dte = 7                       # new expiry at least 7 days out
+max_dte = 60                  # ...and at most 60 days out
+delta = 0.3                   # new short strike nearest |delta| 0.30
+
+# Roll if P&L >= pnl, or if DTE <= dte and P&L >= min_pnl. P&L = share of the
+# premium captured (0.9 = 90%).
+[strategy.credit.roll_when]
+pnl = 0.9                     # roll at 90% captured, whatever the DTE
+dte = 10                      # roll once 10 days or fewer are left...
+min_pnl = 0.7                 # ...if at least 70% is captured
+# max_dte = 180               # never roll options further out than this
+close_at_pnl = 0.9            # close (not roll) above 90% captured
+close_if_unable_to_roll = true  # close a winner whose roll failed; needs max_dte
+                                # (commented out above, so off for now)
+
+  [strategy.credit.roll_when.calls]  # same three switches for .puts below
+  itm = true                  # in-the-money calls may roll (false: never roll ITM)
+  always_when_itm = false     # true: roll as soon as ITM, whatever the P&L
+  credit_only = false         # true: roll only for a net credit >= minimum_credit
+
+  [strategy.credit.roll_when.puts]
+  itm = true
+  always_when_itm = false
+  credit_only = false
+
+# ---- Debit spreads and standalone long calls/puts -----------------------------
+[strategy.debit]
+take_profit = 0.8             # close a debit spread at 80% of its max profit
+                              # (width - debit paid)
+long_take_profit_gain = 1.0   # close a long call/put once worth (1 + this) x the
+                              # premium paid: 1.0 = at double
+max_roll_debit = 0.5          # a roll may cost at most 0.5 x the spread width (a spread)
+                              # or 0.5 x the old option's value (a long), per share;
+                              # dearer: no roll
+
+[strategy.debit.roll_when]    # roll once DTE <= dte, unless take-profit closed it first
 dte = 10
-min_pnl = 0.7
 # max_dte = 180
-close_at_pnl = 0.9
-close_if_unable_to_roll = true  # needs max_dte
+close_if_unable_to_roll = true  # close a winner whose roll failed; needs max_dte
+                                # (commented out above, so off for now)
 
-  [strategy.roll_when.calls]
-  itm = true
-  always_when_itm = false
-  credit_only = false
+[strategy.debit.roll_target]  # what a roll moves into: the new long option (a
+                              # spread's short leg keeps the width)
+dte = 7                       # new expiry at least 7 days out
+max_dte = 60                  # ...and at most 60 days out
+delta = 0.3                   # new long strike nearest |delta| 0.30
 
-  [strategy.roll_when.puts]
-  itm = true
-  always_when_itm = false
-  credit_only = false
-
-[strategy.vix_call_hedge]
+[strategy.vix_call_hedge]     # long VIX calls as a crash hedge, sized by allocation
 enabled = false
-delta = 0.30
-target_dte = 30
-close_hedges_when_vix_exceeds = 30.0
-ignore_dte = 0
+delta = 0.30                  # buy the call nearest 0.30 delta
+target_dte = 30               # about 30 days out
+close_hedges_when_vix_exceeds = 30.0  # sell every hedge call once VIX is above 30
+ignore_dte = 0                # calls with DTE <= this don't count as held hedges
 
 # first match wins: lower_bound <= VIXMO < upper_bound; weight x net liq in VIX calls
 [[strategy.vix_call_hedge.allocation]]
@@ -108,13 +142,20 @@ weight = 0.005
 lower_bound = 50.0
 weight = 0.0
 
+# Option legs you hold as one position, by the dashboard's contract labels. Checked
+# before automatic grouping (butterflies, long straddles/strangles, verticals,
+# calendars/diagonals); left to you and never resized by the trade plan:
+# [[strategy.structures]]
+# name = "AA iron fly"
+# legs = ["AA 20261218 35P", "AA 20261218 40P", "AA 20261218 40C", "AA 20261218 45C"]
+
 # Per-symbol overrides (every held symbol is managed):
 # [strategy.symbols.TQQQ]
-# no_trading = false
-# put_strike_limit = 100.0
-# call_strike_limit = 120.0
-# delta = 0.3
-# max_dte = 250
+# no_trading = false              # true: never trade this symbol (shown, never managed)
+# put_strike_limit = 100.0        # never roll a put above this strike
+# call_strike_limit = 120.0       # never roll a call below this strike
+# delta = 0.3                     # roll target delta for TQQQ (overrides credit.roll_target)
+# max_dte = 250                   # roll target max DTE for TQQQ (overrides credit.roll_target)
 # ignore_missing_greeks = false   # true: its options with no quote count as zero
 #                                  # delta when sizing the trade plan, instead of blocking it
 
@@ -129,11 +170,12 @@ weight = 0.0
 # [pretrade]
 # refresh_mins = 15   # 0: only when you run pretrade
 # [[pretrade.candidates]]
-# name = "AA put spread"
+# name = "AA put spread"          # shown on the Pre-trade dashboard and in the prompt
 # [[pretrade.candidates.trades]]
 # symbol = "AA"
-# structure = "put_debit_spread"
-# width = 5.0
-# delta = 0.6
-# dte = 60
-# max_contracts = 10
+# structure = "put_debit_spread"  # long the put nearest delta, short one width lower
+# width = 5.0                     # strikes $5 apart
+# delta = 0.6                     # long leg nearest |delta| 0.60
+# dte = 60                        # expiry about 60 days out
+# weight = 1.0                    # share of the candidate's delta this trade carries
+# max_contracts = 10              # never more than 10, whatever the sizing says

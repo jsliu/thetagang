@@ -9,6 +9,7 @@ cache under BETAS_KEY for the strategy."""
 from __future__ import annotations
 
 import json
+import math
 from datetime import date, timedelta
 from typing import Any
 
@@ -48,6 +49,7 @@ from thetagang_nt.portfolio import (
     underlying_id,
 )
 from thetagang_nt.rules import (
+    BY_HAND,
     NEUTRALITY,
     Action,
     Leg,
@@ -57,15 +59,19 @@ from thetagang_nt.rules import (
     compute_beta,
     delta_band_dollars,
     expected_move,
+    find_structures,
     gamma_pnl,
     leg_name,
     neutrality,
     option_label,
+    outside_groups,
     position_actions,
     position_rows,
     realized_move,
     short_pnl,
     side_weight,
+    structure_figures,
+    structure_label,
     symbol_adjustment,
     vix_hedge_action,
     weighted_strike,
@@ -111,7 +117,7 @@ class _Families:
 
 def take_profit_text(a: Action) -> str:
     """As the old bot printed it: "buy <= $0.10", "sell >= $4.40", "n/a", "-"."""
-    if a.kind == "long" or a.kind == "calendar/diagonal":
+    if a.kind in BY_HAND or a.kind in ("calendar/diagonal", "group"):
         return "-"
     if a.take_profit is None:
         return "n/a"
@@ -241,6 +247,7 @@ class PortfolioMonitor(Actor):
             self._risk(f, legs, book, today)
             self._proposals(f, legs, book, spx, today)
             self._actions(f, legs, book, today)
+            self._structures(f, legs, book, today)
             if daily:
                 self._attribution(f, legs, book, daily, spx, today)
         if orders is None:  # no side connection: the orders this node knows
@@ -374,7 +381,7 @@ class PortfolioMonitor(Actor):
         if nlv:
             cfg = self._rules or DiscretionaryConfig()
             band = delta_band_dollars(
-                book.theta, nlv, cfg.delta_band_theta_days, cfg.delta_band_nav_pct
+                book.theta, nlv, cfg.delta_band.theta_days, cfg.delta_band.nav_pct
             )
             f.set("delta_band_dollars", "Neutral while |beta delta $| <= this", band)
             f.set(
@@ -564,8 +571,10 @@ class PortfolioMonitor(Actor):
         # rows for the Trade plan table, and "after resizing held" in the greeks
         skip = {s for s in book.by_symbol if is_index(s) or self._no_trading(s)}
         busy = symbols_with_open_orders(self.cache)
-        active = bool(self._rules and self._rules.approve_trades == "auto")
-        planned = target_plan(self.cache, legs, book, spx, skip, busy)
+        active = bool(self._rules and self._rules.trading.approve_trades == "auto")
+        groups = self._rules.groups() if self._rules else {}
+        plan_legs = outside_groups(legs, groups)
+        planned = target_plan(self.cache, plan_legs, book, spx, skip, busy)
         for p in planned:
             f.set(
                 "target_plan_units",
@@ -643,19 +652,80 @@ class PortfolioMonitor(Actor):
                     vix=f"{level:.2f}",
                 )
 
+    def _structures(
+        self, f: _Families, legs: list[Leg], book: Book, today: date
+    ) -> None:
+        """One row per structure, its legs taken together (read-only)."""
+        groups = self._rules.groups() if self._rules else {}
+        by_symbol: dict[str, list[Leg]] = {}
+        for leg in legs:
+            if leg.symbol != VIX_ROOT:
+                by_symbol.setdefault(leg.symbol, []).append(leg)
+
+        def money(x: float | None) -> str:
+            if x is None:
+                return "n/a"  # legs at several expiries
+            if math.isinf(x):
+                return "unlimited"
+            return f"-${-x:,.0f}" if x < 0 else f"${x:,.0f}"
+
+        credit = {"short call", "short put", "credit spread"}
+        debit = {"long call", "long put", "debit spread"}
+        for s, items in by_symbol.items():
+            for st in find_structures(items, groups):
+                fig = structure_figures(st, book.greeks, today)
+                name = structure_label(st)
+                if is_index(s) or self._no_trading(s) or st.kind not in credit | debit:
+                    managed = "by hand"
+                else:
+                    managed = "bot: credit" if st.kind in credit else "bot: debit"
+                f.set(
+                    "structure_info",
+                    "An option structure: legs held as one position",
+                    1,
+                    name=name,
+                    symbol=s.lstrip("^"),
+                    kind=f"group: {st.name}" if st.name else st.kind,
+                    managed=managed,
+                    max_profit=money(fig.max_profit),
+                    max_loss=money(fig.max_loss),
+                    breakevens=", ".join(f"{x:,.2f}" for x in fig.breakevens) or "-",
+                )
+                for field, value in (
+                    ("qty", fig.qty),
+                    ("dte", fig.dte),
+                    ("cost", fig.cost),
+                    ("value", fig.value),
+                    ("pnl", fig.pnl),
+                    ("delta", fig.delta),
+                    ("gamma", fig.gamma),
+                    ("theta", fig.theta),
+                    ("vega", fig.vega),
+                ):
+                    if value is not None:
+                        f.set(
+                            "structure",
+                            "An option structure's combined figures ($, shares)",
+                            value,
+                            name=name,
+                            field=field,
+                        )
+
     def _actions(self, f: _Families, legs: list[Leg], book: Book, today: date) -> None:
         """What the strategy's rules would do with each position, and the price
         that takes profit; the VIX hedge's action. Uses [strategy] settings."""
         rules = self._rules
-        rw = rules.roll_when.rules() if rules else RollWhen()
-        debit_tp = rules.debit_spread_take_profit if rules else 0.8
+        rw = rules.credit.roll_when.rules() if rules else RollWhen()
+        debit_tp = rules.debit.take_profit if rules else 0.8
+        debit_dte = rules.debit.roll_when.dte if rules else 10
+        long_gain = rules.debit.long_take_profit_gain if rules else 1.0
         deltas = {iid: g.delta for iid, g in book.greeks.items()}
         label_delta = {
             option_label(x): deltas[x.instrument_id]
             for x in legs
             if x.instrument_id in deltas
         }
-        alert, alerts = self.config.long_option_alert_delta, 0
+        alert, alerts = self.config.debit_option_alert_delta, 0
         by_symbol: dict[str, list[Leg]] = {}
         for leg in legs:
             if leg.is_option and leg.symbol != VIX_ROOT:
@@ -673,22 +743,39 @@ class PortfolioMonitor(Actor):
                 und,
                 rw,
                 debit_tp,
-                self.config.long_option_alert_delta,
-                deltas,
                 today,
                 self._no_trading(s),
+                debit_dte,
+                long_gain,
+                rules.groups() if rules else None,
             ):
-                if a.action.startswith("roll or close by hand"):  # a standalone long
+                spread = a.kind.endswith("spread")
+                long_name, advice = None, ""
+                if a.kind == "long":
+                    name, what = a.name, "The bot"
+                elif spread and a.kind.startswith("debit"):
+                    name = next(n for n, sign in a.legs if sign > 0)
+                    what = f"It is the long leg of debit spread {a.name}; the bot"
+                else:
+                    name = None
+                if name is not None and abs(label_delta.get(name, 0.0)) >= alert:
+                    long_name = name
+                    advice = (
+                        f"{what} takes profit on it and rolls it at DTE; roll or "
+                        "close it by hand to act sooner."
+                    )
+                if long_name is not None:
                     alerts += 1
                     f.set(
                         "long_option_alert",
-                        "Delta of a standalone long option at or past the alert level",
-                        label_delta.get(a.name, 0.0),
-                        instrument=a.name,
-                        qty=f"{a.qty:g}",
+                        "Delta of a long option (standalone or a debit spread's long leg) "
+                        "at or past the alert level",
+                        label_delta.get(long_name, 0.0),
+                        instrument=long_name,
+                        qty=f"{abs(a.qty):g}",
                         threshold=f"{alert:.2f}",
+                        advice=advice,
                     )
-                spread = a.kind.endswith("spread")
                 table = "spreads" if spread else ("calls" if a.right == "C" else "puts")
                 if spread:
                     side = a.kind.split()[0]  # credit / debit
@@ -710,6 +797,7 @@ class PortfolioMonitor(Actor):
                     ("dte", a.dte),
                     ("pnl_ratio", a.pnl),
                     ("delta", spread_delta(a) if spread else label_delta.get(a.name)),
+                    ("underlying", und),
                     ("breakeven", a.breakeven),
                     ("pnl_dollars", a.pnl_dollars),
                 ):
@@ -724,7 +812,7 @@ class PortfolioMonitor(Actor):
                         )
         f.set(
             "long_option_alerts",
-            f"Standalone long options with |delta| >= {alert}",
+            f"Long options (standalone or debit spread legs) with |delta| >= {alert}",
             alerts,
         )
         if rules is None:

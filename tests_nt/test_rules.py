@@ -141,8 +141,9 @@ def test_sample_config_loads() -> None:
     from thetagang_nt.config import load, node_config
 
     app = load("thetagang.nt.toml")
-    assert app.strategy is not None and app.strategy.dry_run
-    assert app.strategy.roll_when.rules().close_at_pnl == 0.9
+    assert app.strategy is not None and app.strategy.trading.dry_run
+    assert app.strategy.credit.roll_when.rules().close_at_pnl == 0.9
+    assert app.strategy.debit.roll_when.dte == 10
     assert node_config(app).trader_id.value == "THETAGANG-001"
 
 
@@ -206,8 +207,8 @@ def test_net_target_contracts_never_flip_or_sell_covering_shares() -> None:
 def test_actions_follow_roll_when_and_show_take_profit() -> None:
     rw = RollWhen(pnl=0.9, dte=10, min_pnl=0.7, close_at_pnl=0.9)
 
-    def act(*legs: Leg, deltas: dict | None = None) -> dict:
-        found = position_actions(list(legs), 40.0, rw, 0.8, 0.8, deltas or {}, TODAY)
+    def act(*legs: Leg) -> dict:
+        found = position_actions(list(legs), 40.0, rw, 0.8, TODAY)
         return {a.name: a for a in found}
 
     shorts = act(opt("P", 30, -1, 1.0, 0.05), opt("C", 50, -1, 2.0, 1.5))
@@ -216,8 +217,16 @@ def test_actions_follow_roll_when_and_show_take_profit() -> None:
         0.1
     )  # buy back at <= 10% of 1.0
     assert shorts["AA 20261218 50C"].action == "keep"  # 25% captured
-    long_call = act(opt("C", 60, 2, 1.0, 1.2), deltas={"C60": 0.85})
-    assert long_call["AA 20261218 60C"].action.startswith("roll or close by hand")
+    # standalone longs follow the debit rules: take profit at 2x paid, else roll at DTE
+    long_call = act(opt("C", 60, 2, 1.0, 1.2))["AA 20261218 60C"]
+    assert long_call.action == "keep" and long_call.take_profit == pytest.approx(2.0)
+    assert act(opt("C", 60, 2, 1.0, 2.1))["AA 20261218 60C"].action == (
+        "close (take-profit)"
+    )
+    near = position_actions(
+        [opt("C", 60, 2, 1.0, 1.2)], 40.0, rw, 0.8, TODAY, False, 50
+    )
+    assert near[0].action == "roll"
     # a short and a long call of different sizes are a diagonal: left alone, as before
     mixed = act(opt("C", 50, -1, 2.0, 1.5), opt("C", 60, 2, 1.0, 1.2))
     assert {a.action for a in mixed.values()} == {"by hand (calendar/diagonal)"}
@@ -231,15 +240,13 @@ def test_spread_actions_and_index_options_are_left_alone() -> None:
         38.0,
         rw,
         0.8,
-        0.8,
-        {},
         TODAY,
     )
     assert debit[0].kind == "debit spread" and debit[0].action == "close (take-profit)"
     assert debit[0].take_profit == pytest.approx(4.4)
     index_put = Leg("SPX P", "^SPX", "P", 6000.0, EXP, -1, 10.0, 1.0)
     assert (
-        position_actions([index_put], 7000.0, rw, 0.8, 0.8, {}, TODAY)[0].action
+        position_actions([index_put], 7000.0, rw, 0.8, TODAY)[0].action
         == "by hand (index option)"
     )
 
@@ -305,8 +312,8 @@ def test_dashboard_names_and_wording_follow_the_old_bot() -> None:
         take_profit_text(short) == "buy <= $0.10"
         and action_text(short.action) == "Roll"
     )
-    hold = Action("long", "x", "AA", "C", 2, 40, None, None, "", "hold")
-    assert take_profit_text(hold) == "-"
+    long = Action("long", "x", "AA", "C", 2, 40, None, 2.0, "sell >=", "keep")
+    assert take_profit_text(long) == "sell >= $2.00"
     alert = "roll or close by hand (|delta| >= 0.8)"
     assert action_text(alert) == "Roll or close by hand (|Δ| >= 0.8)"
 
@@ -444,9 +451,17 @@ def test_pretrade_runs_beside_the_monitor_and_trader_and_approval_is_checked() -
     ids = {role: split(app, role)[2] for role in ("trade", "monitor", "pretrade")}
     assert len(set(ids.values())) == 3  # three IB connections, three client ids
     assert not split(app, "pretrade")[0].publish  # its metrics are pretrade's own
-    assert app.strategy.approve_trades == "auto"
+    assert app.strategy.trading.approve_trades == "auto"
     with pytest.raises(msgspec.ValidationError):
-        msgspec.convert({"approve_trades": "maybe"}, DiscretionaryConfig)
+        msgspec.convert({"trading": {"approve_trades": "maybe"}}, DiscretionaryConfig)
+
+
+def test_debit_spreads_roll_by_their_own_dte_not_credit_roll_when() -> None:
+    spread = [opt("P", 40, 1, 2.0, 2.5), opt("P", 35, -1, 1.0, 1.0)]  # 46 DTE, under tp
+    rw = RollWhen(dte=10)  # credit rule: far from rolling
+    act = lambda d: position_actions(spread, 38.0, rw, 0.8, TODAY, False, d)
+    assert act(10)[0].action != "roll"
+    assert act(50)[0].action == "roll"
 
 
 def test_target_orders_point_the_right_way_and_never_add_shorts() -> None:
@@ -685,7 +700,7 @@ def test_calendar_legs_get_their_own_pnl_and_breakeven() -> None:
     acts = {
         a.name: a
         for a in position_actions(
-            [short, long], 48.0, RollWhen(), 0.8, 0.8, {}, near - timedelta(days=10)
+            [short, long], 48.0, RollWhen(), 0.8, near - timedelta(days=10)
         )
     }
     s, lg = acts["AA 20261120 50C"], acts["AA 20270115 50C"]
@@ -704,3 +719,85 @@ def test_dollar_pnl_of_a_leg_and_a_spread() -> None:
     assert dollar_pnl(long_p) == pytest.approx(200.0)
     assert dollar_pnl(long_p, short_p) == pytest.approx(100.0)
     assert dollar_pnl(Leg("C1", "AA", "C", 1.0, EXP, 1, 1.0, None)) is None
+
+
+def test_structures_are_recognised_and_figured_as_one_position() -> None:
+    import math
+
+    from thetagang_nt.rules import (
+        find_structures,
+        outside_groups,
+        structure_figures,
+        structure_label,
+    )
+
+    fly = [
+        opt("C", 35, 1, 6.0, 6.5),
+        opt("C", 40, -2, 3.0, 3.0),
+        opt("C", 45, 1, 1.5, 1.0),
+    ]
+    (s,) = find_structures(fly)
+    assert s.kind == "long butterfly"
+    assert structure_label(s) == "AA 20261218 +1x35C -2x40C +1x45C"
+    f = structure_figures(s, {}, TODAY)
+    assert f.cost == pytest.approx(150) and f.value == pytest.approx(150)
+    assert (f.max_profit, f.max_loss) == pytest.approx((350, -150))
+    assert f.breakevens == pytest.approx((36.5, 43.5)) and f.delta is None
+
+    straddle = [opt("P", 40, 1, 2.0, 2.0), opt("C", 40, 1, 2.0, 2.0)]
+    (s,) = find_structures(straddle)
+    f = structure_figures(
+        s,
+        {
+            "P40": SimpleNamespace(delta=-0.5, gamma=0.1, theta=-0.02, vega=0.05),
+            "C40": SimpleNamespace(delta=0.5, gamma=0.1, theta=-0.02, vega=0.05),
+        },
+        TODAY,
+    )
+    assert s.kind == "long straddle" and f.max_profit == math.inf
+    assert f.max_loss == pytest.approx(-400) and f.breakevens == pytest.approx((36, 44))
+    assert f.delta == pytest.approx(0) and f.vega == pytest.approx(10)
+    strangle = find_structures([opt("P", 35, 1, 1.0, 1.0), opt("C", 45, 1, 1.0, 1.0)])
+    assert [x.kind for x in strangle] == ["long strangle"]
+    # a long already in a vertical or a diagonal is never taken into a strangle
+    taken = find_structures(
+        [
+            opt("P", 20, 1, 1.0, 1.0),
+            opt("C", 35, 1, 3.0, 3.0),
+            opt("C", 75, -1, 0.5, 0.5),
+        ]
+    )
+    assert sorted(x.kind for x in taken) == ["debit spread", "long put"]
+
+    # the bot leaves them alone: not paired, not managed leg by leg
+    pairs, unpaired, _ = split_option_legs(fly + straddle)
+    assert pairs == [] and unpaired == []
+    acts = position_actions(straddle, 40.0, RollWhen(), 0.8, TODAY)
+    assert {a.action for a in acts} == {"by hand (long straddle)"}
+
+    later = date(2027, 1, 15)
+    cal = [opt("C", 40, -1, 2.0, 1.0), Leg("C40L", "AA", "C", 40.0, later, 1, 3.0, 2.5)]
+    (s,) = find_structures(cal)
+    assert s.kind == "calendar" and structure_figures(s, {}, TODAY).max_profit is None
+
+    kinds = sorted(
+        x.kind
+        for x in find_structures(
+            [
+                opt("P", 40, 1, 3.0, 5.0),
+                opt("P", 35, -1, 1.0, 0.5),
+                opt("C", 60, -1, 1.0, 0.5),
+            ]
+        )
+    )
+    assert kinds == ["debit spread", "short call"]
+
+    # a manual group wins over detection, and the trade plan never sees its legs
+    group = {"my fly": ("AA 20261218 35C", "AA 20261218 40C", "AA 20261218 45C")}
+    (s,) = find_structures(fly, group)
+    assert (s.kind, s.name) == ("group", "my fly")
+    others = [opt("P", 35, 1, 1.0, 1.0)]
+    assert outside_groups(fly + others, group) == others
+    assert (
+        find_structures(fly, {"gone": ("AA 20261218 99C",)})[0].kind == "long butterfly"
+    )

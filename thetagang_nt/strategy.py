@@ -1,8 +1,9 @@
 """Discretionary: thetagang's discretionary strategy as a Nautilus Strategy.
 
 Every `interval_secs` (market hours) it:
-  - rolls/closes short options and credit verticals with the [roll_when] rules,
-    closes debit verticals at the take-profit and rolls them near expiry
+  - rolls/closes short options and credit verticals by [credit.roll_when],
+  - closes debit verticals and standalone long options at the [debit] take-profit
+    and rolls them near expiry
     (rolls and closes are one IB combo order: a Nautilus OptionSpread),
   - runs the VIX call hedge (buy per VIXMO allocation, sell above a VIX level),
   - opens the configured trades, sized to bring SPX beta-weighted delta to 0,
@@ -71,6 +72,11 @@ from thetagang_nt.rules import (
     credit_pnl,
     debit_pnl,
     debit_take_profit_value,
+    long_pnl,
+    hand_structures,
+    long_take_profit_value,
+    outside_groups,
+    structure_label,
     delta_band_dollars,
     is_debit_vertical,
     is_itm,
@@ -134,14 +140,15 @@ class Discretionary(Strategy):
         self.pretrade = (
             pretrade  # [pretrade]: the candidates compared in the background
         )
-        self.rw = config.roll_when.rules()
+        self.rw = config.credit.roll_when.rules()
+        self.debit_rw = config.debit.roll_when.rules()
         self._busy = False
         self._repriced: set[ClientOrderId] = set()
 
     # ------------------------------------------------------------ lifecycle
 
     def on_start(self) -> None:
-        DRY_RUN.set(self.config.dry_run)
+        DRY_RUN.set(self.config.trading.dry_run)
         p = self.pretrade
         if p is not None and p.candidates and p.refresh_mins > 0:
             # a timer's first event is start + interval: the first run is an alert
@@ -157,7 +164,7 @@ class Discretionary(Strategy):
                 f"Pretrade candidates compared at {first:%H:%M} UTC, then every "
                 f"{p.refresh_mins} min"
             )
-        if self.config.dry_run:
+        if self.config.trading.dry_run:
             self.log.warning("dry_run: orders are logged, never sent")
         aio.spawn(self, self._boot(), "strategy boot")
 
@@ -170,7 +177,7 @@ class Discretionary(Strategy):
         await aio.load_contracts(self, INDEX_CONTRACTS)
         self.clock.set_timer(
             "discretionary",
-            timedelta(seconds=self.config.interval_secs),
+            timedelta(seconds=self.config.trading.interval_secs),
             callback=self._on_timer,
         )
         await self._run()
@@ -186,7 +193,9 @@ class Discretionary(Strategy):
         aio.spawn(self, self._compare_candidates(), "pretrade refresh")
 
     async def _compare_candidates(self) -> None:
-        if self.config.market_hours_only and not market_open(self.clock.utc_now()):
+        if self.config.trading.market_hours_only and not market_open(
+            self.clock.utc_now()
+        ):
             return
         from thetagang_nt import pretrade  # it builds on this module
 
@@ -206,7 +215,9 @@ class Discretionary(Strategy):
             aio.spawn(self, self._run(), "strategy run")
 
     async def _run(self) -> None:
-        if self.config.market_hours_only and not market_open(self.clock.utc_now()):
+        if self.config.trading.market_hours_only and not market_open(
+            self.clock.utc_now()
+        ):
             self.log.info("Market closed, nothing to do")
             return
         self._busy = True
@@ -226,7 +237,7 @@ class Discretionary(Strategy):
         symbols = {leg.symbol for leg in held_legs(self.cache)}
         ids = {leg.instrument_id for leg in held_legs(self.cache)}
         ids |= {underlying_id(s) for s in symbols} | {SPX, VIX, VIXMO}
-        await aio.wait_for_prices(self, ids, self.config.quote_timeout_secs)
+        await aio.wait_for_prices(self, ids, self.config.chain.quote_timeout_secs)
         legs = held_legs(self.cache)
         if not await self._load_ib_orders():
             plan_status("open orders at IB unknown: nothing traded this run")
@@ -301,7 +312,8 @@ class Discretionary(Strategy):
         return s.put_strike_limit if right == "P" else s.call_strike_limit
 
     def _roll_target(self, symbol: str) -> tuple[float, int, int | None]:
-        t, s = self.config.roll_target, self.config.symbols.get(symbol)
+        """[credit.roll_target], with the symbol's delta/max_dte overrides."""
+        t, s = self.config.credit.roll_target, self.config.symbols.get(symbol)
         delta = s.delta if s and s.delta else t.delta
         max_dte = s.max_dte if s and s.max_dte else t.max_dte
         return delta, t.dte, max_dte
@@ -315,7 +327,10 @@ class Discretionary(Strategy):
             return False
         stock = [leg for leg in legs if not leg.is_option and leg.qty > 0]
         share_cost = stock[0].avg_px if stock else None
-        pairs, unpaired, mixed = split_option_legs(legs)
+        groups = self.config.groups()
+        for s in hand_structures(legs, groups):
+            self.log.info(f"{structure_label(s)}: {s.name or s.kind}, by hand")
+        pairs, unpaired, mixed = split_option_legs(legs, groups)
         acted = False
         for short, long in pairs:
             if is_debit_vertical(short, long):
@@ -323,13 +338,64 @@ class Discretionary(Strategy):
             else:
                 acted |= await self._credit_spread(symbol, short, long, und, today)
         for leg in unpaired:
-            if leg.qty >= 0:
-                continue
             if leg.right in mixed:
                 self.log.warning(f"{leg.instrument_id}: calendar/diagonal, by hand")
                 continue
-            acted |= await self._short_option(symbol, leg, und, today, share_cost)
+            if leg.qty > 0:
+                acted |= await self._long_option(symbol, leg, today)
+            elif leg.qty < 0:
+                acted |= await self._short_option(symbol, leg, und, today, share_cost)
         return acted
+
+    async def _long_option(self, symbol: str, leg: Leg, today: date) -> bool:
+        """The [debit] rules, as for a debit spread: take profit, else roll once
+        DTE <= debit.roll_when.dte."""
+        tp = long_take_profit_value(leg, self.config.debit.long_take_profit_gain)
+        if leg.mid is None or tp is None:
+            self.log.warning(f"{leg.instrument_id}: no quote or no cost, skipped")
+            return False
+        if leg.mid >= tp:
+            await self._close(symbol, [leg], "close long (take-profit)")
+            return True
+        dte = leg.dte(today)
+        if dte > self.debit_rw.dte:
+            return False
+        try:
+            await self._roll_long(symbol, leg, leg.mid)
+            return True
+        except NoContract as e:
+            pnl = long_pnl(leg)
+            if pnl is not None and close_if_unable_to_roll(self.debit_rw, dte, pnl):
+                await self._close(symbol, [leg], "close long (unable to roll)")
+                return True
+            self.log.warning(f"{leg.instrument_id}: not rolled ({e}), roll by hand")
+            return False
+
+    async def _roll_long(self, symbol: str, leg: Leg, value: float) -> None:
+        """Sell the old long, buy one further out at [debit.roll_target], as one
+        combo costing at most max_roll_debit x the old option's value."""
+        t = self.config.debit.roll_target
+        new = await self._find(
+            symbol,
+            leg.right,
+            t.delta,
+            t.dte,
+            t.max_dte,
+            0.01,
+            not_before=leg.expiry,
+            exclude={(leg.strike, leg.expiry)},
+        )
+        combo_price = new.price - value  # positive = net debit
+        max_debit = self.config.debit.max_roll_debit * value
+        if combo_price > max_debit:
+            raise NoContract(f"roll costs {combo_price:.2f} > {max_debit:.2f}")
+        await self._submit(
+            symbol,
+            "roll long",
+            [(leg.instrument_id, -1), (new.instrument_id, +1)],
+            abs(leg.qty),
+            combo_price,
+        )
 
     async def _short_option(
         self, symbol: str, leg: Leg, und: float, today: date, share_cost: float | None
@@ -363,7 +429,7 @@ class Discretionary(Strategy):
         limit = roll_strike_limit(
             leg.right, leg.strike, leg.avg_px - leg.mid, itm, configured
         )
-        mc = self.config.minimum_credit
+        mc = self.config.chain.minimum_credit
         floor = leg.mid + mc if self.rw.credit_only[leg.right] else mc
         delta, dte, max_dte = self._roll_target(symbol)
         new = await self._find(
@@ -428,7 +494,10 @@ class Discretionary(Strategy):
             self._strike_limit(symbol, short.right),
         )
         width = long.strike - short.strike
-        credit_only, mc = self.rw.credit_only[short.right], self.config.minimum_credit
+        credit_only, mc = (
+            self.rw.credit_only[short.right],
+            self.config.chain.minimum_credit,
+        )
         delta, dte, max_dte = self._roll_target(symbol)
         exclude = {(short.strike, short.expiry), (long.strike, long.expiry)}
         old_ids = {short.instrument_id, long.instrument_id}
@@ -486,18 +555,18 @@ class Discretionary(Strategy):
             self.log.warning(f"{long.instrument_id}: debit spread without quotes")
             return False
         value, dte = long.mid - short.mid, long.dte(today)
-        tp = debit_take_profit_value(short, long, self.config.debit_spread_take_profit)
+        tp = debit_take_profit_value(short, long, self.config.debit.take_profit)
         if value >= tp:
             await self._close(symbol, [short, long], "close debit spread (take-profit)")
             return True
-        if dte > self.rw.dte:
+        if dte > self.debit_rw.dte:
             return False
         try:
             await self._roll_debit_spread(symbol, short, long, value)
             return True
         except NoContract as e:
             pnl = debit_pnl(short, long)
-            if pnl is not None and close_if_unable_to_roll(self.rw, dte, pnl):
+            if pnl is not None and close_if_unable_to_roll(self.debit_rw, dte, pnl):
                 await self._close(
                     symbol, [short, long], "close debit spread (unable to roll)"
                 )
@@ -509,12 +578,9 @@ class Discretionary(Strategy):
         self, symbol: str, short: Leg, long: Leg, value: float
     ) -> None:
         """Sell the old spread, buy one further out (same width) as one combo;
-        the new long at the configured debit trade's delta/DTE for the symbol."""
-        delta, dte, max_dte = self._roll_target(symbol)
-        for t in self.config.trades:
-            right, sign, second = STRUCTURES[t.structure]
-            if t.symbol == symbol and second and sign > 0 and right == long.right:
-                delta, dte = t.delta, t.dte
+        the new long at [debit.roll_target]'s delta/DTE."""
+        t = self.config.debit.roll_target
+        delta, dte, max_dte = t.delta, t.dte, t.max_dte
         offset = short.strike - long.strike
         exclude = {(short.strike, short.expiry), (long.strike, long.expiry)}
         old_ids = {short.instrument_id, long.instrument_id}
@@ -539,7 +605,7 @@ class Discretionary(Strategy):
         else:
             raise NoContract("every candidate overlapped the old spread")
         combo_price = (new_long.price - short_price) - value  # positive = net debit
-        max_debit = self.config.debit_spread_max_roll_debit * abs(offset)
+        max_debit = self.config.debit.max_roll_debit * abs(offset)
         if combo_price > max_debit:
             raise NoContract(f"roll costs {combo_price:.2f} > {max_debit:.2f}")
         await self._submit(
@@ -599,7 +665,12 @@ class Discretionary(Strategy):
         if weight <= 0 or not nlv:
             return False
         c = await self._find(
-            VIX_ROOT, "C", cfg.delta, cfg.target_dte, None, self.config.minimum_credit
+            VIX_ROOT,
+            "C",
+            cfg.delta,
+            cfg.target_dte,
+            None,
+            self.config.chain.minimum_credit,
         )
         px = bid(self.cache, c.instrument_id) or c.price
         qty = math.floor(weight * nlv / px / 100)
@@ -645,7 +716,7 @@ class Discretionary(Strategy):
             plan_status("no net liquidation")
             return
         band = delta_band_dollars(
-            book.theta, nlv, cfg.delta_band_theta_days, cfg.delta_band_nav_pct
+            book.theta, nlv, cfg.delta_band.theta_days, cfg.delta_band.nav_pct
         )
         if abs(book.beta_dollars) <= band:
             msg = (
@@ -657,7 +728,7 @@ class Discretionary(Strategy):
             return
         planned = await self._plan(legs, book, spx, betas, today, busy)
         after = book.spx_delta + sum(p.add["beta_delta_dollars"] for p in planned) / spx
-        manual = cfg.approve_trades == "manual"
+        manual = cfg.trading.approve_trades == "manual"
         plan_status(
             f"resize held positions: SPX delta {now:+.2f} -> {after:+.2f}"
             + (": awaiting approval (thetagang-nt pretrade)" if manual else "")
@@ -714,6 +785,7 @@ class Discretionary(Strategy):
         self, legs: list[Leg], book: Book, spx: float, busy: set[str]
     ) -> list[Planned]:
         skip = {s for s in book.by_symbol if is_index(s) or self._no_trading(s)}
+        legs = outside_groups(legs, self.config.groups())
         return target_plan(self.cache, legs, book, spx, skip, busy)
 
     async def _size_trades(
@@ -826,7 +898,7 @@ class Discretionary(Strategy):
     async def _price_of(self, iid: InstrumentId | None) -> float | None:
         if iid is None:
             return None
-        timeout = self.config.quote_timeout_secs
+        timeout = self.config.chain.quote_timeout_secs
         return (await aio.wait_for_prices(self, [iid], timeout))[iid]
 
     async def _find(
@@ -859,7 +931,7 @@ class Discretionary(Strategy):
             and valid_strike(right, float(i.strike_price), strike_limit, und)
         ]
         expiries = sorted({i.expiration_utc.date() for i in chain})
-        expiries = expiries[: cfg.chain_expirations]
+        expiries = expiries[: cfg.chain.expirations]
         scan: list[OptionContract] = []
         for expiry in expiries:
             by_strike = {
@@ -867,12 +939,14 @@ class Discretionary(Strategy):
                 for i in chain
                 if i.expiration_utc.date() == expiry
             }
-            picked = scan_strikes(list(by_strike), und, cfg.chain_strikes)
+            picked = scan_strikes(list(by_strike), und, cfg.chain.strikes)
             scan += [by_strike[k] for k in picked]
         if not scan:
             raise NoContract(f"{symbol}: no {right} strikes/expirations in range")
         forwards = await self._vix_forwards(expiries, und) if symbol == VIX_ROOT else {}
-        await aio.wait_for_prices(self, [i.id for i in scan], cfg.quote_timeout_secs)
+        await aio.wait_for_prices(
+            self, [i.id for i in scan], cfg.chain.quote_timeout_secs
+        )
         candidates = []
         for ins in scan:
             expiry = ins.expiration_utc.date()
@@ -923,7 +997,7 @@ class Discretionary(Strategy):
                     )
             if len(pair) != 2 or pair[0].strike_price != pair[1].strike_price:
                 continue
-            timeout = self.config.quote_timeout_secs
+            timeout = self.config.chain.quote_timeout_secs
             prices = await aio.wait_for_prices(self, [i.id for i in pair], timeout)
             call, put = prices[pair[0].id], prices[pair[1].id]
             if call is not None and put is not None:
@@ -946,7 +1020,7 @@ class Discretionary(Strategy):
         if qty < 1:
             return
         desc = " / ".join(f"{'+' if r > 0 else '-'}{i.symbol.value}" for i, r in combo)
-        dry = self.config.dry_run
+        dry = self.config.trading.dry_run
         self.log.warning(
             f"{'[DRY RUN] ' if dry else ''}{symbol}: {action}: "
             f"{qty} x {desc} @ {combo_price:+.2f}"
@@ -974,7 +1048,7 @@ class Discretionary(Strategy):
         self.submit_order(order)
 
     def on_order_accepted(self, event: OrderAccepted) -> None:
-        delay = self.config.reprice_after_secs
+        delay = self.config.trading.reprice_after_secs
         if delay:
             self.clock.set_time_alert(
                 f"reprice-{event.client_order_id}",

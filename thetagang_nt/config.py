@@ -115,48 +115,107 @@ class SymbolConfig(NautilusConfig, frozen=True):
     no_trading: bool = False
     put_strike_limit: float | None = None  # never roll a put above this strike
     call_strike_limit: float | None = None  # never roll a call below this strike
-    delta: float | None = None  # roll target delta override
-    max_dte: int | None = None  # roll target max_dte override
+    delta: float | None = None  # credit.roll_target delta override
+    max_dte: int | None = None  # credit.roll_target max_dte override
     # options here with no quote (so no greeks) count as zero delta when sizing
     # the trade plan instead of blocking it; the dashboard still flags them
     ignore_missing_greeks: bool = False
 
 
-class DiscretionaryConfig(StrategyConfig, frozen=True):
+class TradingConfig(NautilusConfig, frozen=True):
+    """[strategy.trading]: when and how the trading process acts."""
+
     dry_run: bool = True  # log orders instead of sending them
     interval_secs: int = 300
     market_hours_only: bool = True
-    # SPX delta neutral (no new trades) while |beta delta $| <= the band: a 1%
-    # SPX day may cost at most delta_band_theta_days days of theta, capped at
-    # delta_band_nav_pct of net liq (rules.delta_band_dollars)
-    delta_band_theta_days: float = 2.0
-    delta_band_nav_pct: float = 0.10
-    minimum_credit: float = 0.0
-    debit_spread_take_profit: float = 0.8
-    debit_spread_max_roll_debit: float = 0.5
-    reprice_after_secs: int | None = 60  # move unfilled orders halfway to mid, once
-    chain_strikes: int = 15
-    chain_expirations: int = 2
-    quote_timeout_secs: float = 10.0
-    roll_target: TargetConfig = TargetConfig()
-    roll_when: RollWhenConfig = RollWhenConfig()
-    vix_call_hedge: VixHedgeConfig = VixHedgeConfig()
-    symbols: dict[str, SymbolConfig] = {}
-    # --role trade only: the trading process's own metrics (orders, dry_run, trade plan)
-    metrics_port: int = 9465
     # the trade plan resizes what is held toward the positions summary's SPX
     # delta 0 targets (shares, one option, or a whole vertical per symbol).
     # "auto": place it when off SPX delta neutral; "manual": only show it, and
     # trade with `thetagang-nt pretrade`
     approve_trades: str = "auto"
-    pretrade_metrics_port: int = 9466  # the pre-trade dashboard, while it asks
     proposal_max_age_secs: int = 300  # a confirmation later than this sends nothing
+    reprice_after_secs: int | None = 60  # move unfilled orders halfway to mid, once
+    # --role trade only: the trading process's own metrics (orders, dry_run, trade plan)
+    metrics_port: int = 9465
+    pretrade_metrics_port: int = 9466  # the pre-trade dashboard, while it asks
 
     def __post_init__(self) -> None:
         if self.approve_trades not in ("auto", "manual"):
             raise ValueError(
                 f"approve_trades must be auto or manual, not {self.approve_trades!r}"
             )
+
+
+class DeltaBandConfig(NautilusConfig, frozen=True):
+    """SPX delta neutral (no new trades) while |beta delta $| <= the band: a 1%
+    SPX day may cost at most theta_days days of theta, capped at nav_pct of net
+    liq (rules.delta_band_dollars)."""
+
+    theta_days: float = 2.0
+    nav_pct: float = 0.10
+
+
+class ChainConfig(NautilusConfig, frozen=True):
+    """How a contract is picked by delta from the option chain."""
+
+    strikes: int = 15
+    expirations: int = 2
+    quote_timeout_secs: float = 10.0
+    minimum_credit: float = 0.0
+
+
+class CreditConfig(NautilusConfig, frozen=True):
+    """[strategy.credit]: standalone short calls/puts and credit spreads."""
+
+    roll_target: TargetConfig = TargetConfig()
+    roll_when: RollWhenConfig = RollWhenConfig()
+
+
+class DebitRollWhenConfig(NautilusConfig, frozen=True):
+    """Roll a debit spread once dte <= dte (unless take-profit closed it)."""
+
+    dte: int = 10
+    max_dte: int | None = None
+    close_if_unable_to_roll: bool = False
+
+    def rules(self) -> RollWhen:
+        return RollWhen(
+            dte=self.dte,
+            max_dte=self.max_dte,
+            close_if_unable_to_roll=self.close_if_unable_to_roll,
+        )
+
+
+class DebitConfig(NautilusConfig, frozen=True):
+    """[strategy.debit]: debit spreads and standalone long calls/puts."""
+
+    take_profit: float = 0.8  # spreads: share of the max profit (width - debit)
+    long_take_profit_gain: float = 1.0  # longs: close at (1 + this) x premium paid
+    max_roll_debit: float = 0.5  # x width (spreads) or x old option value (longs)
+    roll_when: DebitRollWhenConfig = DebitRollWhenConfig()
+    roll_target: TargetConfig = TargetConfig()
+
+
+class StructureGroupConfig(NautilusConfig, frozen=True):
+    """[[strategy.structures]]: option legs you hold as one position, by the
+    dashboard's contract labels ("AA 20261218 40P"); left to you ("by hand")."""
+
+    name: str
+    legs: list[str]
+
+
+class DiscretionaryConfig(StrategyConfig, frozen=True):
+    trading: TradingConfig = TradingConfig()
+    delta_band: DeltaBandConfig = DeltaBandConfig()
+    chain: ChainConfig = ChainConfig()
+    credit: CreditConfig = CreditConfig()
+    debit: DebitConfig = DebitConfig()
+    vix_call_hedge: VixHedgeConfig = VixHedgeConfig()
+    symbols: dict[str, SymbolConfig] = {}
+    structures: list[StructureGroupConfig] = []
+
+    def groups(self) -> dict[str, tuple[str, ...]]:
+        return {g.name: tuple(g.legs) for g in self.structures}
 
 
 class MonitorConfig(ActorConfig, frozen=True):
@@ -166,7 +225,7 @@ class MonitorConfig(ActorConfig, frozen=True):
     publish: bool = (
         True  # serve /metrics; off in --role trade, which only needs the betas
     )
-    long_option_alert_delta: float = 0.8
+    debit_option_alert_delta: float = 0.8
     stress_moves: tuple[float, ...] = (-0.10, -0.05, -0.01, 0.01, 0.05, 0.10)
 
 
@@ -240,7 +299,7 @@ def split(
       client_id + 1 so it runs beside a trade process.
     trade: the strategy, with a monitor that only loads the betas it sizes with
       (no metrics, so the dashboard isn't doubled); the strategy's own metrics go
-      on strategy.metrics_port.
+      on strategy.trading.metrics_port.
     pretrade (`thetagang-nt pretrade`): like trade, as client_id + 2 so it runs
       beside both."""
     if role == "all":

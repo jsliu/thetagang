@@ -43,28 +43,33 @@ publishes Prometheus metrics on port 9464:
   the premium, days to expiry, delta, implied volatility
 - stress P&L for each SPX move in `monitor.stress_moves` (default ±1% (a typical day), ±5%, ±10%),
   with each stock moving by beta × the SPX move, and with every beta set to 1
-- SPX, VIX and VIXMO levels, open orders, and long options whose |delta| has
-  reached `long_option_alert_delta`
+- SPX, VIX and VIXMO levels, open orders, and long options (standalone, or a
+  debit spread's long leg) whose |delta| has reached `debit_option_alert_delta`
 
 Betas come from one year of IB daily bars, refreshed once a day, and are
 shared with the strategy through the Nautilus cache. VIX options are left out
 of the SPX numbers: they move against the market and price off VIX futures.
 
 **Discretionary** ([`strategy.py`](thetagang_nt/strategy.py)) is a Nautilus
-`Strategy`. Every `strategy.interval_secs`, during NYSE hours, it works
+`Strategy`. Every `strategy.trading.interval_secs`, during NYSE hours, it works
 through the account symbol by symbol:
 
 1. **Short options and credit verticals** are rolled when
-   `[strategy.roll_when]` says so (near expiry with enough P&L, or a P&L
+   `[strategy.credit.roll_when]` says so (near expiry with enough P&L, or a P&L
    target), or closed above `close_at_pnl`. A roll targets
-   `[strategy.roll_target]` (DTE, delta). The new strike may move against
+   `[strategy.credit.roll_target]` (DTE, delta). The new strike may move against
    you by at most the premium already captured, and an in-the-money position
    only rolls to the same or a safer strike. Covered calls never roll below
    the share cost. When no roll is found, `close_if_unable_to_roll` closes a
    profitable position inside `max_dte` instead.
-2. **Debit verticals** are closed at `debit_spread_take_profit` of their
-   maximum profit, and rolled out once within `roll_when.dte` days of expiry,
-   unless the roll costs more than `debit_spread_max_roll_debit` × the width.
+2. **Debit verticals and standalone long calls/puts** follow `[strategy.debit]`.
+   A debit vertical is closed at `debit.take_profit` of its maximum profit; a
+   long option once it is worth (1 + `debit.long_take_profit_gain`) × the
+   premium paid. Otherwise both are rolled out once within
+   `debit.roll_when.dte` days of expiry to `[strategy.debit.roll_target]` (the
+   new long leg's DTE and delta), unless the roll costs more than
+   `debit.max_roll_debit` × the width (a vertical) or × the old option's value
+   (a long option).
 3. **The VIX call hedge** sells all long VIX calls once VIX is above
    `close_hedges_when_vix_exceeds`. With no hedge held, it buys calls near
    `delta` and `target_dte` for `weight` × net liquidation, taking the
@@ -85,7 +90,7 @@ through the account symbol by symbol:
    count that symbol's unquoted options as zero delta instead (the dashboard
    still lists them under Attention). Neutral means
    |beta delta $| is within the band: a typical 1% SPX day may cost at most
-   `delta_band_theta_days` days of theta, capped at `delta_band_nav_pct` of net
+   `delta_band.theta_days` days of theta, capped at `delta_band.nav_pct` of net
    liq. The dashboard colours SPX delta and beta delta $ green within the band,
    orange up to twice it, and red beyond. With `approve_trades = "manual"` the
    strategy only shows this plan; you open trades with
@@ -101,11 +106,11 @@ The strategy leaves alone index options
 (SPX, NDX, …), calendar and diagonal legs, and symbols with `no_trading`.
 
 Contracts are chosen like this: load the chain for the first
-`chain_expirations` expirations at or past the target DTE, quote the
-`chain_strikes` strikes nearest the money, compute Nautilus greeks, and take
+`chain.expirations` expirations at or past the target DTE, quote the
+`chain.strikes` strikes nearest the money, compute Nautilus greeks, and take
 the nearest expiry, then the largest |delta| at or below the target.
 
-> **`strategy.dry_run = true` is the default.** Orders are logged and counted
+> **`strategy.trading.dry_run = true` is the default.** Orders are logged and counted
 > on the dashboard, never sent. Turn it off only after a paper run during
 > market hours.
 
@@ -245,7 +250,7 @@ later. While it waits, the **thetagang pre-trade** dashboard in Grafana shows
 the same numbers.
 
 To approve every new trade yourself, set `approve_trades = "manual"` in
-`[strategy]`: the running strategy still rolls, closes and runs the VIX hedge,
+`[strategy.trading]`: the running strategy still rolls, closes and runs the VIX hedge,
 but only shows its trade plan (status "awaiting approval") instead of opening
 it.
 
@@ -275,12 +280,16 @@ lists every key with a comment.
 | `[node]` | trader id, log level, optional log directory, optional Redis cache |
 | `[ib]` | host, port, client id, `account_id`, `market_data_type` (`REALTIME`, or `DELAYED_FROZEN` for last prices while markets are closed). Add `[ib.gateway]` to have Nautilus start IB Gateway in Docker |
 | `[monitor]` | refresh interval, metrics address and port, long-option alert delta, stress moves |
-| `[strategy]` | `dry_run`, run interval, `market_hours_only`, `delta_band_theta_days`, `delta_band_nav_pct`, `approve_trades` (`auto`/`manual`), `pretrade_metrics_port`, `proposal_max_age_secs`, `minimum_credit`, debit-spread take-profit and maximum roll debit, `reprice_after_secs`, `chain_strikes`, `chain_expirations`, quote timeout |
-| `[strategy.roll_target]` | what a roll moves into: `dte`, `max_dte`, `delta` |
-| `[strategy.roll_when]` | `pnl`, `dte`, `min_pnl`, `max_dte`, `close_at_pnl`, `close_if_unable_to_roll`; `.calls` and `.puts` set `itm`, `always_when_itm`, `credit_only` |
+| `[strategy.trading]` | `dry_run`, `interval_secs`, `market_hours_only`, `approve_trades` (`auto`/`manual`), `proposal_max_age_secs`, `reprice_after_secs`, `metrics_port`, `pretrade_metrics_port` |
+| `[strategy.delta_band]` | `theta_days`, `nav_pct`: the SPX delta neutral band |
+| `[strategy.chain]` | `strikes`, `expirations`, `quote_timeout_secs`, `minimum_credit`: picking a contract by delta |
+| `[strategy.credit.roll_target]` | standalone short calls/puts and credit spreads: what a roll moves into (`dte`, `max_dte`, `delta`) |
+| `[strategy.credit.roll_when]` | `pnl`, `dte`, `min_pnl`, `max_dte`, `close_at_pnl`, `close_if_unable_to_roll`; `.calls` and `.puts` set `itm`, `always_when_itm`, `credit_only` |
+| `[strategy.debit]` | debit spreads and standalone long calls/puts: `take_profit` (spreads), `long_take_profit_gain` (longs), `max_roll_debit`; `.roll_when` (`dte`, `max_dte`, `close_if_unable_to_roll`) and `.roll_target` (`dte`, `max_dte`, `delta` of the new long leg) |
 | `[strategy.vix_call_hedge]` | `enabled`, `delta`, `target_dte`, `close_hedges_when_vix_exceeds`, `ignore_dte`, and `[[…allocation]]` bands (`lower_bound` ≤ VIXMO < `upper_bound`, first match wins, `weight` × net liquidation) |
 | `[[pretrade.candidates]]` | `name`, and `[[pretrade.candidates.trades]]`: `symbol`, `structure` (`long_call`, `short_call`, `long_put`, `short_put`, `put_credit_spread`, `call_credit_spread`, `put_debit_spread`, `call_debit_spread`), `delta`, `dte`, `width` (spreads only), `weight`, `max_contracts`: ideas `pretrade` sizes and compares |
-| `[strategy.symbols.<SYM>]` | `no_trading`, `put_strike_limit`, `call_strike_limit`, `delta`, `max_dte`, `ignore_missing_greeks` |
+| `[[strategy.structures]]` | `name`, `legs` (contract labels as the dashboard shows them, e.g. `"AA 20261218 40P"`): option legs you hold as one position; recognised before any automatic grouping, left to you, and never resized by the trade plan |
+| `[strategy.symbols.<SYM>]` | `no_trading`, `put_strike_limit`, `call_strike_limit`, `delta` and `max_dte` (override `credit.roll_target`), `ignore_missing_greeks` |
 
 Remove the whole `[strategy]` section to run the monitor only. The roll,
 discretionary and VIX keys mean the same as in `thetagang`, so values can be
@@ -305,7 +314,7 @@ Alerts are sent 09:30–16:00 New York time on weekdays, repeated at most every
 | thetagang-nt down | the bot was running in the last 8 hours and its metrics are now unreachable (5 min) |
 | data stale | no refresh for over 5 minutes (5 min) |
 | positions without greeks | any position has no greeks for 30 min: SPX delta is incomplete and new trades are blocked |
-| long option to roll by hand | a long option's \|delta\| reached `long_option_alert_delta` |
+| long option at the alert delta | a long option's \|delta\| reached `debit_option_alert_delta`: standalone longs, and the long leg of a debit spread |
 | SPX delta out of band | \|beta delta $\| outside the neutral band for an hour with `dry_run = false` |
 | stress loss | a −10% SPX move (beta-weighted) would lose more than 5% of net liquidation (15 min) |
 | order sent | the bot sent a real (not dry-run) order in the last 10 minutes |
@@ -319,6 +328,7 @@ The dashboard (everything the old bot printed):
 | Risk | portfolio greeks now / after the SPX Δ=0 proposals / after the trade plan; stress P&L, beta-weighted and with all betas at 1; the VIX call hedge (calls held, allocation at VIXMO, close level) and what it would do |
 | By symbol | beta delta $ by symbol; today's P&L by symbol and its attribution (from SPX, unexplained, delta, gamma, theta, vega, residual); the Symbols table (beta, delta, delta $, beta delta $, gamma, theta, vega, volga) |
 | Positions summary | shares, short/long puts and calls, average strikes, weight now and target weight for SPX Δ=0, target beta delta $, share-equivalent change, side, and the net target contracts (display only) |
+| Structures | each symbol's option legs grouped into the positions they form (your `[[strategy.structures]]` groups first, then butterflies, long straddles/strangles, verticals, calendars/diagonals, single legs), with combined cost, value, P&L, max profit and loss and breakevens at expiry (one-expiry structures), Δ Γ Θ V, and whether the bot manages it (credit or debit rules) or leaves it to you; butterflies, straddles, strangles, calendars/diagonals and your groups are "by hand" for now |
 | Options and spreads | every short, long, credit and debit vertical with quantity, DTE, delta, P&L of the premium, the take-profit price, and what the strategy's rules would do (roll / close / keep / by hand) |
 | Positions | quantity, cost, price, unrealized P&L, P&L ratio, DTE |
 | Trade plan | the configured trades sized to SPX Δ=0 and why (only while the trading strategy runs) |
@@ -364,7 +374,7 @@ add your own panels.
 - **"Order overfill rejected" at startup.** Nautilus can't reconcile
   fractional shares. It doesn't affect the strategy.
 - **The other bot runs out of market data.** Both share IB's per-account limit
-  on simultaneous quotes. Lower `chain_strikes` / `chain_expirations`, or
+  on simultaneous quotes. Lower `chain.strikes` / `chain.expirations`, or
   don't run both during market hours.
 
 ---

@@ -9,7 +9,7 @@ What it proposes, first that applies:
 - the strategy's own trade plan (new trades, or the resizes of what you hold).
 Every "after" number comes from the same build_book / stress_pnl the monitor
 uses, run on the held legs plus the proposed ones. It prints now vs each
-scenario, publishes the same on strategy.pretrade_metrics_port (the Pre-trade
+scenario, publishes the same on strategy.trading.pretrade_metrics_port (the Pre-trade
 dashboard), asks what to send, re-prices at the confirmation, and sends through
 the strategy's own order path (dry_run applies). Then it shuts down."""
 
@@ -145,7 +145,7 @@ def risk(
     """The headline risk of a book, as the dashboard shows it."""
     nlv = net_liquidation(cache) or 0.0
     band = delta_band_dollars(
-        book.theta, nlv, cfg.delta_band_theta_days, cfg.delta_band_nav_pct
+        book.theta, nlv, cfg.delta_band.theta_days, cfg.delta_band.nav_pct
     )
     gamma_day = gamma_pnl(book.gamma, book.spx, expected_move(price(cache, VIX)))
     even = breakeven_move(book.theta, book.gamma, book.spx)
@@ -203,7 +203,7 @@ class PreTrade(Discretionary):
         legs = held_legs(self.cache)
         ids = {leg.instrument_id for leg in legs} | {SPX, VIX, VIXMO}
         ids |= {underlying_id(leg.symbol) for leg in legs}
-        await aio.wait_for_prices(self, ids, cfg.quote_timeout_secs)
+        await aio.wait_for_prices(self, ids, cfg.chain.quote_timeout_secs)
         legs = held_legs(self.cache)
         spx = price(self.cache, SPX)
         if not spx:
@@ -221,18 +221,18 @@ class PreTrade(Discretionary):
             STATUS.labels(status="nothing to send").set(1)
             print("Nothing to send.", flush=True)
             return
-        dry = "(DRY RUN) " if cfg.dry_run else ""
+        dry = "(DRY RUN) " if cfg.trading.dry_run else ""
         if len(scenarios) == 1:
             count = len(sendable(scenarios[choices[0]]))
             prompt = f"Send {dry}these {count} order(s)? [y/N] "
         else:
             menu = "  ".join(f"{k}={n}" for k, n in enumerate(choices, 1))
             prompt = f"Send {dry}which? 0=none, no trade  {menu}  (Enter: 0) "
-        answer = await ask_within(prompt, cfg.proposal_max_age_secs)
+        answer = await ask_within(prompt, cfg.trading.proposal_max_age_secs)
         STATUS.clear()
         if answer is None:  # its prices are too old to send now: end the run
             STATUS.labels(status="no answer: nothing sent").set(1)
-            mins = cfg.proposal_max_age_secs / 60
+            mins = cfg.trading.proposal_max_age_secs / 60
             print(f"\nNo answer within {mins:g} min: nothing sent.", flush=True)
             return
         answer = answer.strip().lower()
@@ -254,9 +254,9 @@ class PreTrade(Discretionary):
                 continue
             px = sum(r * m for (_, r), m in zip(p.combo, mids, strict=True))
             await self._submit(p.symbol, f"pretrade {p.name}", p.combo, p.qty, px)
-            done = "logged, not sent (dry_run)" if cfg.dry_run else "sent"
+            done = "logged, not sent (dry_run)" if cfg.trading.dry_run else "sent"
             print(f"{order_text(self.cache, p.combo, p.qty)} @ {px:+.2f}: {done}")
-        sent = "sent (dry run)" if cfg.dry_run else "sent"
+        sent = "sent (dry run)" if cfg.trading.dry_run else "sent"
         STATUS.labels(status=f"{sent}: {chosen}").set(1)
         CHOICE.labels(choice=f"{stamp} {sent}: {chosen}").set(time.time())
         print(

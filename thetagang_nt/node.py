@@ -45,7 +45,7 @@ def build(path: str, role: str = "all", adhoc: tuple[str, ...] = ()) -> TradingN
             stress_moves=app.monitor.stress_moves,
         )
         node.trader.add_strategy(PreTrade(config, extras=extras))
-        start_http_server(strategy.pretrade_metrics_port, monitor.metrics_addr)
+        start_http_server(strategy.trading.pretrade_metrics_port, monitor.metrics_addr)
     elif strategy is not None:
         from thetagang_nt.strategy import Discretionary
 
@@ -53,7 +53,7 @@ def build(path: str, role: str = "all", adhoc: tuple[str, ...] = ()) -> TradingN
             Discretionary(strategy, pretrade=app.pretrade, extras=extras)
         )
     if role == "trade":  # the strategy's own metrics; the monitor publishes none here
-        start_http_server(strategy.metrics_port, monitor.metrics_addr)
+        start_http_server(strategy.trading.metrics_port, monitor.metrics_addr)
     node.add_data_client_factory(IB, InteractiveBrokersLiveDataClientFactory)
     node.add_exec_client_factory(IB, InteractiveBrokersLiveExecClientFactory)
     node.build()
