@@ -6,9 +6,9 @@ ask these functions what to do, so every rule is unit-testable on plain data."""
 from __future__ import annotations
 
 import math
+from collections import defaultdict
 from dataclasses import dataclass, field
 from datetime import date
-from collections import defaultdict
 from typing import Any
 
 import numpy as np
@@ -352,6 +352,213 @@ def structure_figures(
         max_loss=lo,
         breakevens=tuple(evens),
     )
+
+
+# -------------------------------------------------- structure recommendations
+# What to do with a structure the bot leaves to you: one recommender per kind,
+# each (structure, figures, underlying, greeks, settings, today) -> (action, why).
+# Add a kind by adding a function to RECOMMENDERS. Read-only: shown, not traded.
+
+
+def _money(x: float) -> str:
+    return f"-${-x:,.0f}" if x < 0 else f"${x:,.0f}"
+
+
+def _half(fig: StructureFigures) -> str:
+    n = int(fig.qty)
+    return f"close {n // 2} of {n} (partial take-profit)"
+
+
+def _share(pnl: float | None, of: float | None) -> float | None:
+    """P&L as a share of `of` (max profit or debit); None without a quote."""
+    if pnl is None or of is None or math.isinf(of) or of <= 0:
+        return None
+    return pnl / of
+
+
+def _butterfly(
+    s: Structure,
+    fig: StructureFigures,
+    und: float | None,
+    greeks: Any,
+    cfg: Any,
+    today: date,
+) -> tuple[str, ...]:
+    c = cfg.butterfly
+    share = _share(fig.pnl, fig.max_profit)
+    if share is not None and share >= c.take_profit:
+        return "close (take-profit)", f"P&L {share:.0%} of max profit"
+    if fig.dte <= c.close_dte:
+        return "close (near expiry)", f"{fig.dte} days left: the body's gamma"
+    if share is not None and fig.qty >= 2 and share >= c.partial_take_profit:
+        return _half(fig), f"P&L {share:.0%} of max profit"
+    lo, hi = min(p.strike for p in s.legs), max(p.strike for p in s.legs)
+    if s.kind == "long butterfly" and und is not None and not lo < und < hi:
+        return (
+            "roll whole (re-center)",
+            f"price {und:,.2f} outside the wings {lo:g}-{hi:g}",
+        )
+    if share is None:
+        return "review", "no quote: P&L unknown"
+    return "keep", f"P&L {share:.0%} of max profit"
+
+
+def _straddle(
+    s: Structure,
+    fig: StructureFigures,
+    und: float | None,
+    greeks: Any,
+    cfg: Any,
+    today: date,
+) -> tuple[str, ...]:
+    c = cfg.straddle
+    gain = _share(fig.pnl, fig.cost)
+    if gain is not None and gain >= c.take_profit_gain:
+        return "close (take-profit)", f"P&L {gain:+.0%} of the debit"
+    if gain is not None and fig.qty >= 2 and gain >= c.partial_take_profit_gain:
+        return _half(fig), f"P&L {gain:+.0%} of the debit"
+    for leg in s.legs:
+        g = greeks.get(leg.instrument_id)
+        if (
+            g is not None
+            and abs(g.delta) >= c.leg_delta
+            and (leg.mid or 0) > leg.avg_px
+        ):
+            return (
+                f"adjust leg: close {option_label(leg)}",
+                f"|delta| {abs(g.delta):.2f}: bank the move, the other leg stays",
+                leg_order(leg, "sell to close"),
+            )
+    if fig.dte <= c.roll_dte:
+        return "roll whole (out in time)", f"{fig.dte} days left: theta speeds up"
+    if gain is None:
+        return "review", "no quote: P&L unknown"
+    return "keep", f"P&L {gain:+.0%} of the debit"
+
+
+def _calendar(
+    s: Structure,
+    fig: StructureFigures,
+    und: float | None,
+    greeks: Any,
+    cfg: Any,
+    today: date,
+) -> tuple[str, ...]:
+    c = cfg.calendar
+    long = next(p for p in s.legs if p.qty > 0)
+    short = next(p for p in s.legs if p.qty < 0)
+    if short.expiry and long.expiry and short.expiry > long.expiry:
+        return "review", "the short leg expires after the long one"
+    gain = _share(fig.pnl, fig.cost)
+    if gain is not None and gain >= c.take_profit:
+        return "close (take-profit)", f"P&L {gain:+.0%} of the debit"
+    long_dte, short_dte = long.dte(today), short.dte(today)
+    if long_dte <= c.close_dte:
+        return "close (long leg near expiry)", f"long leg: {long_dte} days left"
+    if short_dte <= c.short_roll_dte:
+        return (
+            f"adjust leg: roll {option_label(short)} out",
+            f"short leg: {short_dte} days left; sell the next expiry",
+            leg_order(short, "buy to close") + ", then sell the next expiry",
+        )
+    if gain is None:
+        return "review", "no quote: P&L unknown"
+    return "keep", f"P&L {gain:+.0%} of the debit"
+
+
+def _group(
+    s: Structure,
+    fig: StructureFigures,
+    und: float | None,
+    greeks: Any,
+    cfg: Any,
+    today: date,
+) -> tuple[str, ...]:
+    return "review", "your group: no rules for it"
+
+
+def structure_take_profit(s: Structure, fig: StructureFigures, cfg: Any) -> str:
+    """Where the recommenders take profit, as a price per share of one structure
+    ("sell >= $2.40"); "-" for kinds without a target or with no cost."""
+    if s.kind == "long butterfly":
+        top = fig.max_profit
+        target = (
+            fig.cost + cfg.butterfly.take_profit * top
+            if top and not math.isinf(top)
+            else None
+        )
+    elif s.kind in ("long straddle", "long strangle"):
+        target = fig.cost * (1 + cfg.straddle.take_profit_gain)
+    elif s.kind in ("calendar", "diagonal"):
+        target = fig.cost * (1 + cfg.calendar.take_profit)
+    else:
+        return "-"
+    per_share = fig.qty * s.legs[0].multiplier
+    if target is None or fig.cost <= 0 or not per_share:
+        return "-"
+    return f"sell >= ${target / per_share:,.2f}"
+
+
+# structure kind -> its [strategy.<section>]: the settings, and `trade`
+SECTIONS = {
+    "long butterfly": "butterfly",
+    "short butterfly": "butterfly",
+    "long straddle": "straddle",
+    "long strangle": "straddle",
+    "calendar": "calendar",
+    "diagonal": "calendar",
+}
+
+
+RECOMMENDERS = {
+    "long butterfly": _butterfly,
+    "short butterfly": _butterfly,
+    "long straddle": _straddle,
+    "long strangle": _straddle,
+    "calendar": _calendar,
+    "diagonal": _calendar,
+    "group": _group,
+}
+
+
+def leg_order(leg: Leg, side: str, qty: float | None = None) -> str:
+    """One leg as its own order, at its mid: legs opened at different times show
+    in TWS as separate positions, so a combo price can't be set on them."""
+    order = f"{side} {abs(leg.qty) if qty is None else qty:g} {option_label(leg)}"
+    if leg.mid is None:
+        return f"{order} (no quote now)"
+    return f"{order} at {'<=' if side.startswith('buy') else '>='} ${leg.mid:,.2f}"
+
+
+def recommend(
+    s: Structure,
+    fig: StructureFigures,
+    und: float | None,
+    greeks: Any,
+    cfg: Any,
+    today: date,
+) -> tuple[str, str, str] | None:
+    """(action, why, leg order) for a structure the bot leaves to you; the leg
+    order only when one leg is to be traded on its own. None for the kinds the
+    bot's own rules manage. `cfg`: the [strategy] settings."""
+    rec = RECOMMENDERS.get(s.kind)
+    if rec is None:
+        return None
+    action, why, *order = rec(s, fig, und, greeks, cfg, today)
+    if not order and action.startswith(("close", "roll whole")):
+        part = int(fig.qty) // 2 / fig.qty if "partial" in action else 1.0
+        order = [
+            "; ".join(
+                leg_order(
+                    p,
+                    "sell to close" if p.qty > 0 else "buy to close",
+                    abs(p.qty) * part,
+                )
+                for p in s.legs
+            )
+            + (", then open the new one" if action.startswith("roll") else "")
+        ]
+    return action, why, order[0] if order else "-"
 
 
 # ------------------------------------------------------------------- P&L
@@ -1013,6 +1220,18 @@ def vertical_breakeven(short: Leg, long: Leg) -> float:
     return low + net if short.right == "C" else high - net
 
 
+def debit_roll_reason(
+    dte: int, long_delta: float | None, roll_dte: int, roll_delta: float
+) -> str | None:
+    """Why a debit spread or long option is due to roll ([debit.roll_when]):
+    DTE <= dte, or its long leg at |delta| >= delta (0: off); None if neither."""
+    if dte <= roll_dte:
+        return f"{dte} days left"
+    if roll_delta and long_delta is not None and abs(long_delta) >= roll_delta:
+        return f"|delta| {abs(long_delta):.2f} >= {roll_delta:g}"
+    return None
+
+
 def position_actions(
     legs: list[Leg],
     und: float | None,
@@ -1023,10 +1242,12 @@ def position_actions(
     debit_roll_dte: int = 10,
     long_take_profit_gain: float = 1.0,
     groups: dict[str, tuple[str, ...]] | None = None,
+    deltas: dict[Any, float] | None = None,
+    debit_roll_delta: float = 0.0,
 ) -> list[Action]:
     """The roll/close/keep decision for every option leg or vertical of one
     symbol, by the same rules the strategy trades with. Standalone longs follow
-    the debit spread rules: take profit, else roll once DTE <= debit_roll_dte. A roll can still fail
+    the debit spread rules: take profit, else roll (debit_roll_reason). A roll can still fail
     when no contract fits; the strategy then closes or leaves it, as logged."""
     out: list[Action] = []
     symbol = legs[0].symbol if legs else ""
@@ -1080,8 +1301,13 @@ def position_actions(
                 action = "by hand (no quote)"
             elif value >= target:
                 action = "close (take-profit)"
-            elif dte <= debit_roll_dte:
-                action = "roll"
+            elif why := debit_roll_reason(
+                dte,
+                (deltas or {}).get(long.instrument_id),
+                debit_roll_dte,
+                debit_roll_delta,
+            ):
+                action = f"roll ({why})"
             else:
                 action = "keep"
             out.append(
@@ -1173,8 +1399,13 @@ def position_actions(
                 action = "by hand (no cost / no quote)"
             elif leg.mid >= tp:
                 action = "close (take-profit)"
-            elif dte <= debit_roll_dte:
-                action = "roll"
+            elif why := debit_roll_reason(
+                dte,
+                (deltas or {}).get(leg.instrument_id),
+                debit_roll_dte,
+                debit_roll_delta,
+            ):
+                action = f"roll ({why})"
             else:
                 action = "keep"
             out.append(

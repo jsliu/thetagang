@@ -60,6 +60,7 @@ class AccountExtras:
         self.port, self.client_id, self.account = port, client_id, account
         self.ib = IB()
         self._pnl: dict[int, Any] = {}  # conId -> live PnLSingle subscription
+        self._account_pnl: Any = None  # live PnL subscription for the account
         self._labels: dict[int, str] = {}  # conId -> contract_label, combo legs
         self._lock = asyncio.Lock()  # --role all: the monitor and strategy share it
 
@@ -73,7 +74,7 @@ class AccountExtras:
                     readonly=True,
                     timeout=15,
                 )
-                self._pnl = {}
+                self._pnl, self._account_pnl = {}, None
 
     async def read(self) -> tuple[dict[str, float], dict[str, float]]:
         """(account fields, IB daily P&L by position name)."""
@@ -87,6 +88,16 @@ class AccountExtras:
                 and v.currency in ("USD", "BASE", "")
                 and (x := _number(v.value)) is not None
             ):
+                summary[field] = x
+        # the account's daily P&L as TWS shows it: open positions plus those closed
+        # today and commissions, which a sum over open positions can't include
+        if self._account_pnl is None:
+            self._account_pnl = self.ib.reqPnL(account, "")
+        for field, value in (
+            ("daily_pnl", self._account_pnl.dailyPnL),
+            ("realized_pnl", self._account_pnl.realizedPnL),  # TWS's Realized P&L
+        ):
+            if (x := _number(value)) is not None:
                 summary[field] = x
         held = {
             p.contract.conId: p.contract

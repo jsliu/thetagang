@@ -172,9 +172,11 @@ class CreditConfig(NautilusConfig, frozen=True):
 
 
 class DebitRollWhenConfig(NautilusConfig, frozen=True):
-    """Roll a debit spread once dte <= dte (unless take-profit closed it)."""
+    """Roll a debit spread or long option once dte <= dte or its long leg's
+    |delta| >= delta (unless take-profit closed it)."""
 
     dte: int = 10
+    delta: float = 0.0  # also roll once the long leg's |delta| >= this; 0: off
     max_dte: int | None = None
     close_if_unable_to_roll: bool = False
 
@@ -196,6 +198,34 @@ class DebitConfig(NautilusConfig, frozen=True):
     roll_target: TargetConfig = TargetConfig()
 
 
+class ButterflyConfig(NautilusConfig, frozen=True):
+    """[strategy.butterfly]: what the Structures table recommends."""
+
+    trade: bool = False  # true: the bot places these recommendations (dry_run applies)
+    take_profit: float = 0.5  # close at this share of the max profit
+    partial_take_profit: float = 0.25  # close half (2+ held) at this share
+    close_dte: int = 7  # close with this many days or fewer left
+
+
+class StraddleConfig(NautilusConfig, frozen=True):
+    """[strategy.straddle]: long straddles and strangles."""
+
+    trade: bool = False  # true: the bot places these recommendations (dry_run applies)
+    take_profit_gain: float = 0.5  # close at P&L >= this x the debit
+    partial_take_profit_gain: float = 0.25  # close half (2+ held)
+    leg_delta: float = 0.7  # a winning leg at |delta| >= this: close that leg
+    roll_dte: int = 21  # roll the whole position out in time
+
+
+class CalendarConfig(NautilusConfig, frozen=True):
+    """[strategy.calendar]: calendars and diagonals."""
+
+    trade: bool = False  # true: the bot places these recommendations (dry_run applies)
+    take_profit: float = 0.25  # close at P&L >= this x the debit
+    short_roll_dte: int = 5  # roll the short leg out with this many days left
+    close_dte: int = 10  # close once the long leg has this many days left
+
+
 class StructureGroupConfig(NautilusConfig, frozen=True):
     """[[strategy.structures]]: option legs you hold as one position, by the
     dashboard's contract labels ("AA 20261218 40P"); left to you ("by hand")."""
@@ -212,6 +242,9 @@ class DiscretionaryConfig(StrategyConfig, frozen=True):
     debit: DebitConfig = DebitConfig()
     vix_call_hedge: VixHedgeConfig = VixHedgeConfig()
     symbols: dict[str, SymbolConfig] = {}
+    butterfly: ButterflyConfig = ButterflyConfig()
+    straddle: StraddleConfig = StraddleConfig()
+    calendar: CalendarConfig = CalendarConfig()
     structures: list[StructureGroupConfig] = []
 
     def groups(self) -> dict[str, tuple[str, ...]]:
@@ -225,7 +258,6 @@ class MonitorConfig(ActorConfig, frozen=True):
     publish: bool = (
         True  # serve /metrics; off in --role trade, which only needs the betas
     )
-    debit_option_alert_delta: float = 0.8
     stress_moves: tuple[float, ...] = (-0.10, -0.05, -0.01, 0.01, 0.05, 0.10)
 
 
@@ -244,6 +276,9 @@ class NodeConfig(NautilusConfig, frozen=True):
     log_directory: str | None = None
     redis_host: str | None = None  # persist the cache in Redis when set
     redis_port: int = 6379
+    # compare positions with IB this often, so trades made elsewhere (TWS, the
+    # phone app) reach the cache without a restart; 0: only at startup
+    position_check_secs: int = 60
 
 
 class CandidateConfig(NautilusConfig, frozen=True):
@@ -343,7 +378,11 @@ def node_config(app: AppConfig, client_id: int | None = None) -> TradingNodeConf
         cache=cache,
         # IB reports whole shares for a fractional position (17.738 -> 18): accept
         # its fill instead of leaving a stand-in order open that blocks the symbol
-        exec_engine=LiveExecEngineConfig(reconciliation=True, allow_overfills=True),
+        exec_engine=LiveExecEngineConfig(
+            reconciliation=True,
+            allow_overfills=True,
+            position_check_interval_secs=app.node.position_check_secs or None,
+        ),
         data_clients={
             IB: InteractiveBrokersDataClientConfig(
                 market_data_type=getattr(IBMarketDataTypeEnum, ib.market_data_type),

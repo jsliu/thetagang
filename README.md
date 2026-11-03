@@ -43,8 +43,7 @@ publishes Prometheus metrics on port 9464:
   the premium, days to expiry, delta, implied volatility
 - stress P&L for each SPX move in `monitor.stress_moves` (default ±1% (a typical day), ±5%, ±10%),
   with each stock moving by beta × the SPX move, and with every beta set to 1
-- SPX, VIX and VIXMO levels, open orders, and long options (standalone, or a
-  debit spread's long leg) whose |delta| has reached `debit_option_alert_delta`
+- SPX, VIX and VIXMO levels, and open orders
 
 Betas come from one year of IB daily bars, refreshed once a day, and are
 shared with the strategy through the Nautilus cache. VIX options are left out
@@ -66,7 +65,8 @@ through the account symbol by symbol:
    A debit vertical is closed at `debit.take_profit` of its maximum profit; a
    long option once it is worth (1 + `debit.long_take_profit_gain`) × the
    premium paid. Otherwise both are rolled out once within
-   `debit.roll_when.dte` days of expiry to `[strategy.debit.roll_target]` (the
+   `debit.roll_when.dte` days of expiry, or once the long leg's |delta| reaches
+   `debit.roll_when.delta` (deep in the money), to `[strategy.debit.roll_target]` (the
    new long leg's DTE and delta), unless the roll costs more than
    `debit.max_roll_debit` × the width (a vertical) or × the old option's value
    (a long option).
@@ -87,8 +87,7 @@ through the account symbol by symbol:
    SPX delta neutral, and while any position has no greeks. An option with no
    quote at IB (an illiquid strike) has no greeks and so blocks the plan every
    day; set `ignore_missing_greeks = true` under `[strategy.symbols.<SYM>]` to
-   count that symbol's unquoted options as zero delta instead (the dashboard
-   still lists them under Attention). Neutral means
+   count that symbol's unquoted options as zero delta instead. Neutral means
    |beta delta $| is within the band: a typical 1% SPX day may cost at most
    `delta_band.theta_days` days of theta, capped at `delta_band.nav_pct` of net
    liq. The dashboard colours SPX delta and beta delta $ green within the band,
@@ -285,9 +284,10 @@ lists every key with a comment.
 | `[strategy.chain]` | `strikes`, `expirations`, `quote_timeout_secs`, `minimum_credit`: picking a contract by delta |
 | `[strategy.credit.roll_target]` | standalone short calls/puts and credit spreads: what a roll moves into (`dte`, `max_dte`, `delta`) |
 | `[strategy.credit.roll_when]` | `pnl`, `dte`, `min_pnl`, `max_dte`, `close_at_pnl`, `close_if_unable_to_roll`; `.calls` and `.puts` set `itm`, `always_when_itm`, `credit_only` |
-| `[strategy.debit]` | debit spreads and standalone long calls/puts: `take_profit` (spreads), `long_take_profit_gain` (longs), `max_roll_debit`; `.roll_when` (`dte`, `max_dte`, `close_if_unable_to_roll`) and `.roll_target` (`dte`, `max_dte`, `delta` of the new long leg) |
+| `[strategy.debit]` | debit spreads and standalone long calls/puts: `take_profit` (spreads), `long_take_profit_gain` (longs), `max_roll_debit`; `.roll_when` (`dte`, `delta`, `max_dte`, `close_if_unable_to_roll`) and `.roll_target` (`dte`, `max_dte`, `delta` of the new long leg) |
 | `[strategy.vix_call_hedge]` | `enabled`, `delta`, `target_dte`, `close_hedges_when_vix_exceeds`, `ignore_dte`, and `[[…allocation]]` bands (`lower_bound` ≤ VIXMO < `upper_bound`, first match wins, `weight` × net liquidation) |
 | `[[pretrade.candidates]]` | `name`, and `[[pretrade.candidates.trades]]`: `symbol`, `structure` (`long_call`, `short_call`, `long_put`, `short_put`, `put_credit_spread`, `call_credit_spread`, `put_debit_spread`, `call_debit_spread`), `delta`, `dte`, `width` (spreads only), `weight`, `max_contracts`: ideas `pretrade` sizes and compares |
+| `[strategy.butterfly]`, `[strategy.straddle]`, `[strategy.calendar]` | what the Structures table recommends for butterflies (`take_profit`, `partial_take_profit` of the max profit, `close_dte`), long straddles/strangles (`take_profit_gain`, `partial_take_profit_gain` of the debit, `leg_delta`, `roll_dte`) and calendars/diagonals (`take_profit` of the debit, `short_roll_dte`, `close_dte`). Each has `trade` (default false): true lets the bot place the recommendation (dry_run applies): close or close half as one combo with every leg in its ratio, close a straddle's winning leg, or roll a calendar's short leg to the next expiry before the long leg's for a net credit. "Roll whole" is never placed: it stays yours |
 | `[[strategy.structures]]` | `name`, `legs` (contract labels as the dashboard shows them, e.g. `"AA 20261218 40P"`): option legs you hold as one position; recognised before any automatic grouping, left to you, and never resized by the trade plan |
 | `[strategy.symbols.<SYM>]` | `no_trading`, `put_strike_limit`, `call_strike_limit`, `delta` and `max_dte` (override `credit.roll_target`), `ignore_missing_greeks` |
 
@@ -314,7 +314,6 @@ Alerts are sent 09:30–16:00 New York time on weekdays, repeated at most every
 | thetagang-nt down | the bot was running in the last 8 hours and its metrics are now unreachable (5 min) |
 | data stale | no refresh for over 5 minutes (5 min) |
 | positions without greeks | any position has no greeks for 30 min: SPX delta is incomplete and new trades are blocked |
-| long option at the alert delta | a long option's \|delta\| reached `debit_option_alert_delta`: standalone longs, and the long leg of a debit spread |
 | SPX delta out of band | \|beta delta $\| outside the neutral band for an hour with `dry_run = false` |
 | stress loss | a −10% SPX move (beta-weighted) would lose more than 5% of net liquidation (15 min) |
 | order sent | the bot sent a real (not dry-run) order in the last 10 minutes |
@@ -323,13 +322,12 @@ The dashboard (everything the old bot printed):
 
 | Row | Panels |
 |---|---|
-| Headline | one tile each, the latest value (shown in any time range): net liquidation, unrealized P&L, SPX delta, theta per day, vega per vol point, volga (vega change per vol point), gamma, *need attention* (positions without greeks + long options at the alert delta), data age |
+| Headline | one tile each, the latest value (shown in any time range): net liquidation, unrealized P&L, SPX delta, theta per day, vega per vol point, volga (vega change per vol point), gamma, *attention* (structures whose recommendation is to roll, close or adjust a leg now), data age |
 | Account | available funds, cash, excess liquidity, initial and maintenance margin, buying power, cushion; SPX move today |
 | Risk | portfolio greeks now / after the SPX Δ=0 proposals / after the trade plan; stress P&L, beta-weighted and with all betas at 1; the VIX call hedge (calls held, allocation at VIXMO, close level) and what it would do |
 | By symbol | beta delta $ by symbol; today's P&L by symbol and its attribution (from SPX, unexplained, delta, gamma, theta, vega, residual); the Symbols table (beta, delta, delta $, beta delta $, gamma, theta, vega, volga) |
 | Positions summary | shares, short/long puts and calls, average strikes, weight now and target weight for SPX Δ=0, target beta delta $, share-equivalent change, side, and the net target contracts (display only) |
-| Structures | each symbol's option legs grouped into the positions they form (your `[[strategy.structures]]` groups first, then butterflies, long straddles/strangles, verticals, calendars/diagonals, single legs), with combined cost, value, P&L, max profit and loss and breakevens at expiry (one-expiry structures), Δ Γ Θ V, and whether the bot manages it (credit or debit rules) or leaves it to you; butterflies, straddles, strangles, calendars/diagonals and your groups are "by hand" for now |
-| Options and spreads | every short, long, credit and debit vertical with quantity, DTE, delta, P&L of the premium, the take-profit price, and what the strategy's rules would do (roll / close / keep / by hand) |
+| Structures | the Options section: each symbol's option legs grouped into the positions they form (your `[[strategy.structures]]` groups first, then butterflies, long straddles/strangles, verticals, calendars/diagonals, single legs), with combined cost, value, P&L, max profit and loss and breakevens at expiry (one-expiry structures), Δ Γ Θ V, whether the bot manages it (credit or debit rules) or leaves it to you, a recommendation with its reason (close, close half, adjust one leg, roll the whole structure, keep), the take-profit price, P&L % and the underlying price; butterflies, straddles, strangles, calendars/diagonals and your groups are "by hand" for now |
 | Positions | quantity, cost, price, unrealized P&L, P&L ratio, DTE |
 | Trade plan | the configured trades sized to SPX Δ=0 and why (only while the trading strategy runs) |
 | Activity | VIX and VIXMO, orders per hour (dry-run orders included) |

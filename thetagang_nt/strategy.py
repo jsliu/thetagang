@@ -63,24 +63,29 @@ from thetagang_nt.portfolio import (
     underlying_id,
 )
 from thetagang_nt.rules import (
+    RECOMMENDERS,
+    SECTIONS,
     STRUCTURES,
     Candidate,
     Leg,
     Plan,
+    Structure,
     blocking_missing,
     close_if_unable_to_roll,
     credit_pnl,
     debit_pnl,
+    debit_roll_reason,
     debit_take_profit_value,
-    long_pnl,
-    hand_structures,
-    long_take_profit_value,
-    outside_groups,
-    structure_label,
     delta_band_dollars,
+    find_structures,
     is_debit_vertical,
     is_itm,
+    long_pnl,
+    long_take_profit_value,
+    option_label,
+    outside_groups,
     pick_contract,
+    recommend,
     roll_strike_limit,
     scan_strikes,
     short_pnl,
@@ -88,6 +93,8 @@ from thetagang_nt.rules import (
     should_roll,
     size_plans,
     split_option_legs,
+    structure_figures,
+    structure_label,
     valid_strike,
     vix_hedge_weight,
 )
@@ -328,24 +335,141 @@ class Discretionary(Strategy):
         stock = [leg for leg in legs if not leg.is_option and leg.qty > 0]
         share_cost = stock[0].avg_px if stock else None
         groups = self.config.groups()
-        for s in hand_structures(legs, groups):
-            self.log.info(f"{structure_label(s)}: {s.name or s.kind}, by hand")
+        acted, calendar_legs = False, set()
+        for s in find_structures(legs, groups):
+            if s.kind in ("calendar", "diagonal"):
+                calendar_legs |= {id(p) for p in s.legs}
+            if s.kind in RECOMMENDERS:
+                acted |= await self._structure(symbol, s, und, today)
         pairs, unpaired, mixed = split_option_legs(legs, groups)
-        acted = False
         for short, long in pairs:
             if is_debit_vertical(short, long):
                 acted |= await self._debit_spread(symbol, short, long, today)
             else:
                 acted |= await self._credit_spread(symbol, short, long, und, today)
         for leg in unpaired:
-            if leg.right in mixed:
-                self.log.warning(f"{leg.instrument_id}: calendar/diagonal, by hand")
+            if leg.right in mixed:  # in a calendar/diagonal, or unmatched
+                if id(leg) not in calendar_legs:
+                    self.log.warning(f"{leg.instrument_id}: calendar/diagonal, by hand")
                 continue
             if leg.qty > 0:
                 acted |= await self._long_option(symbol, leg, today)
             elif leg.qty < 0:
                 acted |= await self._short_option(symbol, leg, und, today, share_cost)
         return acted
+
+    # ---------------------------------------------- butterflies, straddles, calendars
+
+    async def _structure(
+        self, symbol: str, s: Structure, und: float, today: date
+    ) -> bool:
+        """Place the Structures table's recommendation when [strategy.<kind>]
+        trade = true; otherwise (and for manual groups) only log it."""
+        label = structure_label(s)
+        greeks = {}
+        for p in s.legs:
+            ins = self.cache.instrument(p.instrument_id)
+            if ins and (g := option_greeks(self.cache, self.greeks, ins, today)):
+                greeks[p.instrument_id] = g
+        fig = structure_figures(s, greeks, today)
+        rec = recommend(s, fig, und, greeks, self.config, today)
+        if rec is None:
+            return False
+        action, why, _ = rec
+        section = SECTIONS.get(s.kind)
+        if section is None or not getattr(self.config, section).trade:
+            self.log.info(f"{label}: {s.name or s.kind}: {action} ({why}), by hand")
+            return False
+        if action == "keep" or action == "review":
+            return False
+        try:
+            if action.startswith("close"):
+                units = int(fig.qty) // 2 if "partial" in action else fig.qty
+                await self._close_structure(symbol, s, fig.qty, units, action)
+            elif action.startswith("adjust leg: close "):
+                name = action.removeprefix("adjust leg: close ")
+                leg = next(p for p in s.legs if option_label(p) == name)
+                await self._close(symbol, [leg], f"{s.kind}: close {name}")
+            elif action.startswith("adjust leg: roll "):
+                await self._roll_calendar_short(symbol, s, today)
+            else:  # roll whole: opening the new structure isn't automated yet
+                self.log.warning(f"{label}: {action} ({why}): roll it by hand")
+                return False
+        except NoContract as e:
+            self.log.warning(f"{label}: {action} not placed ({e}), by hand")
+            return False
+        return True
+
+    async def _close_structure(
+        self, symbol: str, s: Structure, base: float, units: float, action: str
+    ) -> None:
+        """Close `units` of a structure as one combo, every leg in its own ratio
+        (a butterfly: 1 / -2 / 1), at the net mid."""
+        if any(p.mid is None for p in s.legs):
+            raise NoContract("no quote to close at")
+        ratios = [-p.qty / base for p in s.legs]
+        if any(not math.isclose(r, round(r)) for r in ratios):
+            raise NoContract("legs not in whole ratios")
+        combo = [(p.instrument_id, round(r)) for p, r in zip(s.legs, ratios)]
+        net = sum(r * p.mid for (_, r), p in zip(combo, s.legs))  # type: ignore[operator]
+        await self._submit(symbol, f"{s.kind}: {action}", combo, units, net)
+
+    async def _roll_calendar_short(
+        self, symbol: str, s: Structure, today: date
+    ) -> None:
+        """Buy back the short leg and sell the same strike at the next expiry
+        before the long leg's, as one combo for a net credit."""
+        long = next(p for p in s.legs if p.qty > 0)
+        short = next(p for p in s.legs if p.qty < 0)
+        lo, hi = short.dte(today) + 1, long.dte(today) - 1
+        if short.mid is None:
+            raise NoContract(f"no quote for {option_label(short)}")
+        if hi < lo or short.expiry is None or long.expiry is None:
+            raise NoContract("no expiry between the short and the long leg")
+        await self._load_chain(symbol, lo, hi)
+        expiries = sorted(
+            {
+                i.expiration_utc.date()
+                for i in self._options(symbol, short.right)
+                if short.expiry < i.expiration_utc.date() < long.expiry
+            }
+        )
+        new = next(
+            (
+                iid
+                for e in expiries
+                if (iid := self._option_at(symbol, short.right, e, short.strike))
+            ),
+            None,
+        )
+        if new is None:
+            raise NoContract(
+                f"no {short.strike:g}{short.right} in the {len(expiries)} expiries "
+                "between the short and the long leg"
+            )
+        new_price = await self._price_of(new)
+        if new_price is None:
+            raise NoContract(f"no quote for the new {short.strike:g}{short.right}")
+        net = short.mid - new_price  # positive = net debit
+        if net > -self.config.chain.minimum_credit:
+            raise NoContract(f"roll pays {-net:+.2f}, not a credit")
+        await self._submit(
+            symbol,
+            f"{s.kind}: roll short leg",
+            [(short.instrument_id, +1), (new, -1)],
+            abs(short.qty),
+            net,
+        )
+
+    def _debit_roll_due(self, long: Leg, dte: int, today: date) -> bool:
+        """[debit.roll_when]: DTE, or the long leg's |delta|."""
+        c = self.config.debit.roll_when
+        ins = self.cache.instrument(long.instrument_id) if c.delta else None
+        g = option_greeks(self.cache, self.greeks, ins, today) if ins else None
+        why = debit_roll_reason(dte, g.delta if g else None, c.dte, c.delta)
+        if why:
+            self.log.info(f"{long.instrument_id}: roll due ({why})")
+        return why is not None
 
     async def _long_option(self, symbol: str, leg: Leg, today: date) -> bool:
         """The [debit] rules, as for a debit spread: take profit, else roll once
@@ -358,7 +482,7 @@ class Discretionary(Strategy):
             await self._close(symbol, [leg], "close long (take-profit)")
             return True
         dte = leg.dte(today)
-        if dte > self.debit_rw.dte:
+        if not self._debit_roll_due(leg, dte, today):
             return False
         try:
             await self._roll_long(symbol, leg, leg.mid)
@@ -559,7 +683,7 @@ class Discretionary(Strategy):
         if value >= tp:
             await self._close(symbol, [short, long], "close debit spread (take-profit)")
             return True
-        if dte > self.debit_rw.dte:
+        if not self._debit_roll_due(long, dte, today):
             return False
         try:
             await self._roll_debit_spread(symbol, short, long, value)

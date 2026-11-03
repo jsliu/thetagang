@@ -14,6 +14,7 @@ trader_id = "THETAGANG-001"
 log_level = "INFO"
 # log_directory = "logs"
 # redis_host = "localhost"    # persist the Nautilus cache in Redis
+position_check_secs = 60      # pick up trades made in TWS within a minute (0: only at startup)
 
 [ib]
 host = "127.0.0.1"
@@ -32,9 +33,6 @@ market_data_type = "REALTIME" # DELAYED_FROZEN shows last prices when markets ar
 [monitor]                     # the dashboard process (read-only, never trades)
 interval_secs = 60            # recompute positions, greeks and risk every 60 s
 metrics_port = 9464           # Prometheus scrapes the dashboard data here
-debit_option_alert_delta = 0.8 # a long option (standalone, or a debit spread's long leg)
-                               # with |delta| >= this: Telegram alert; a standalone one
-                               # also shows "roll or close by hand" in the Options tables
 stress_moves = [-0.10, -0.05, -0.01, 0.01, 0.05, 0.10]  # SPX moves in the Stress P&L table
 
 # The strategy's rules. The dashboard (--role monitor, the docker default) only reads
@@ -104,8 +102,11 @@ max_roll_debit = 0.5          # a roll may cost at most 0.5 x the spread width (
                               # or 0.5 x the old option's value (a long), per share;
                               # dearer: no roll
 
-[strategy.debit.roll_when]    # roll once DTE <= dte, unless take-profit closed it first
+[strategy.debit.roll_when]    # roll once DTE <= dte or |delta| >= delta, unless
+                              # take-profit closed it first
 dte = 10
+delta = 0.8                   # also roll once the long leg's |delta| reaches this
+                              # (deep in the money); 0: off
 # max_dte = 180
 close_if_unable_to_roll = true  # close a winner whose roll failed; needs max_dte
                                 # (commented out above, so off for now)
@@ -115,6 +116,28 @@ close_if_unable_to_roll = true  # close a winner whose roll failed; needs max_dt
 dte = 7                       # new expiry at least 7 days out
 max_dte = 60                  # ...and at most 60 days out
 delta = 0.3                   # new long strike nearest |delta| 0.30
+
+# ---- Butterflies, straddles/strangles, calendars/diagonals ----------------------
+# The Structures table recommends what to do; with trade = true the bot also places it
+# (close, close half, adjust a leg; never "roll whole", which stays yours). dry_run applies.
+[strategy.butterfly]
+trade = false                 # true: the bot places these recommendations
+take_profit = 0.5             # close at 50% of the max profit
+partial_take_profit = 0.25    # close half (2+ held) at 25% of the max profit
+close_dte = 7                 # close with 7 days or fewer left (the body's gamma)
+
+[strategy.straddle]           # long straddles and strangles
+trade = false
+take_profit_gain = 0.5        # close at P&L >= 50% of the debit
+partial_take_profit_gain = 0.25  # close half (2+ held) at +25%
+leg_delta = 0.7               # a winning leg at |delta| >= 0.7: close that leg
+roll_dte = 21                 # roll the whole position out with 21 days left
+
+[strategy.calendar]           # calendars and diagonals (long the later expiry)
+trade = false
+take_profit = 0.25            # close at P&L >= 25% of the debit
+short_roll_dte = 5            # roll the short leg out with 5 days or fewer left
+close_dte = 10                # close once the long leg has 10 days or fewer left
 
 [strategy.vix_call_hedge]     # long VIX calls as a crash hedge, sized by allocation
 enabled = false

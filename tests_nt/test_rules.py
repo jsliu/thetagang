@@ -169,7 +169,6 @@ def test_roles_split_monitoring_from_trading() -> None:
 from thetagang_nt.rules import (  # noqa: E402
     position_actions,
     side_weight,
-    size_adjustment,
     stock_trade,
     symbol_adjustment,
     vix_hedge_action,
@@ -226,7 +225,7 @@ def test_actions_follow_roll_when_and_show_take_profit() -> None:
     near = position_actions(
         [opt("C", 60, 2, 1.0, 1.2)], 40.0, rw, 0.8, TODAY, False, 50
     )
-    assert near[0].action == "roll"
+    assert near[0].action == "roll (46 days left)"
     # a short and a long call of different sizes are a diagonal: left alone, as before
     mixed = act(opt("C", 50, -1, 2.0, 1.5), opt("C", 60, 2, 1.0, 1.2))
     assert {a.action for a in mixed.values()} == {"by hand (calendar/diagonal)"}
@@ -461,7 +460,16 @@ def test_debit_spreads_roll_by_their_own_dte_not_credit_roll_when() -> None:
     rw = RollWhen(dte=10)  # credit rule: far from rolling
     act = lambda d: position_actions(spread, 38.0, rw, 0.8, TODAY, False, d)
     assert act(10)[0].action != "roll"
-    assert act(50)[0].action == "roll"
+    assert act(50)[0].action == "roll (46 days left)"
+    # [debit.roll_when] delta: the long leg deep in the money also rolls it
+    deep = {"P40": -0.85}
+    by_delta = lambda d: (
+        position_actions(spread, 38.0, rw, 0.8, TODAY, False, 10, 1.0, None, deep, d)[
+            0
+        ].action
+    )
+    assert by_delta(0.7) == "roll (|delta| 0.85 >= 0.7)"
+    assert by_delta(0.9) == "keep" and by_delta(0.0) == "keep"
 
 
 def test_target_orders_point_the_right_way_and_never_add_shorts() -> None:
@@ -579,8 +587,7 @@ def test_pnl_curve_spans_spx_and_is_zero_today() -> None:
     pytest.importorskip("nautilus_trader")
     from datetime import UTC, datetime
 
-    from thetagang_nt.portfolio import Book, Greeks, SymbolRisk
-    from thetagang_nt.portfolio import curve
+    from thetagang_nt.portfolio import Book, Greeks, SymbolRisk, curve
 
     call = Leg("C40", "AA", "C", 40.0, EXP, 2, 1.0, 2.5)
     greeks = Greeks(0.5, 0.05, -0.02, 0.06, 40.0, 0.35, 2.5)
@@ -605,8 +612,7 @@ def test_vix_curve_is_zero_today_and_long_vega_gains_on_a_spike() -> None:
     pytest.importorskip("nautilus_trader")
     from datetime import UTC, datetime
 
-    from thetagang_nt.portfolio import Book, Greeks, SymbolRisk
-    from thetagang_nt.portfolio import vix_curve
+    from thetagang_nt.portfolio import Book, Greeks, SymbolRisk, vix_curve
 
     call = Leg("C40", "AA", "C", 40.0, EXP, 2, 1.0, 2.5)
     greeks = Greeks(0.5, 0.05, -0.02, 0.06, 40.0, 0.35, 2.5)
@@ -801,3 +807,186 @@ def test_structures_are_recognised_and_figured_as_one_position() -> None:
     assert (
         find_structures(fly, {"gone": ("AA 20261218 99C",)})[0].kind == "long butterfly"
     )
+
+
+def test_structure_recommendations_follow_their_kind() -> None:
+    from datetime import timedelta
+
+    from thetagang_nt.rules import find_structures, recommend, structure_figures
+
+    cfg = SimpleNamespace(
+        butterfly=SimpleNamespace(
+            take_profit=0.5, partial_take_profit=0.25, close_dte=7
+        ),
+        straddle=SimpleNamespace(
+            take_profit_gain=0.5,
+            partial_take_profit_gain=0.25,
+            leg_delta=0.7,
+            roll_dte=21,
+        ),
+        calendar=SimpleNamespace(take_profit=0.25, short_roll_dte=5, close_dte=10),
+    )
+
+    def rec(legs, und=40.0, greeks=None, today=TODAY, groups=None):
+        (s,) = find_structures(legs, groups)
+        f = structure_figures(s, greeks or {}, today)
+        return recommend(s, f, und, greeks or {}, cfg, today)[0]
+
+    def fly(lo_mid):  # cost 150, max profit 350
+        return [
+            opt("C", 35, 1, 6.0, lo_mid),
+            opt("C", 40, -2, 3.0, 3.0),
+            opt("C", 45, 1, 1.5, 1.0),
+        ]
+
+    assert rec(fly(6.5)) == "keep"  # P&L 0
+    assert rec(fly(6.5), und=50.0) == "roll whole (re-center)"
+    assert rec(fly(8.5)) == "close (take-profit)"  # P&L 200 = 57% of 350
+    (s,) = find_structures(fly(8.5))
+    assert recommend(s, structure_figures(s, {}, TODAY), 40.0, {}, cfg, TODAY)[2] == (
+        "sell to close 1 AA 20261218 35C at >= $8.50; "
+        "buy to close 2 AA 20261218 40C at <= $3.00; "
+        "sell to close 1 AA 20261218 45C at >= $1.00"
+    )
+    assert rec(fly(6.5), today=EXP - timedelta(days=5)) == "close (near expiry)"
+
+    def straddle(call_mid, put_mid=2.0):  # cost 400
+        return [opt("P", 40, 1, 2.0, put_mid), opt("C", 40, 1, 2.0, call_mid)]
+
+    assert rec(straddle(3.5)) == "keep"  # +37%, one held: no partial
+    assert rec(straddle(4.0, 2.5)) == "close (take-profit)"  # +62%
+    g = {"gamma": 0.1, "theta": -0.02, "vega": 0.05}
+    deep = {
+        "C40": SimpleNamespace(delta=0.75, **g),
+        "P40": SimpleNamespace(delta=-0.25, **g),
+    }
+    assert rec(straddle(3.5), greeks=deep) == "adjust leg: close AA 20261218 40C"
+    (s,) = find_structures(straddle(3.5))
+    f = structure_figures(s, deep, TODAY)
+    assert recommend(s, f, 40.0, deep, cfg, TODAY)[2] == (
+        "sell to close 1 AA 20261218 40C at >= $3.50"
+    )
+    assert (
+        rec(straddle(2.2), today=EXP - timedelta(days=20)) == "roll whole (out in time)"
+    )
+
+    later = date(2027, 1, 15)
+    cal = [opt("C", 40, -1, 2.0, 1.9), Leg("C40L", "AA", "C", 40.0, later, 1, 3.0, 3.0)]
+    assert rec(cal) == "keep"  # cost 100, P&L +10%
+    assert (
+        rec(cal, today=EXP - timedelta(days=3))
+        == "adjust leg: roll AA 20261218 40C out"
+    )
+    (s,) = find_structures(cal)
+    near = EXP - timedelta(days=3)
+    assert recommend(s, structure_figures(s, {}, near), 40.0, {}, cfg, near)[2] == (
+        "buy to close 1 AA 20261218 40C at <= $1.90, then sell the next expiry"
+    )
+    assert (
+        rec(cal) == "keep"
+        and recommend(s, structure_figures(s, {}, TODAY), 40.0, {}, cfg, TODAY)[2]
+        == "-"
+    )
+    rich = [
+        opt("C", 40, -1, 2.0, 1.0),
+        Leg("C40L", "AA", "C", 40.0, later, 1, 3.0, 3.6),
+    ]
+    assert rec(rich) == "close (take-profit)"  # P&L 160 = +160% of the debit
+
+    group = {"g": ("AA 20261218 40P", "AA 20261218 40C")}
+    assert rec(straddle(2.0), groups=group) == "review"
+
+
+def test_structure_take_profit_is_a_price_per_share() -> None:
+    from thetagang_nt.rules import (
+        find_structures,
+        structure_figures,
+        structure_take_profit,
+    )
+
+    cfg = SimpleNamespace(
+        butterfly=SimpleNamespace(take_profit=0.5),
+        straddle=SimpleNamespace(take_profit_gain=0.5),
+        calendar=SimpleNamespace(take_profit=0.25),
+    )
+
+    def tp(legs):
+        (s,) = find_structures(legs)
+        return structure_take_profit(s, structure_figures(s, {}, TODAY), cfg)
+
+    fly = [
+        opt("C", 35, 1, 6.0, 6.5),
+        opt("C", 40, -2, 3.0, 3.0),
+        opt("C", 45, 1, 1.5, 1.0),
+    ]
+    assert tp(fly) == "sell >= $3.25"  # cost 150 + 50% of the 350 max profit
+    assert tp([opt("P", 40, 1, 2.0, 2.0), opt("C", 40, 1, 2.0, 2.0)]) == "sell >= $6.00"
+    assert tp([opt("P", 40, -1, 2.0, 2.0)]) == "-"  # the bot's rules give its own
+
+
+def test_structure_orders_close_in_ratio_and_roll_the_calendar_short_for_a_credit() -> (
+    None
+):
+    import asyncio
+    from datetime import datetime, timezone
+
+    pytest.importorskip("nautilus_trader")
+    from thetagang_nt.rules import find_structures
+    from thetagang_nt.strategy import Discretionary, NoContract
+
+    sent: list = []
+
+    async def submit(symbol, action, combo, qty, price):
+        sent.append((action, combo, qty, round(price, 2)))
+
+    # a long call butterfly, 2 held: close 1 (partial) as one combo, legs 1 / -2 / 1
+    fly = [
+        opt("C", 35, 2, 6.0, 6.5),
+        opt("C", 40, -4, 3.0, 3.0),
+        opt("C", 45, 2, 1.5, 1.0),
+    ]
+    (s,) = find_structures(fly)
+    stub = SimpleNamespace(_submit=submit)
+    asyncio.run(Discretionary._close_structure(stub, "AA", s, 2, 1, "close 1 of 2"))
+    action, combo, qty, price = sent.pop()
+    assert dict(combo) == {"C35": -1, "C40": 2, "C45": -1} and qty == 1
+    assert price == -1.5  # a credit: sell the wings, buy back the body
+
+    # a calendar: buy back the short 40C, sell the 40C at the next expiry before the long's
+    later, mid = date(2027, 1, 15), date(2027, 1, 8)
+    cal = [opt("C", 40, -1, 2.0, 0.3), Leg("C40L", "AA", "C", 40.0, later, 1, 3.0, 3.0)]
+    (s,) = find_structures(cal)
+    utc = lambda d: datetime(d.year, d.month, d.day, tzinfo=timezone.utc)
+    chain = [
+        SimpleNamespace(expiration_utc=utc(mid)),
+        SimpleNamespace(expiration_utc=utc(later)),
+    ]
+
+    async def nothing(*a):
+        return None
+
+    def at(symbol, right, expiry, strike):
+        return f"{right}{strike:g}@{expiry}" if expiry == mid else None
+
+    async def priced(iid, quote=1.2):
+        return quote
+
+    stub = SimpleNamespace(
+        _submit=submit,
+        _load_chain=nothing,
+        _options=lambda symbol, right: chain,
+        _option_at=at,
+        _price_of=priced,
+        config=SimpleNamespace(chain=SimpleNamespace(minimum_credit=0.0)),
+    )
+    asyncio.run(Discretionary._roll_calendar_short(stub, "AA", s, TODAY))
+    action, combo, qty, price = sent.pop()
+    assert combo == [("C40", 1), ("C40@2027-01-08", -1)] and qty == 1 and price == -0.9
+
+    async def cheap(iid):  # the new short pays less than the buyback costs: refused
+        return 0.2
+
+    stub._price_of = cheap
+    with pytest.raises(NoContract):
+        asyncio.run(Discretionary._roll_calendar_short(stub, "AA", s, TODAY))
+    assert sent == []
