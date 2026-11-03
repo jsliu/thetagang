@@ -96,6 +96,7 @@ class AccountExtras:
         for field, value in (
             ("daily_pnl", self._account_pnl.dailyPnL),
             ("realized_pnl", self._account_pnl.realizedPnL),  # TWS's Realized P&L
+            ("unrealized_pnl", self._account_pnl.unrealizedPnL),  # TWS's Unrealized
         ):
             if (x := _number(value)) is not None:
                 summary[field] = x
