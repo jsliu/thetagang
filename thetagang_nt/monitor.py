@@ -442,6 +442,14 @@ class PortfolioMonitor(Actor):
             f.set("position_theta", "Theta per share ($/day)", g.theta, **labels)
             f.set("position_vega", "Vega per share ($ per vol point)", g.vega, **labels)
             f.set("position_iv", "Implied volatility", g.vol, **labels)
+            # held long: + gamma, - theta. Gamma bought per $1 a day of decay
+            if leg.qty > 0 and g.gamma > 0 and g.theta < 0:
+                f.set(
+                    "position_gamma_theta",
+                    "Gamma / |theta| of a long option",
+                    g.gamma / -g.theta,
+                    **labels,
+                )
         for move in self.config.stress_moves:
             for basis, use_beta in (("beta", True), ("one", False)):
                 f.set(

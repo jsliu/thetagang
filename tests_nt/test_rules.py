@@ -398,17 +398,19 @@ def test_expected_move_follows_vix():
     assert expected_move(None) == 0.01  # no VIX price: the fixed 1% day
 
 
-def test_positions_are_grouped_like_the_old_bot():
+def test_positions_are_ordered_by_expiry_with_stocks_last():
     stock = Leg("ms", "MS", "", 0.0, None, 200, 183.0, 183.0, 1.0)
     far = Leg("ms2", "MS", "C", 195.0, date(2026, 12, 18), -1, 0.15, 0.1)
     near = Leg("ms1", "MS", "C", 192.5, date(2026, 10, 30), -1, 0.29, 0.2)
-    ewq = Leg("ewq", "EWQ", "C", 43.0, EXP, -10, 0.4, 0.3)
-    rows = position_rows([far, near, ewq, stock])
+    ewq = Leg("ewq", "EWQ", "C", 43.0, EXP, -10, 0.4, 0.3)  # EXP = 2026-12-18
+    aa = Leg("aa", "AA", "", 0.0, None, 100, 30.0, 31.0, 1.0)
+    rows = position_rows([far, near, ewq, stock, aa])
     assert [(leg.instrument_id, row, stripe) for leg, row, stripe in rows] == [
-        ("ewq", 0, 0),
-        ("ms", 1, 1),  # stock first,
-        ("ms1", 2, 1),  # then options by expiry
-        ("ms2", 3, 1),
+        ("ms1", 0, 0),  # nearest expiry first,
+        ("ewq", 1, 1),  # one date: by symbol, one stripe
+        ("ms2", 2, 1),
+        ("aa", 3, 0),  # stocks at the bottom, by symbol
+        ("ms", 4, 0),
     ]
 
 

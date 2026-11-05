@@ -968,17 +968,23 @@ def parse_trade(text: str) -> TradeSpec:
 
 
 def position_rows(legs: list[Leg]) -> list[tuple[Leg, int, int]]:
-    """Legs in the old bot's Portfolio positions order (by symbol; stock first,
-    then options by expiry, right and strike), each with its row number and a
-    0/1 stripe that alternates per symbol, for shading the groups."""
+    """Legs for the Positions table: options by expiry (then symbol, right and
+    strike), stocks at the bottom by symbol; each with its row number and a 0/1
+    stripe that alternates per expiry (the stocks one group), for shading."""
     ordered = sorted(
         legs,
-        key=lambda x: (x.symbol, x.is_option, x.expiry or date.min, x.right, x.strike),
+        key=lambda x: (
+            not x.is_option,
+            x.expiry or date.max,
+            x.symbol,
+            x.right,
+            x.strike,
+        ),
     )
-    rows, group, last = [], -1, None
+    rows, group, last = [], -1, object()
     for row, leg in enumerate(ordered):
-        if leg.symbol != last:
-            group, last = group + 1, leg.symbol
+        if leg.expiry != last:
+            group, last = group + 1, leg.expiry
         rows.append((leg, row, group % 2))
     return rows
 
