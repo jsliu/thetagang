@@ -326,6 +326,10 @@ class PMConfig(NautilusConfig, frozen=True):
     """[pm]: the Portfolio Manager (decision support, vault PM Knowledge Base)."""
 
     journal: bool = True  # write the journal to Postgres at $JOURNAL_DSN (if set)
+    # the vault's rules win: the bot's roll/close rules no longer place orders;
+    # the PM's review signals tell you what to look at, you decide. The trade
+    # plan and the VIX hedge are unaffected. false: the bot's rules trade again
+    decide: bool = True
     strategies: list[PMStrategyConfig] = []
     # review thresholds, by vault register ID; all hypotheses (assumptions_register)
     profit_levels: tuple[float, ...] = (0.5, 1.0, 1.5)  # [T1] return on debit

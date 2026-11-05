@@ -138,8 +138,12 @@ class Discretionary(Strategy):
         config: DiscretionaryConfig,
         pretrade: PreTradeSectionConfig | None = None,
         extras: Any = None,
+        pm_decides: bool = False,
     ) -> None:
         super().__init__(config)
+        # [pm] decide: the Portfolio Manager's review signals replace the
+        # roll/close rules below (they only report); trade plan and hedge stay
+        self._pm_decides = pm_decides
         # a read-only IB connection (ib_extra.AccountExtras) for the orders this
         # node can't see: TWS's and other clients'. None: only this node's.
         self._extras = extras
@@ -255,6 +259,9 @@ class Discretionary(Strategy):
         for leg in legs:
             by_symbol[leg.symbol].append(leg)
         acted = False
+        if self._pm_decides:
+            self.log.info("[pm] decide: rolls and closes are review items, no orders")
+            by_symbol.clear()
         for symbol, symbol_legs in sorted(by_symbol.items()):
             if is_index(symbol) or self._no_trading(symbol):
                 continue  # index options: roll by hand; VIX: the hedge below

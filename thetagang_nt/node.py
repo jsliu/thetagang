@@ -60,7 +60,9 @@ def build(path: str, role: str = "all", adhoc: tuple[str, ...] = ()) -> TradingN
         from thetagang_nt.strategy import Discretionary
 
         node.trader.add_strategy(
-            Discretionary(strategy, pretrade=app.pretrade, extras=extras)
+            Discretionary(
+                strategy, pretrade=app.pretrade, extras=extras, pm_decides=app.pm.decide
+            )
         )
     if role == "trade":  # the strategy's own metrics; the monitor publishes none here
         start_http_server(strategy.trading.metrics_port, monitor.metrics_addr)

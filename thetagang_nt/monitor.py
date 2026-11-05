@@ -66,7 +66,6 @@ from thetagang_nt.portfolio import (
 from thetagang_nt.rules import (
     BY_HAND,
     NEUTRALITY,
-    SECTIONS,
     Action,
     Leg,
     RollWhen,
@@ -89,7 +88,6 @@ from thetagang_nt.rules import (
     side_weight,
     structure_figures,
     structure_label,
-    structure_take_profit,
     symbol_adjustment,
     vix_hedge_action,
     weighted_strike,
@@ -464,14 +462,6 @@ class PortfolioMonitor(Actor):
             f.set("position_theta", "Theta per share ($/day)", g.theta, **labels)
             f.set("position_vega", "Vega per share ($ per vol point)", g.vega, **labels)
             f.set("position_iv", "Implied volatility", g.vol, **labels)
-            # held long: + gamma, - theta. Gamma bought per $1 a day of decay
-            if leg.qty > 0 and g.gamma > 0 and g.theta < 0:
-                f.set(
-                    "position_gamma_theta",
-                    "Gamma / |theta| of a long option",
-                    g.gamma / -g.theta,
-                    **labels,
-                )
         for move in self.config.stress_moves:
             for basis, use_beta in (("beta", True), ("one", False)):
                 f.set(
@@ -704,40 +694,20 @@ class PortfolioMonitor(Actor):
                 return "unlimited"
             return f"-${-x:,.0f}" if x < 0 else f"${x:,.0f}"
 
-        credit = {"short call", "short put", "credit spread"}
-        debit = {"long call", "long put", "debit spread"}
         cfg = self._rules or DiscretionaryConfig()
-        entries = []  # for the journal: (symbol, spot, structure, figures)
+        entries = []  # for the Portfolio Manager: (symbol, spot, structure, figures, bot)
         for s, items in by_symbol.items():
             und = price(self.cache, underlying_id(s))
             for st in find_structures(items, groups):
                 fig = structure_figures(st, book.greeks, today)
                 name = structure_label(st)
-                section = SECTIONS.get(st.kind)
-                if is_index(s) or self._no_trading(s):
-                    managed = "by hand"
-                elif section:  # traded only with [strategy.<section>] trade = true
-                    managed = (
-                        f"bot: {section}" if getattr(cfg, section).trade else "by hand"
-                    )
-                elif st.kind in credit | debit:
-                    managed = "bot: credit" if st.kind in credit else "bot: debit"
-                else:
-                    managed = "by hand"
+                # what the bot's own rules would do: shown beside the PM's view
                 rec = recommend(st, fig, und, book.greeks, cfg, today)
-                take_profit = structure_take_profit(st, fig, cfg)
-                if rec is None:  # the bot's own rules
+                if rec is None:
                     labels = frozenset(option_label(p) for p in st.legs)
-                    action, take_profit = self._bot_actions.get(labels, ("-", "-"))
-                    rule = (
-                        "[strategy.credit]" if st.kind in credit else "[strategy.debit]"
-                    )
-                    if action.startswith(("by hand", "none")):
-                        managed = "by hand"
-                        reason = action.partition("(")[2].rstrip(")") or "left to you"
-                        rec = (action, f"the bot leaves it to you: {reason}", "-")
-                    else:
-                        rec = (action, f"the bot's {rule} rules", "-")
+                    bot = self._bot_actions.get(labels, ("-", "-"))[0]
+                else:
+                    bot = rec[0]
                 f.set(
                     "structure_info",
                     "An option structure: legs held as one position",
@@ -745,16 +715,11 @@ class PortfolioMonitor(Actor):
                     name=name,
                     symbol=s.lstrip("^"),
                     kind=f"group: {st.name}" if st.name else st.kind,
-                    managed=managed,
                     max_profit=money(fig.max_profit),
                     max_loss=money(fig.max_loss),
                     breakevens=", ".join(f"{x:,.2f}" for x in fig.breakevens) or "-",
-                    recommendation=action_text(rec[0]),
-                    why=rec[1],
-                    leg_order=rec[2],
-                    take_profit=take_profit,
                 )
-                entries.append((s, und, st, fig, action_text(rec[0])))
+                entries.append((s, und, st, fig, action_text(bot)))
                 for field, value in (
                     ("qty", fig.qty),
                     ("dte", fig.dte),
