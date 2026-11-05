@@ -30,6 +30,23 @@ services:
     # THETAGANG_CONFIG: path relative to the repo root (default: your local config)
     command: ["python", "-m", "thetagang_nt.node", "-c", "${THETAGANG_CONFIG:-thetagang.nt.local.toml}", "--role", "monitor"]
     ports: ["127.0.0.1:9464:9464"]   # /metrics: the dashboard
+    environment:
+      IB_HOST: host.docker.internal
+      # the Portfolio Manager journal; the password is in deploy/.env (git-ignored)
+      JOURNAL_DSN: postgresql://thetagang:${JOURNAL_DB_PASSWORD}@journal-db:5432/thetagang
+    depends_on: [journal-db]
+
+  # the Portfolio Manager journal: strategies, legs, daily snapshots, decisions.
+  # Grafana reads it at 127.0.0.1:5432 (host.docker.internal from its container).
+  journal-db:
+    image: postgres:16.4-alpine
+    environment:
+      POSTGRES_DB: thetagang
+      POSTGRES_USER: thetagang
+      POSTGRES_PASSWORD: ${JOURNAL_DB_PASSWORD}
+    volumes: ["journal-data:/var/lib/postgresql/data"]
+    ports: ["127.0.0.1:5432:5432"]
+    restart: unless-stopped
 
   thetagang-nt:
     <<: *thetagang
@@ -46,3 +63,6 @@ services:
     tty: true
     entrypoint: ["python", "-m", "thetagang_nt.node", "-c", "${THETAGANG_CONFIG:-thetagang.nt.local.toml}", "pretrade"]
     ports: ["127.0.0.1:9466:9466"]   # /metrics: the Pre-trade dashboard, while it asks
+
+volumes:
+  journal-data:                       # the journal database survives container rebuilds

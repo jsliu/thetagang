@@ -308,12 +308,33 @@ class PreTradeSectionConfig(NautilusConfig, frozen=True):
             raise ValueError("pretrade candidates need distinct names")
 
 
+class PMStrategyConfig(NautilusConfig, frozen=True):
+    """[[pm.strategies]]: your inputs for one strategy, by the ID the Portfolio
+    Manager dashboard shows (e.g. "AA-debit-spread-1"). Copied into the journal."""
+
+    id: str
+    thesis: str = ""
+    invalidation_below: float | None = None  # thesis invalid if the price falls below
+    invalidation_above: float | None = None  # ...or rises above
+    target: float | None = None  # profit target, $
+    max_loss: float | None = None  # max acceptable loss (risk budget), $
+    thesis_valid: bool | None = None
+
+
+class PMConfig(NautilusConfig, frozen=True):
+    """[pm]: the Portfolio Manager (decision support, vault PM Knowledge Base)."""
+
+    journal: bool = True  # write the journal to Postgres at $JOURNAL_DSN (if set)
+    strategies: list[PMStrategyConfig] = []
+
+
 class AppConfig(NautilusConfig, frozen=True):
     node: NodeConfig = NodeConfig()
     ib: IBConfig = IBConfig()
     monitor: MonitorConfig = MonitorConfig()
     strategy: DiscretionaryConfig | None = None  # omit for monitor-only
     pretrade: PreTradeSectionConfig = PreTradeSectionConfig()
+    pm: PMConfig = PMConfig()
 
 
 def load(path: str | Path) -> AppConfig:

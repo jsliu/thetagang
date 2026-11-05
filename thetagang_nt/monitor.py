@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import json
 import math
-from datetime import date, timedelta
+from datetime import UTC, date, datetime, timedelta
 from typing import Any
 
 from nautilus_trader.common.actor import Actor
@@ -22,8 +22,12 @@ from prometheus_client import REGISTRY, start_http_server
 from prometheus_client.core import GaugeMetricFamily
 
 from thetagang_nt import aio
-from thetagang_nt.config import DiscretionaryConfig, MonitorConfig
+from thetagang_nt.config import DiscretionaryConfig, MonitorConfig, PMConfig
 from thetagang_nt.ib_extra import AccountExtras
+from thetagang_nt.journal import Journal, LegRow, StrategyRow
+from thetagang_nt.pm.assess import assess
+from thetagang_nt.pm.quality import Quote
+from thetagang_nt.pm.strategy_id import Seen, auto_ids
 from thetagang_nt.portfolio import (
     INDEX_CONTRACTS,
     SPX,
@@ -147,8 +151,12 @@ class PortfolioMonitor(Actor):
         config: MonitorConfig,
         rules: DiscretionaryConfig | None = None,
         extras: AccountExtras | None = None,
+        pm: PMConfig | None = None,
+        journal: Journal | None = None,
     ) -> None:
         super().__init__(config)
+        self._pm = pm or PMConfig()
+        self._journal = journal  # the Portfolio Manager journal (Postgres), or None
         self._snapshot = _Snapshot()
         self._closes: dict[InstrumentId, dict[date, float]] = {}
         self._betas: dict[str, float] = {}
@@ -685,10 +693,12 @@ class PortfolioMonitor(Actor):
         credit = {"short call", "short put", "credit spread"}
         debit = {"long call", "long put", "debit spread"}
         cfg = self._rules or DiscretionaryConfig()
+        entries = []  # for the journal: (symbol, spot, structure, figures)
         for s, items in by_symbol.items():
             und = price(self.cache, underlying_id(s))
             for st in find_structures(items, groups):
                 fig = structure_figures(st, book.greeks, today)
+                entries.append((s, und, st, fig))
                 name = structure_label(st)
                 section = SECTIONS.get(st.kind)
                 if is_index(s) or self._no_trading(s):
@@ -755,6 +765,54 @@ class PortfolioMonitor(Actor):
                             name=name,
                             field=field,
                         )
+        if self._journal is not None:
+            try:
+                self._record_journal(entries, book, today)
+            except Exception as e:  # noqa: BLE001 - the dashboard never depends on it
+                self.log.warning(f"Journal not written: {e!r}")
+
+    def _quote(self, iid: InstrumentId) -> Quote:
+        """Bid, ask and quote time; IB sends -1 for a missing side."""
+        q = self.cache.quote_tick(iid)
+        if q is None:
+            return Quote(None, None)
+        bid, ask = q.bid_price.as_double(), q.ask_price.as_double()
+        return Quote(
+            bid if bid >= 0 else None,
+            ask if ask > 0 else None,
+            datetime.fromtimestamp(q.ts_event / 1e9, tz=UTC),
+        )
+
+    def _record_journal(self, entries: list, book: Book, today: date) -> None:
+        """Assess each strategy (pm), give it its stable ID and write the
+        journal: strategies, legs, today's snapshot."""
+        now = datetime.now(UTC)
+        quotes = {
+            p.instrument_id: self._quote(p.instrument_id)
+            for e in entries
+            for p in e[2].legs
+        }
+        seen = [
+            Seen(
+                s, st.name or st.kind, frozenset(str(p.instrument_id) for p in st.legs)
+            )
+            for s, _, st, _ in entries
+        ]
+        ids = auto_ids(seen, self._journal.known(today))
+        rows = []
+        for sid, (s, und, st, fig) in zip(ids, entries, strict=True):
+            move = realized_move(self._closes.get(underlying_id(s), {}))
+            sigma_f = move * math.sqrt(252) if move is not None else None
+            a = assess(st, fig, book.greeks, quotes, und, sigma_f, today, now)
+            legs = tuple(
+                LegRow(
+                    str(p.instrument_id), option_label(p), p.qty, p.multiplier, p.avg_px
+                )
+                for p in st.legs
+            )
+            rows.append(StrategyRow(sid, s, st.name or st.kind, legs, fig.cost, und, a))
+        inputs = {x.id: x for x in self._pm.strategies}
+        self._journal.record(rows, inputs, today, now)
 
     def _actions(self, f: _Families, legs: list[Leg], book: Book, today: date) -> None:
         """What the strategy's rules would do with each position, and the price

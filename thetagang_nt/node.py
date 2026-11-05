@@ -3,6 +3,8 @@
 
 from __future__ import annotations
 
+import os
+
 import click
 import msgspec
 from nautilus_trader.adapters.interactive_brokers.common import IB
@@ -15,6 +17,7 @@ from prometheus_client import start_http_server
 
 from thetagang_nt.config import ROLES, load, node_config, split
 from thetagang_nt.ib_extra import EXTRA_CLIENT_OFFSET, AccountExtras
+from thetagang_nt.journal import Journal
 from thetagang_nt.monitor import PortfolioMonitor
 
 
@@ -34,7 +37,14 @@ def build(path: str, role: str = "all", adhoc: tuple[str, ...] = ()) -> TradingN
             app.ib.host, app.ib.port, client_id + EXTRA_CLIENT_OFFSET, app.ib.account_id
         )
     shown = extras if monitor.publish else None
-    node.trader.add_actor(PortfolioMonitor(monitor, rules=app.strategy, extras=shown))
+    # the Portfolio Manager journal: only the dashboard's monitor writes it
+    dsn = os.environ.get("JOURNAL_DSN")
+    journal = Journal(dsn) if monitor.publish and app.pm.journal and dsn else None
+    node.trader.add_actor(
+        PortfolioMonitor(
+            monitor, rules=app.strategy, extras=shown, pm=app.pm, journal=journal
+        )
+    )
     if role == "pretrade":
         from thetagang_nt.pretrade import PreTrade, PreTradeConfig
 
