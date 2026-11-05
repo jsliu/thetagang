@@ -605,10 +605,14 @@ def test_a_default_risk_budget_applies_unless_a_strategy_sets_its_own():
     from thetagang_nt.config import PMConfig, PMStrategyConfig
     from thetagang_nt.monitor import PortfolioMonitor, _Families
 
-    # a 40/45 call spread bought for 2.00, worth 2.80 at the bid: worst case 280
+    # a 40/45 call spread bought for 2.00, worth 2.80 at the bid; the scenario
+    # grid's worst case (10 days, -5%, IV -10) is the P0 risk-budget check
     legs = [leg("c40", "C", 40, 1, avg=3.0), leg("c45", "C", 45, -1, avg=1.0)]
     quotes = {"c40": Quote(3.9, 4.1), "c45": Quote(0.9, 1.1)}
-    g = {"c40": greeks(delta=0.6), "c45": greeks(delta=0.3)}
+    g = {
+        "c40": SimpleNamespace(**greeks(delta=0.6).__dict__, underlying=43.0),
+        "c45": SimpleNamespace(**greeks(delta=0.3).__dict__, underlying=43.0),
+    }
     (st,) = find_structures(legs)
     entries = [("AA", 43.0, st, structure_figures(st, g, TODAY), "-")]
 
@@ -626,12 +630,20 @@ def test_a_default_risk_budget_applies_unless_a_strategy_sets_its_own():
         f = _Families()
         PortfolioMonitor._portfolio_manager(fake, f, entries, g, TODAY)
         (info,) = f.by_name["pm_info"].samples
-        return info.labels["outcome"], info.labels["top"]
+        fields = {x.labels["field"]: x.value for x in f.by_name["pm"].samples}
+        return info.labels["outcome"], info.labels["top"], fields
 
-    assert run(PMConfig()) == ("HOLD", "-")  # no budget: off
-    assert run(PMConfig(max_loss=200.0)) == ("CLOSE review", "P0")
-    own = PMStrategyConfig(id="AA-debit-spread-1", max_loss=500.0)
-    assert run(PMConfig(max_loss=200.0, strategies=[own])) == ("HOLD", "-")
+    outcome_, top, fields = run(PMConfig())
+    assert (outcome_, top) == ("HOLD", "-")  # no budget: off
+    worst = fields["worst_case_loss"]
+    assert 0 < worst < 280  # 10 days of -5%: less than the whole spread
+    assert worst == max(fields[f"wcl_{h}"] for h in (1, 5, 10))
+    assert run(PMConfig(max_loss=worst - 1))[:2] == ("CLOSE review", "P0")
+    stress = fields["stress_loss"]  # the -10% gap is beyond the grid: also P0
+    assert stress > worst
+    assert run(PMConfig(max_loss=stress - 1))[:2] == ("CLOSE review", "P0")
+    own = PMStrategyConfig(id="AA-debit-spread-1", max_loss=stress + 1)
+    assert run(PMConfig(max_loss=worst - 1, strategies=[own]))[:2] == ("HOLD", "-")
     listed = {n: (v, s) for n, v, _, s, _ in PMConfig(max_loss=2000.0).params()}
     assert listed["max_loss"] == ("2000", "your setting")
 
@@ -822,3 +834,139 @@ def test_the_monitor_prices_vix_calls_on_the_matching_future(monkeypatch):
     assert g.underlying == pytest.approx(27.5)
     assert 0 < g.delta < 0.5 and g.gamma > 0 and g.theta < 0 and g.vol > 0
     assert fig.cost == pytest.approx(256.0)
+
+
+# ------------------------------------------------------- phase 2: scenarios
+
+
+def test_repricing_matches_textbook_prices():
+    from thetagang_nt.pm.core.scenarios import bsm
+
+    # Hull: S = K = 100, 1 year, 20% vol, 5% rate
+    assert bsm(100, 100, 1, 0.2, True, 0.05, 0.05) == pytest.approx(10.4506, abs=1e-4)
+    assert bsm(100, 100, 1, 0.2, False, 0.05, 0.05) == pytest.approx(5.5735, abs=1e-4)
+    # Black-76 on a future (carry 0): e^-r (F N(d1) - K N(d2)), d1 = 0.1
+    assert bsm(100, 100, 1, 0.2, True, 0.0, 0.05) == pytest.approx(7.5771, abs=1e-4)
+    assert bsm(105, 100, 0, 0.2, True, 0.05) == 5.0  # expired: intrinsic
+    assert bsm(95, 100, -0.01, 0.2, False, 0.05) == 5.0
+
+
+def priced(iid, right, strike, qty, und, vol, expiry=EXP):
+    p = leg(iid, right, strike, qty, expiry=expiry)
+    return p, SimpleNamespace(underlying=und, vol=vol)
+
+
+def test_scenario_grid_reprices_every_cell_from_a_model_baseline():
+    from thetagang_nt.pm.core.efficiency import calendar_days
+    from thetagang_nt.pm.core.scenarios import RATE, bsm, grid
+
+    p, g = priced("c", "C", 100, 1, 100.0, 0.3)
+    s = grid((p,), {"c": g}, TODAY, RATE, 0.3)
+    assert len(s.fixed) == 3 * 5 * 5 and len(s.scaled) == 3 * 5 * 5
+    assert s.v_model == pytest.approx(100 * bsm(100, 100, 30 / 365, 0.3, True, RATE))
+    # a cell is repriced directly at its own horizon, never scaled from 1 day
+    days = calendar_days(TODAY, 5)
+    cell = 100 * bsm(95, 100, (30 - days) / 365, 0.2, True, RATE) - s.v_model
+    assert s.fixed[(5, -0.05, -10)] == pytest.approx(cell)
+    # WCL covers both families: -2 Move_5 (30% vol: -8.5%) beats the fixed -5%
+    assert min(v for k, v in s.fixed.items() if k[0] == 5) == pytest.approx(cell)
+    assert s.wcl(5) == pytest.approx(-s.scaled[(5, -2, -10)])
+    assert s.wcl(5) > -cell
+    assert s.worst_loss() == s.wcl(10) > s.wcl(1)
+    summary = s.summary(5, 5)
+    assert summary["time_decay"] < 0 < summary["iv_sensitivity"]
+    assert summary["worst"] == pytest.approx(cell) and summary["best"] > 0
+    assert set(s.stress) == {
+        "gap down",
+        "gap up",
+        "event IV crush",
+        "front-month spike",
+    }
+    # a lone long call: the front IV crush (-20) hurts more than the gap down,
+    # where IV +15 offsets part of the -10% move
+    assert s.stress_loss() == -s.stress["event IV crush"] > -s.stress["gap down"] > 0
+    # no realised-vol forecast: no vol-scaled family
+    assert grid((p,), {"c": g}, TODAY, RATE, None).scaled == {}
+    # no implied vol: no grid at all
+    assert (
+        grid((p,), {"c": SimpleNamespace(underlying=100.0, vol=None)}, TODAY, RATE, 0.3)
+        is None
+    )
+
+
+def test_near_expiry_legs_expire_inside_the_horizon_with_strikes_as_nodes():
+    from thetagang_nt.pm.core.scenarios import RATE, grid
+
+    soon = TODAY + timedelta(days=4)  # expires before the 5- and 10-day horizons
+    short, g = priced("p", "P", 98, -1, 100.0, 0.3, expiry=soon)
+    s = grid((short,), {"p": g}, TODAY, RATE, None)
+    assert (5, -0.02, 0) in s.fixed  # the 98 strike is a price node (pin risk)
+    # expired at intrinsic: at -5% the short 98 put owes 98 - 95 = 3 a share
+    assert s.fixed[(10, -0.05, 10)] == pytest.approx(-300 - s.v_model)
+    assert s.fixed[(10, -0.05, 10)] == s.fixed[(10, -0.05, -10)]  # IV is gone
+
+
+def test_vix_grid_moves_each_leg_on_its_own_future():
+    from thetagang_nt.pm.core.scenarios import VIX_SPEC, bsm, grid
+
+    later = EXP + timedelta(days=28)
+    front, gf = priced("f", "C", 25, 1, 22.0, 0.9)
+    back, gb = priced("b", "C", 25, -1, 24.0, 0.8, expiry=later)
+    s = grid((front, back), {"f": gf, "b": gb}, TODAY, 0.0, None, VIX_SPEC)
+    assert {k[1] for k in s.fixed} == {-0.2, -0.1, 0.0, 0.15, 0.3}
+    assert set(s.stress) == {"spike", "fade", "regime shift"}
+    # spike: front future +30%, back +15%; front IV +20, back +10 (1 day)
+    from thetagang_nt.pm.core.efficiency import calendar_days
+
+    d = calendar_days(TODAY, 1)
+    spike = (
+        100 * bsm(22 * 1.3, 25, (30 - d) / 365, 1.1, True, 0.0)
+        - 100 * bsm(24 * 1.15, 25, (58 - d) / 365, 0.9, True, 0.0)
+        - s.v_model
+    )
+    assert s.stress["spike"] == pytest.approx(spike)
+
+
+def test_expected_pnl_and_expected_shortfall_by_hand():
+    from thetagang_nt.pm.core.scenarios import Grid
+    from thetagang_nt.pm.core.valuation import (
+        UtilityLimits,
+        expected_shortfall,
+        forward,
+        node_probabilities,
+    )
+
+    probs = node_probabilities((-2, -1, 0, 1, 2))
+    assert sum(probs.values()) == pytest.approx(1.0)
+    assert probs[-2] == pytest.approx(0.0668, abs=1e-4)  # N(-1.5)
+    assert probs[0] == pytest.approx(0.3829, abs=1e-4)  # N(0.5) - N(-0.5)
+    # the worst 10%: all of the 5% at -100 and half of the 10% at -50
+    outcomes = [(0.05, -100.0), (0.10, -50.0), (0.85, 10.0)]
+    assert expected_shortfall(outcomes, 0.10) == pytest.approx(75.0)
+
+    pnl = {-2: -200.0, -1: -80.0, 0: -10.0, 1: 60.0, 2: 150.0}
+    g = Grid(0.0, {}, {(5, z, 0): v for z, v in pnl.items()})
+    lim = UtilityLimits(risk_aversion=0.5, capital_cost=0.10, commission=1.0)
+    fwd = forward(g, liquidity_cost=20.0, contracts=2, capital_at_risk=504.0, lim=lim)
+    e = sum(probs[z] * v for z, v in pnl.items())
+    es = expected_shortfall([(probs[z], v) for z, v in pnl.items()], 0.10)
+    c_close = 20.0 + 2 * 1.0
+    assert fwd.e_pnl == pytest.approx(e) and fwd.es == pytest.approx(es)
+    assert fwd.u_close == -c_close
+    assert fwd.u_hold == pytest.approx(e - 0.5 * es - c_close - 0.10 * 504 * 5 / 252)
+    assert fwd.rar == pytest.approx(e / es)
+    assert forward(Grid(0.0, {}), 20.0, 2, 504.0) is None  # no probabilities
+
+
+def test_stress_loss_beyond_the_budget_is_p0():
+    from thetagang_nt.pm.core.review import hard_signals
+
+    over = StrategyState(cls=LONG, stress_loss=900.0, loss_budget=500.0)
+    assert [x.detail for x in hard_signals(over)] == ["stress loss -$900 > budget $500"]
+
+
+def test_a_used_up_budget_reads_as_a_negative_amount():
+    from thetagang_nt.pm.core.review import hard_signals
+
+    s = StrategyState(cls=LONG, worst_case_loss=300.0, loss_budget=-485.0)
+    assert hard_signals(s)[0].detail == "worst case -$300 > budget -$485"

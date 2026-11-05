@@ -370,7 +370,17 @@ class PMConfig(NautilusConfig, frozen=True):
         0.0,
         0.02,
         0.05,
-    )  # [M1] gamma sign check
+    )  # [M1] scenario grid price nodes; also the gamma sign check
+    iv_shifts: tuple[float, ...] = (-10.0, -5.0, 0.0, 5.0, 10.0)  # [M1] IV points
+    vix_moves: tuple[float, ...] = (-0.2, -0.1, 0.0, 0.15, 0.3)  # [M11] VIX futures
+    vix_iv_shifts: tuple[float, ...] = (-20.0, -10.0, 0.0, 10.0, 20.0)  # [M11]
+    # Phase 2 forward value (expected_pnl, risk_metrics, roll_rules): starting
+    # values chosen here, the vault leaves them open
+    utility_horizon: int = 5  # trading days
+    es_alpha: float = 0.10  # [M7] Expected Shortfall tail
+    risk_aversion: float = 0.1  # [M7] lambda, $ of utility per $ of ES
+    capital_cost: float = 0.05  # [M7] kappa, per year on capital at risk
+    commission: float = 0.65  # [M9] $ per contract
     realized_vol_days: int = 21  # [M6] daily returns behind the realised-vol forecast
     # Short Options Manager (strategies opened for a credit), short_exit_signals
     capture_levels: tuple[float, ...] = (0.5, 0.7, 0.8, 0.9)  # [S1] credit captured
@@ -421,6 +431,24 @@ class PMConfig(NautilusConfig, frozen=True):
             profit_levels=tuple(self.vix_profit_levels),
             loss_levels=tuple(self.vix_loss_levels),
             review_dte=self.vix_review_dte,
+        )
+
+    def grid_spec(self, vix: bool = False) -> Any:
+        from thetagang_nt.pm.core.scenarios import GridSpec
+
+        if vix:
+            return GridSpec(tuple(self.vix_moves), tuple(self.vix_iv_shifts), vix=True)
+        return GridSpec(tuple(self.grid_moves), tuple(self.iv_shifts))
+
+    def utility_limits(self) -> Any:
+        from thetagang_nt.pm.core.valuation import UtilityLimits
+
+        return UtilityLimits(
+            horizon=self.utility_horizon,
+            alpha=self.es_alpha,
+            risk_aversion=self.risk_aversion,
+            capital_cost=self.capital_cost,
+            commission=self.commission,
         )
 
     def quality(self) -> Any:
@@ -487,7 +515,15 @@ class PMConfig(NautilusConfig, frozen=True):
             ("wide_spread", "T9", "(ask - bid) / mid above this is wide"),
             ("near_expiry_days", "", "a short leg this close to expiry..."),
             ("near_money", "", "...and this close to its strike"),
-            ("grid_moves", "M1", "price moves for the gamma sign check"),
+            ("grid_moves", "M1", "scenario grid price moves (and gamma sign check)"),
+            ("iv_shifts", "M1", "scenario grid IV shifts, points"),
+            ("vix_moves", "M11", "VIX grid: matching-future moves"),
+            ("vix_iv_shifts", "M11", "VIX grid: IV shifts, points"),
+            ("utility_horizon", "M7", "trading days for E[P&L], ES and utility"),
+            ("es_alpha", "M7", "Expected Shortfall tail"),
+            ("risk_aversion", "M7", "lambda: utility cost per $ of ES"),
+            ("capital_cost", "M7", "kappa: yearly cost of capital at risk"),
+            ("commission", "M9", "$ per contract to trade"),
             (
                 "realized_vol_days",
                 "M6",

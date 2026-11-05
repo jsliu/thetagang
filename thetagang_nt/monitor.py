@@ -37,7 +37,10 @@ from thetagang_nt.pm.core.review import (
     StrategyState,
     manager,
 )
+from thetagang_nt.pm.core.scenarios import RATE as SCENARIO_RATE
+from thetagang_nt.pm.core.scenarios import grid as scenario_grid
 from thetagang_nt.pm.core.strategy_id import Seen, auto_ids
+from thetagang_nt.pm.core.valuation import forward
 from thetagang_nt.pm.long_options import signals as long_options
 from thetagang_nt.pm.long_options import vix as long_vix
 from thetagang_nt.pm.short_options import signals as short_options
@@ -109,6 +112,34 @@ def position_labels(leg: Leg) -> dict[str, str]:
         "symbol": leg.symbol,
         "kind": {"C": "call", "P": "put"}.get(leg.right, "stock"),
     }
+
+
+def publish_grid(f: _Families, sid: str, grid: Any, spec: Any) -> None:
+    """The fixed-move grid cells, stress scenarios and per-horizon summaries
+    (scenario_engine, stress_testing) of one strategy."""
+    for (h, move, iv), pnl in grid.fixed.items():
+        f.set(
+            "pm_grid",
+            "Scenario P&L ($): horizon (trading days), price move, IV shift (points)",
+            pnl,
+            strategy=sid,
+            horizon=str(h),
+            move=f"{move:g}",  # numbers, so the dashboard sorts them
+            iv=f"{iv:g}",
+        )
+    for name, pnl in grid.stress.items():
+        f.set("pm_stress", "Stress scenario P&L ($)", pnl, strategy=sid, name=name)
+    step = sorted(x for x in spec.iv_points if x > 0)[0]
+    for h in (1, 5, 10):
+        for stat, value in grid.summary(h, step).items():
+            f.set(
+                "pm_grid_summary",
+                "Scenario grid summary per horizon ($; counts; ratio)",
+                value,
+                strategy=sid,
+                horizon=str(h),
+                stat=stat,
+            )
 
 
 class _Snapshot:
@@ -875,6 +906,7 @@ class PortfolioMonitor(Actor):
         inputs = {x.id: x for x in self._pm.strategies}
         limits, quality = self._pm.limits(), self._pm.quality()
         short_limits, vix_limits = self._pm.short_limits(), self._pm.vix_limits()
+        utility = self._pm.utility_limits()
         rows, decisions, counts = [], [], dict.fromkeys((P0, P1, P2), 0)
         for sid, (s, und, st, fig, bot) in zip(ids, entries, strict=True):
             closes = self._closes.get(underlying_id(s), {})
@@ -901,12 +933,45 @@ class PortfolioMonitor(Actor):
             elif x is not None and x.invalidation_above is not None:
                 invalidation = ("above", x.invalidation_above)
             v_floor, _ = value_bounds(fig)
-            # phase 1 proxy for the worst-case loss: down to the expiry floor
-            # (phase 2: the scenario grid's worst cell)
-            worst = (
-                max(0.0, a.v_exec - v_floor)
+            # the scenario grid (scenario_engine): VIX options on their future
+            is_vix = s == VIX_ROOT
+            grid = scenario_grid(
+                st.legs,
+                greeks,
+                today,
+                0.0 if is_vix else SCENARIO_RATE,
+                None if is_vix else sigma_f,  # no sigma_F for VIX futures yet
+                self._pm.grid_spec(vix=is_vix),
+            )
+            worst = grid.worst_loss() if grid else None
+            stress = grid.stress_loss() if grid else None
+            liquidity = (
+                None if a.v_mid is None or a.v_exec is None else a.v_mid - a.v_exec
+            )
+            # capital at risk (risk_metrics): to the expiry floor for defined
+            # risk; else the worst stress loss (no broker margin here)
+            car = (
+                a.v_exec - v_floor
                 if a.v_exec is not None and v_floor is not None
+                else stress
+            )
+            fwd = (
+                forward(
+                    grid,
+                    liquidity,
+                    sum(abs(p.qty) for p in st.legs),
+                    max(car, 0.0),
+                    utility,
+                )
+                if grid and liquidity is not None and car is not None
                 else None
+            )
+            # LossBudget = max acceptable loss + min(0, unrealized P&L)
+            max_loss = x.max_loss if x and x.max_loss is not None else self._pm.max_loss
+            budget = (
+                max_loss + min(0.0, a.v_exec - net_debit)
+                if max_loss is not None and a.v_exec is not None
+                else max_loss
             )
             single = st.legs[0] if len(st.legs) == 1 and st.legs[0].qty > 0 else None
             g = greeks.get(single.instrument_id) if single else None
@@ -933,9 +998,8 @@ class PortfolioMonitor(Actor):
                 thesis_valid=x.thesis_valid if x else None,
                 invalidation=invalidation,
                 worst_case_loss=worst,
-                loss_budget=x.max_loss
-                if x and x.max_loss is not None
-                else self._pm.max_loss,
+                stress_loss=stress,
+                loss_budget=budget,
                 sigma_f=sigma_f,
                 assignment_intended=x.assignment_intended if x else False,
             )
@@ -980,10 +1044,18 @@ class PortfolioMonitor(Actor):
             for field, value in (
                 ("v_mid", a.v_mid),
                 ("v_exec", a.v_exec),
-                (
-                    "liquidity_cost",
-                    None if a.v_mid is None or a.v_exec is None else a.v_mid - a.v_exec,
-                ),
+                ("liquidity_cost", liquidity),
+                ("stress_loss", stress),
+                ("loss_budget", budget),
+                ("capital_at_risk", car),
+                ("e_pnl", fwd.e_pnl if fwd else None),
+                ("es", fwd.es if fwd else None),
+                ("rar", fwd.rar if fwd else None),
+                ("u_hold", fwd.u_hold if fwd else None),
+                ("u_close", fwd.u_close if fwd else None),
+                ("wcl_1", grid.wcl(1) if grid else None),
+                ("wcl_5", grid.wcl(5) if grid else None),
+                ("wcl_10", grid.wcl(10) if grid else None),
                 ("net_debit", net_debit),
                 ("pnl_exec", None if a.v_exec is None else a.v_exec - net_debit),
                 ("delta", net.get("delta")),
@@ -1026,7 +1098,7 @@ class PortfolioMonitor(Actor):
                 ),
                 (
                     "premium_to_risk",
-                    premium_to_risk(a.v_exec, worst)
+                    premium_to_risk(a.v_exec, car)
                     if short and a.v_exec is not None
                     else None,
                 ),
@@ -1040,6 +1112,8 @@ class PortfolioMonitor(Actor):
                         strategy=sid,
                         field=field,
                     )
+            if grid:
+                publish_grid(f, sid, grid, self._pm.grid_spec(vix=is_vix))
             key = (out, tuple((x.priority, x.name) for x in found))
             if self._pm_last.get(sid) != key:
                 decisions.append((sid, out, [x.__dict__ for x in found], bot))

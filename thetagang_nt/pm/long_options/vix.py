@@ -19,7 +19,13 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from thetagang_nt.pm.core.review import P1, Signal, StrategyState, hard_signals, outcome
+from thetagang_nt.pm.core.review import (
+    P1,
+    Signal,
+    StrategyState,
+    hard_signals,
+    outcome,
+)
 from thetagang_nt.pm.long_options.signals import (
     SignalLimits,
     drift_signals,

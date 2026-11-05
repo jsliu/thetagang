@@ -228,7 +228,18 @@ weight = 0.0
 #                               # review at days left (interpolated; LEAPS keep 270)
 # gamma_tolerance = 0.01        # [T7] |net gamma| below this counts as zero (shares per $1)
 # theta_tolerance = 0.01        # [T7] |net theta| below this counts as zero ($ per day)
-# grid_moves = [-0.05, -0.02, 0.0, 0.02, 0.05]  # [M1] moves for the gamma sign check
+# grid_moves = [-0.05, -0.02, 0.0, 0.02, 0.05]  # [M1] scenario grid price moves
+#                               # (and the gamma sign check)
+# iv_shifts = [-10.0, -5.0, 0.0, 5.0, 10.0]  # [M1] scenario grid IV shifts, points
+# vix_moves = [-0.2, -0.1, 0.0, 0.15, 0.3]  # [M11] VIX grid: matching-future moves
+# vix_iv_shifts = [-20.0, -10.0, 0.0, 10.0, 20.0]  # [M11] VIX grid: IV shifts
+# Phase 2 forward value (vault expected_pnl, risk_metrics, roll_rules); the
+# vault leaves these open, so the values are starting points:
+# utility_horizon = 5           # trading days for E[P&L], Expected Shortfall, utility
+# es_alpha = 0.10               # [M7] Expected Shortfall: the worst 10% of outcomes
+# risk_aversion = 0.1           # [M7] lambda: utility cost per $ of Expected Shortfall
+# capital_cost = 0.05           # [M7] kappa: yearly cost of the capital at risk
+# commission = 0.65             # [M9] $ per contract to trade
 # realized_vol_days = 21        # [M6] daily returns behind the realised-vol forecast
 # The settings above serve the Long Options Manager (strategies opened for a
 # debit; credit_levels [T2] is superseded by S1). Strategies opened for a credit

@@ -11,13 +11,13 @@ from __future__ import annotations
 import math
 
 
-def premium_to_risk(value_exec: float, worst_case_loss: float | None) -> float | None:
-    """RemainingPremium / RemainingRisk = C_close / WCL_h: the premium still to
-    earn per $ of risk still carried. Phase 1 WCL_h: the expiry value floor
-    (defined risk only), until the scenario grid exists."""
-    if not worst_case_loss or worst_case_loss <= 0:
+def premium_to_risk(value_exec: float, remaining_risk: float | None) -> float | None:
+    """RemainingPremium / RemainingRisk: the premium still to earn per $ of
+    risk still carried. Remaining risk: capital at risk (risk_metrics), down
+    to the expiry floor for defined risk, else the worst stress loss."""
+    if not remaining_risk or remaining_risk <= 0:
         return None
-    return -value_exec / worst_case_loss
+    return -value_exec / remaining_risk
 
 
 def loss_multiple(value_exec: float, net_debit: float) -> float | None:

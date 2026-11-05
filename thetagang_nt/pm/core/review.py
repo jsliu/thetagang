@@ -62,10 +62,16 @@ class StrategyState:
     prev_cls: str | None = None
     thesis_valid: bool | None = None  # your input
     invalidation: tuple[str, float] | None = None  # ("below" | "above", price)
-    worst_case_loss: float | None = None  # $, positive
+    worst_case_loss: float | None = None  # $, positive: the grid's worst WCL_h
+    stress_loss: float | None = None  # $, positive: the worst stress scenario
     loss_budget: float | None = None  # max acceptable loss, $, positive
     sigma_f: float | None = None  # forecast annualised realised vol (M6)
     assignment_intended: bool = False  # your input: expiry/assignment is the plan
+
+
+def _money(x: float) -> str:
+    """$500, or -$485 once the loss is already past the max acceptable loss."""
+    return f"-${-x:,.0f}" if x < 0 else f"${x:,.0f}"
 
 
 def hard_signals(s: StrategyState) -> list[Signal]:
@@ -92,7 +98,19 @@ def hard_signals(s: StrategyState) -> list[Signal]:
             Signal(
                 P0,
                 "risk budget breached",
-                f"worst case -${s.worst_case_loss:,.0f} > budget ${s.loss_budget:,.0f}",
+                f"worst case -${s.worst_case_loss:,.0f} > budget {_money(s.loss_budget)}",
+            )
+        )
+    if (
+        s.stress_loss is not None
+        and s.loss_budget is not None
+        and s.stress_loss > s.loss_budget
+    ):
+        out.append(
+            Signal(
+                P0,
+                "risk budget breached",
+                f"stress loss -${s.stress_loss:,.0f} > budget {_money(s.loss_budget)}",
             )
         )
     return out

@@ -21,6 +21,11 @@ long_options and short_options import core, never each other.
                                                P0 and class-change signals,
                                                the Phase 1 outcome, manager
       strategy_id    data_model                stable strategy IDs across rolls
+      scenarios      scenario_engine,          the 1/5/10-day price x IV grid,
+                     option_repricing,         stress scenarios, WCL_h
+                     stress_testing
+      valuation      expected_pnl,             E[P&L], ES, HOLD and CLOSE
+                     risk_metrics, roll_rules  utilities (Phase 2)
     long_options/    Long Options Manager (vault: long_options_manager)
       signals        exit_signals              T1, T3-T8 review signals, decide
       vix            vix_options_management    long VIX: V2, V3, V7 replace T1, T3
