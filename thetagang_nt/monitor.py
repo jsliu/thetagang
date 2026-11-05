@@ -39,6 +39,7 @@ from thetagang_nt.pm.core.review import (
 )
 from thetagang_nt.pm.core.strategy_id import Seen, auto_ids
 from thetagang_nt.pm.long_options import signals as long_options
+from thetagang_nt.pm.long_options import vix as long_vix
 from thetagang_nt.pm.short_options import signals as short_options
 from thetagang_nt.pm.short_options.analysis import loss_multiple, premium_to_risk
 from thetagang_nt.portfolio import (
@@ -54,8 +55,10 @@ from thetagang_nt.portfolio import (
     held_legs,
     is_index,
     net_liquidation,
+    option_greeks,
     order_cost,
     order_text,
+    parity_partner,
     price,
     proposal_legs,
     stock_contract,
@@ -202,6 +205,8 @@ class PortfolioMonitor(Actor):
         self._bot_actions: dict[frozenset[str], tuple[str, str]] = {}
         self._extras = extras
         self._iv_open: tuple[date | None, dict[InstrumentId, float]] = (None, {})
+        self._vix_hedge = "-"  # what the VIX call hedge would do, set by _actions
+        self._vix_chain_day: date | None = None  # VIX chain loaded for parity
 
     def on_start(self) -> None:
         if self.config.publish:
@@ -228,6 +233,34 @@ class PortfolioMonitor(Actor):
             callback=self._on_timer,
         )
         await self._refresh()
+
+    async def _vix_partners(self, today: date) -> set[InstrumentId]:
+        """The parity partner of every held VIX option (same expiry and strike,
+        other right): its price gives the matching VIX future the option prices
+        off. Loads the VIX chain over the held expiries, at most once a day."""
+        held = [
+            self.cache.instrument(x.instrument_id)
+            for x in held_legs(self.cache)
+            if x.symbol == VIX_ROOT and x.is_option
+        ]
+        held = [i for i in held if i is not None]
+        missing = [i for i in held if parity_partner(self.cache, i) is None]
+        if missing and self._vix_chain_day != today:
+            self._vix_chain_day = today
+            days = [(i.expiration_utc.date() - today).days for i in missing]
+            chain = {
+                "secType": "IND",
+                "symbol": "VIX",
+                "exchange": "CBOE",
+                "build_options_chain": True,
+                "min_expiry_days": max(min(days) - 1, 0),
+                "max_expiry_days": max(days) + 1,
+            }
+            try:
+                await aio.load_contracts(self, [chain])
+            except Exception as e:  # noqa: BLE001 - VIX greeks are then missing
+                self.log.warning(f"VIX chain not loaded: {e!r}")
+        return {p.id for i in held if (p := parity_partner(self.cache, i))}
 
     def _on_timer(self, _event: object) -> None:
         if not self._busy:  # a slow refresh (IB pacing) never piles up
@@ -263,6 +296,7 @@ class PortfolioMonitor(Actor):
             )
         ids = {leg.instrument_id for leg in held_legs(self.cache)}
         ids |= {SPX, VIX, VIXMO} | {underlying_id(s) for s in symbols}
+        ids |= await self._vix_partners(today)
         await aio.wait_for_prices(self, ids, timeout=10)
         legs = held_legs(self.cache)  # again, now with prices
         if self._beta_day != today:
@@ -767,8 +801,32 @@ class PortfolioMonitor(Actor):
                             name=name,
                             field=field,
                         )
+        # long VIX calls (vault vix_options_management): priced on the matching
+        # VIX future, so the spot is that future (the front leg's, for a calendar)
+        vix_legs = [x for x in legs if x.symbol == VIX_ROOT and x.is_option]
+        greeks = dict(book.greeks)
+        for x in vix_legs:
+            ins = self.cache.instrument(x.instrument_id)
+            if ins is not None and (
+                g := option_greeks(self.cache, self.greeks, ins, today)
+            ):
+                greeks[x.instrument_id] = g
+        for st in find_structures(vix_legs, groups):
+            front = greeks.get(
+                min(st.legs, key=lambda p: p.expiry or today).instrument_id
+            )
+            fig = structure_figures(st, greeks, today)
+            entries.append(
+                (
+                    VIX_ROOT,
+                    front.underlying if front else None,
+                    st,
+                    fig,
+                    self._vix_hedge,
+                )
+            )
         try:
-            self._portfolio_manager(f, entries, book, today)
+            self._portfolio_manager(f, entries, greeks, today)
         except Exception as e:  # noqa: BLE001 - the rest of the dashboard never waits on it
             self.log.warning(f"Portfolio Manager skipped: {e!r}")
 
@@ -785,7 +843,7 @@ class PortfolioMonitor(Actor):
         )
 
     def _portfolio_manager(
-        self, f: _Families, entries: list, book: Book, today: date
+        self, f: _Families, entries: list, greeks: dict, today: date
     ) -> None:
         """The Portfolio Manager (vault): assess each strategy, give it its stable
         ID, raise the review signals and publish them; then write the journal,
@@ -816,7 +874,7 @@ class PortfolioMonitor(Actor):
                 pass
         inputs = {x.id: x for x in self._pm.strategies}
         limits, quality = self._pm.limits(), self._pm.quality()
-        short_limits = self._pm.short_limits()
+        short_limits, vix_limits = self._pm.short_limits(), self._pm.vix_limits()
         rows, decisions, counts = [], [], dict.fromkeys((P0, P1, P2), 0)
         for sid, (s, und, st, fig, bot) in zip(ids, entries, strict=True):
             closes = self._closes.get(underlying_id(s), {})
@@ -825,7 +883,7 @@ class PortfolioMonitor(Actor):
             a = assess(
                 st,
                 fig,
-                book.greeks,
+                greeks,
                 quotes,
                 und,
                 sigma_f,
@@ -851,7 +909,7 @@ class PortfolioMonitor(Actor):
                 else None
             )
             single = st.legs[0] if len(st.legs) == 1 and st.legs[0].qty > 0 else None
-            g = book.greeks.get(single.instrument_id) if single else None
+            g = greeks.get(single.instrument_id) if single else None
             state = StrategyState(
                 cls=a.cls,
                 data_flags=a.flags,
@@ -886,6 +944,8 @@ class PortfolioMonitor(Actor):
             short = category == SHORT_PREMIUM
             if short:
                 found, out = short_options.decide(state, short_limits)
+            elif s == VIX_ROOT:
+                found, out = long_vix.decide(state, limits, vix_limits)
             else:
                 found, out = long_options.decide(state, limits)
             top, rank = review_rank(found)
@@ -942,8 +1002,12 @@ class PortfolioMonitor(Actor):
                 ("dte_front", a.dte_front),
                 (
                     "dte_window",
-                    long_options.dte_window(initial_dte, limits.dte_windows)
-                    if initial_dte is not None and not short
+                    None
+                    if short
+                    else vix_limits.review_dte
+                    if s == VIX_ROOT
+                    else long_options.dte_window(initial_dte, limits.dte_windows)
+                    if initial_dte is not None
                     else None,
                 ),
                 # Short Options Manager: premium captured, loss multiple, and
@@ -1063,6 +1127,7 @@ class PortfolioMonitor(Actor):
         )
         vixmo = price(self.cache, VIXMO)
         action, weight = vix_hedge_action(held, price(self.cache, VIX), vixmo, cfg)
+        self._vix_hedge = f"VIX hedge: {action}"
         f.set("vix_hedge_action", "What the VIX call hedge would do", 1, action=action)
         f.set("vix_hedge", "VIX call hedge", held, field="held_calls")
         if vixmo is not None:  # without VIXMO the weight is unknown, not 0

@@ -241,6 +241,13 @@ weight = 0.0
 # assignment_days = 7           # [S4] an in-the-money short leg this close to expiry
 # tested_moves = 1.0            # [S5] spot within this many moves of a short strike
 # tested_horizon = 5            # [S5] trading days in a move (S x sigma_f x sqrt(h/252))
+# Long VIX calls (vault vix_options_management) replace T1 and T3 with:
+# vix_profit_levels = [0.10, 0.15, 0.20, 0.30]  # [V2] review at these gains on the
+#                               # debit: review / evaluate early close / consider /
+#                               # strong profit-taking consideration
+# vix_loss_levels = [-0.25, -0.35]  # [V3] loss reviews (not stop-losses)
+# vix_review_dte = 14           # [V7] review at this many days left, before the
+#                               # last trading session (the vault leaves it to be set)
 #
 # Your inputs for one strategy, by its ID on the Portfolio Manager dashboard:
 # [[pm.strategies]]

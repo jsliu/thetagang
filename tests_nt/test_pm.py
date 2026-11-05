@@ -35,6 +35,7 @@ from thetagang_nt.pm.core.review import (
 )
 from thetagang_nt.pm.core.strategy_id import Seen, auto_ids
 from thetagang_nt.pm.long_options import signals as long_options
+from thetagang_nt.pm.long_options import vix as long_vix
 from thetagang_nt.pm.long_options.signals import dte_window, signals
 from thetagang_nt.pm.short_options import signals as short_options
 from thetagang_nt.pm.short_options.analysis import (
@@ -511,9 +512,7 @@ def test_the_monitor_sends_each_strategy_to_its_manager():
         log=SimpleNamespace(warning=warnings.append),
     )
     f = _Families()
-    PortfolioMonitor._portfolio_manager(
-        fake, f, entries, SimpleNamespace(greeks=book_greeks), TODAY
-    )
+    PortfolioMonitor._portfolio_manager(fake, f, entries, book_greeks, TODAY)
     assert warnings == []
     info = {s.labels["kind"]: s.labels for s in f.by_name["pm_info"].samples}
     assert info["debit spread"]["manager"] == LONG_PREMIUM
@@ -625,9 +624,7 @@ def test_a_default_risk_budget_applies_unless_a_strategy_sets_its_own():
             log=SimpleNamespace(warning=print),
         )
         f = _Families()
-        PortfolioMonitor._portfolio_manager(
-            fake, f, entries, SimpleNamespace(greeks=g), TODAY
-        )
+        PortfolioMonitor._portfolio_manager(fake, f, entries, g, TODAY)
         (info,) = f.by_name["pm_info"].samples
         return info.labels["outcome"], info.labels["top"]
 
@@ -637,3 +634,191 @@ def test_a_default_risk_budget_applies_unless_a_strategy_sets_its_own():
     assert run(PMConfig(max_loss=200.0, strategies=[own])) == ("HOLD", "-")
     listed = {n: (v, s) for n, v, _, s, _ in PMConfig(max_loss=2000.0).params()}
     assert listed["max_loss"] == ("2000", "your setting")
+
+
+def test_long_vix_calls_use_the_vix_levels_not_t1_and_t3():
+    """V2 replaces T1 and V7 replaces T3 for VIX; V3 adds loss reviews; P0 and
+    the P2 signals are the general ones (vault vix_options_management)."""
+
+    def vix(value, dte=40, initial=60, **kw):
+        return StrategyState(
+            cls=LONG,
+            net_debit=128.0,
+            value_exec=value,
+            dte_front=dte,
+            initial_dte=initial,
+            **kw,
+        )
+
+    def found(s):
+        return [(x.priority, x.name, x.detail) for x in long_vix.decide(s)[0]]
+
+    # +18.8% (the vault's example): V2 "evaluate early close"; T1 (+50%) is silent
+    assert found(vix(152.0)) == [
+        (P1, "VIX profit level", "+19% on the debit: evaluate early close")
+    ]
+    assert long_options.signals(vix(152.0)) == []
+    assert found(vix(170.0))[0][2].endswith("strong profit-taking consideration")
+    assert found(vix(135.0)) == []  # +5%: normal monitoring
+    # V3: -25% review, -35% the stronger case; reviews, not stops
+    assert found(vix(96.0))[0][2] == "-25% on the debit: loss review"
+    assert found(vix(80.0))[0][2].endswith("stronger case for closing or reducing")
+    # V7: fixed 14 days, not the life-scaled 60 -> 19 days of T3
+    assert dte_window(60) == 19
+    assert found(vix(135.0, dte=18)) == []
+    assert found(vix(135.0, dte=14))[0][1] == "VIX time review"
+    # shared: P0 hard signals, P2 delta on the matching future, the outcome
+    s = vix(152.0, thesis_valid=False, single_long_delta=0.85)
+    names = [(p, n) for p, n, _ in found(s)]
+    assert (P0, "thesis invalidated") in names and (P2, "delta") in names
+    assert long_vix.decide(s)[1] == "CLOSE review"
+    tight = long_vix.VixLimits(profit_levels=(0.05,), review_dte=30)
+    assert [x.name for x in long_vix.vix_signals(vix(135.0, dte=25), tight)] == [
+        "VIX profit level",
+        "VIX time review",
+    ]
+
+
+def test_vix_settings_come_from_the_toml_and_are_listed():
+    pytest.importorskip("nautilus_trader")
+    from thetagang_nt.config import PMConfig
+
+    pm = PMConfig(vix_profit_levels=(0.12,), vix_review_dte=10)
+    listed = {name: (value, vid, src) for name, value, vid, src, _ in pm.params()}
+    assert listed["vix_profit_levels"] == ("0.12", "V2", "your setting")
+    assert listed["vix_loss_levels"] == ("-0.25, -0.35", "V3", "default")
+    assert listed["vix_review_dte"] == ("10", "V7", "your setting")
+    lim = pm.vix_limits()
+    assert lim.profit_levels == (0.12,) and lim.review_dte == 10
+
+
+def test_the_monitor_sends_vix_calls_to_the_vix_rules():
+    pytest.importorskip("nautilus_trader")
+    pytest.importorskip("psycopg")
+    from thetagang_nt.config import PMConfig
+    from thetagang_nt.monitor import PortfolioMonitor, _Families
+    from thetagang_nt.portfolio import VIX_ROOT
+
+    call = Leg("vxc", VIX_ROOT, "C", 30, EXP, 2, 1.28, 1.55)  # debit 256
+    g = {"vxc": greeks(delta=0.4, gamma=0.05, theta=-0.03, vega=0.04, vol=0.9)}
+    entries = []
+    for st in find_structures([call]):
+        fig = structure_figures(st, g, TODAY)
+        entries.append((VIX_ROOT, 27.5, st, fig, "VIX hedge: hold"))
+    fake = SimpleNamespace(
+        _quote={"vxc": Quote(1.52, 1.58)}.get,
+        _pm_known={},
+        _journal=None,
+        _pm=PMConfig(),
+        _closes={},
+        _pm_cls={},
+        _pm_last={},
+        log=SimpleNamespace(warning=print),
+    )
+    f = _Families()
+    PortfolioMonitor._portfolio_manager(fake, f, entries, g, TODAY)
+    (info,) = [s.labels for s in f.by_name["pm_info"].samples]
+    assert info["symbol"] == "VIX" and info["manager"] == LONG_PREMIUM
+    assert info["signals"].startswith("P1 VIX profit level: +19% on the debit")
+    assert info["bot"] == "VIX hedge: hold"
+    window = [
+        s.value for s in f.by_name["pm"].samples if s.labels["field"] == "dte_window"
+    ]
+    assert window == [14]  # V7, not T3
+
+
+def test_the_monitor_prices_vix_calls_on_the_matching_future(monkeypatch):
+    """The monitor's live-data steps for a long VIX call, on a real Nautilus
+    cache: load the parity partner (once a day), price the call on the matching
+    future F = C - P + K, and hand it to the Portfolio Manager."""
+    pytest.importorskip("nautilus_trader")
+    pytest.importorskip("psycopg")
+    import asyncio
+
+    from nautilus_trader.cache.cache import Cache
+    from nautilus_trader.model.currencies import USD
+    from nautilus_trader.model.data import QuoteTick
+    from nautilus_trader.model.enums import AssetClass, OptionKind
+    from nautilus_trader.model.identifiers import InstrumentId, Symbol
+    from nautilus_trader.model.instruments import OptionContract
+    from nautilus_trader.model.objects import Price, Quantity
+
+    from thetagang_nt import monitor
+    from thetagang_nt.monitor import PortfolioMonitor, _Families
+    from thetagang_nt.portfolio import VIX_ROOT
+
+    expiry = datetime(2026, 12, 16, 21, tzinfo=timezone.utc)  # 44 days out
+    cache = Cache()
+
+    def option(right, kind):
+        iid = InstrumentId.from_str(f"VIX261216{right}00030000.SMART")
+        return OptionContract(
+            iid,
+            Symbol(iid.symbol.value),
+            AssetClass.INDEX,
+            USD,
+            2,
+            Price.from_str("0.01"),
+            Quantity.from_int(100),
+            Quantity.from_int(1),
+            VIX_ROOT,
+            kind,
+            Price.from_str("30.00"),
+            0,
+            int(expiry.timestamp() * 1e9),
+            0,
+            0,
+        )
+
+    def quote(ins, bid, ask):
+        size = Quantity.from_int(10)
+        cache.add_quote_tick(
+            QuoteTick(
+                ins.id, Price.from_str(bid), Price.from_str(ask), size, size, 0, 0
+            )
+        )
+
+    call, put = option("C", OptionKind.CALL), option("P", OptionKind.PUT)
+    cache.add_instrument(call)
+    quote(call, "1.50", "1.60")
+    held = Leg(call.id, VIX_ROOT, "C", 30.0, expiry.date(), 2, 1.28, 1.55)
+    monkeypatch.setattr(monitor, "held_legs", lambda _cache: [held])
+    loads = []
+
+    async def load_contracts(_actor, contracts):
+        loads.append(contracts)
+        cache.add_instrument(put)
+        quote(put, "4.00", "4.10")
+
+    monkeypatch.setattr(monitor.aio, "load_contracts", load_contracts)
+    fake = SimpleNamespace(cache=cache, _vix_chain_day=None, log=None)
+
+    # the put at the held strike is not loaded: load the chain over the expiry
+    assert asyncio.run(PortfolioMonitor._vix_partners(fake, TODAY)) == {put.id}
+    ((chain,),) = loads
+    assert chain["symbol"] == "VIX" and chain["build_options_chain"]
+    assert chain["min_expiry_days"] <= 44 <= chain["max_expiry_days"]
+    assert asyncio.run(PortfolioMonitor._vix_partners(fake, TODAY)) == {put.id}
+    assert len(loads) == 1  # found in the cache now; never twice a day anyway
+
+    # priced on F = 1.55 - 4.05 + 30 = 27.50, not spot VIX, and sent to the PM
+    sent = {}
+    fake = SimpleNamespace(
+        cache=cache,
+        greeks=None,  # the VIX path prices with Black-76 itself
+        _rules=None,
+        _vix_hedge="VIX hedge: hold",
+        _portfolio_manager=lambda f, entries, greeks, today: sent.update(
+            entries=entries, greeks=greeks
+        ),
+    )
+    PortfolioMonitor._structures(
+        fake, _Families(), [held], SimpleNamespace(greeks={}), TODAY
+    )
+    ((symbol, spot, st, fig, bot),) = sent["entries"]
+    assert (symbol, st.kind, bot) == (VIX_ROOT, "long call", "VIX hedge: hold")
+    assert spot == pytest.approx(27.5)
+    g = sent["greeks"][call.id]
+    assert g.underlying == pytest.approx(27.5)
+    assert 0 < g.delta < 0.5 and g.gamma > 0 and g.theta < 0 and g.vol > 0
+    assert fig.cost == pytest.approx(256.0)

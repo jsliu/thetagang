@@ -23,6 +23,7 @@ long_options and short_options import core, never each other.
       strategy_id    data_model                stable strategy IDs across rolls
     long_options/    Long Options Manager (vault: long_options_manager)
       signals        exit_signals              T1, T3-T8 review signals, decide
+      vix            vix_options_management    long VIX: V2, V3, V7 replace T1, T3
     short_options/   Short Options Manager (vault: short_options_manager)
       analysis       premium_capture_model,    premium to risk, loss multiple,
                      loss_control              distance to a short strike

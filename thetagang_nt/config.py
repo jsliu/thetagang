@@ -380,6 +380,10 @@ class PMConfig(NautilusConfig, frozen=True):
     assignment_days: int = 7  # [S4] an in-the-money short leg this close to expiry
     tested_moves: float = 1.0  # [S5] spot within this many moves of a short strike
     tested_horizon: int = 5  # [S5] trading days in a move (S * sigma_f * sqrt(h/252))
+    # Long VIX calls (vault vix_options_management): replace T1 and T3 for VIX
+    vix_profit_levels: tuple[float, ...] = (0.10, 0.15, 0.20, 0.30)  # [V2] on the debit
+    vix_loss_levels: tuple[float, ...] = (-0.25, -0.35)  # [V3] loss reviews, not stops
+    vix_review_dte: int = 14  # [V7] review at this many days left (starting point)
 
     def limits(self) -> Any:
         from thetagang_nt.pm.long_options.signals import SignalLimits
@@ -408,6 +412,15 @@ class PMConfig(NautilusConfig, frozen=True):
             assignment_days=self.assignment_days,
             tested_moves=self.tested_moves,
             tested_horizon=self.tested_horizon,
+        )
+
+    def vix_limits(self) -> Any:
+        from thetagang_nt.pm.long_options.vix import VixLimits
+
+        return VixLimits(
+            profit_levels=tuple(self.vix_profit_levels),
+            loss_levels=tuple(self.vix_loss_levels),
+            review_dte=self.vix_review_dte,
         )
 
     def quality(self) -> Any:
@@ -494,6 +507,9 @@ class PMConfig(NautilusConfig, frozen=True):
             ),
             ("tested_moves", "S5", "short: spot within this many moves of a strike"),
             ("tested_horizon", "S5", "short: trading days in one move"),
+            ("vix_profit_levels", "V2", "long VIX: review at these gains on the debit"),
+            ("vix_loss_levels", "V3", "long VIX: loss review at these returns"),
+            ("vix_review_dte", "V7", "long VIX: review when this many days remain"),
             ("journal", "", "write the journal (Postgres)"),
         )
         return [

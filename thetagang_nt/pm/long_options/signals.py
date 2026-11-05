@@ -66,10 +66,9 @@ def _level(value: float, levels: tuple[float, ...]) -> int:
     return sum(value >= x for x in levels)
 
 
-def signals(s: StrategyState, lim: SignalLimits = SignalLimits()) -> list[Signal]:
-    # P0: hard
-    out = hard_signals(s)
-    # P1: profit levels, by how the strategy was opened
+def profit_signals(s: StrategyState, lim: SignalLimits) -> list[Signal]:
+    """P1 profit levels (T1, T2), by how the strategy was opened."""
+    out: list[Signal] = []
     if s.value_exec is not None and s.net_debit > 0:
         gain = (s.value_exec - s.net_debit) / s.net_debit
         n = _level(gain, lim.profit_levels)
@@ -88,15 +87,22 @@ def signals(s: StrategyState, lim: SignalLimits = SignalLimits()) -> list[Signal
             out.append(
                 Signal(P1, "profit level", f"{captured:.0%} of the credit captured")
             )
-    # P1: time
-    if s.dte_front is not None and s.initial_dte is not None:
-        window = dte_window(s.initial_dte, lim.dte_windows)
-        if s.dte_front <= window:
-            out.append(
-                Signal(
-                    P1, "DTE window", f"{s.dte_front} days left (review at {window})"
-                )
-            )
+    return out
+
+
+def time_signals(s: StrategyState, lim: SignalLimits) -> list[Signal]:
+    """P1 DTE window (T3), scaled to the strategy's original life."""
+    if s.dte_front is None or s.initial_dte is None:
+        return []
+    window = dte_window(s.initial_dte, lim.dte_windows)
+    if s.dte_front > window:
+        return []
+    return [Signal(P1, "DTE window", f"{s.dte_front} days left (review at {window})")]
+
+
+def near_expiry_signals(s: StrategyState, lim: SignalLimits) -> list[Signal]:
+    """P1: a short leg near the money close to expiry."""
+    out: list[Signal] = []
     if s.spot:
         for leg in s.short_legs:
             close = abs(leg.strike / s.spot - 1) <= lim.near_money
@@ -108,7 +114,13 @@ def signals(s: StrategyState, lim: SignalLimits = SignalLimits()) -> list[Signal
                         f"short {leg.strike:g} near the money, {leg.dte} days left",
                     )
                 )
-    # P2: drift and efficiency
+    return out
+
+
+def drift_signals(s: StrategyState, lim: SignalLimits) -> list[Signal]:
+    """P2: delta (T4, T5), class change, Gamma/Theta efficiency (T6) and low
+    remaining reward (T8)."""
+    out: list[Signal] = []
     if s.single_long_delta is not None and abs(s.single_long_delta) > lim.delta_review:
         out.append(Signal(P2, "delta", f"|delta| {abs(s.single_long_delta):.2f}"))
     if (
@@ -130,6 +142,16 @@ def signals(s: StrategyState, lim: SignalLimits = SignalLimits()) -> list[Signal
     if rr is not None and rr < lim.remaining_reward_risk:
         out.append(Signal(P2, "low remaining reward", f"reward/risk {rr:.2f}"))
     return out
+
+
+def signals(s: StrategyState, lim: SignalLimits = SignalLimits()) -> list[Signal]:
+    return (
+        hard_signals(s)
+        + profit_signals(s, lim)
+        + time_signals(s, lim)
+        + near_expiry_signals(s, lim)
+        + drift_signals(s, lim)
+    )
 
 
 def decide(

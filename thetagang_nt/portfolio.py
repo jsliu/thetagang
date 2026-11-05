@@ -199,9 +199,9 @@ def years_to(ins: OptionContract, today: date) -> float:
     return max((ins.expiration_utc.date() - today).days, 1) / 365.25
 
 
-def index_forward(cache: Cache, ins: OptionContract) -> float | None:
-    """VIX options price off the VIX future of their expiry: F = C - P + K at the
-    same strike (r ~ 0 over a month)."""
+def parity_partner(cache: Cache, ins: OptionContract) -> OptionContract | None:
+    """The other right at the same expiry and strike: its price gives the
+    forward by put-call parity."""
     for other in cache.instruments(VENUE, underlying=ins.underlying):
         if (
             isinstance(other, OptionContract)
@@ -209,13 +209,22 @@ def index_forward(cache: Cache, ins: OptionContract) -> float | None:
             and other.strike_price == ins.strike_price
             and other.option_kind != ins.option_kind
         ):
-            mine, theirs = price(cache, ins.id), price(cache, other.id)
-            if mine is None or theirs is None:
-                return None
-            is_call = ins.option_kind == OptionKind.CALL
-            call, put = (mine, theirs) if is_call else (theirs, mine)
-            return call - put + float(ins.strike_price)
+            return other
     return None
+
+
+def index_forward(cache: Cache, ins: OptionContract) -> float | None:
+    """VIX options price off the VIX future of their expiry: F = C - P + K at the
+    same strike (r ~ 0 over a month)."""
+    other = parity_partner(cache, ins)
+    if other is None:
+        return None
+    mine, theirs = price(cache, ins.id), price(cache, other.id)
+    if mine is None or theirs is None:
+        return None
+    is_call = ins.option_kind == OptionKind.CALL
+    call, put = (mine, theirs) if is_call else (theirs, mine)
+    return call - put + float(ins.strike_price)
 
 
 def option_greeks(
