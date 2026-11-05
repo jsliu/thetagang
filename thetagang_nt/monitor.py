@@ -25,20 +25,22 @@ from thetagang_nt import aio
 from thetagang_nt.config import DiscretionaryConfig, MonitorConfig, PMConfig
 from thetagang_nt.ib_extra import AccountExtras
 from thetagang_nt.journal import Journal, LegRow, StrategyRow
-from thetagang_nt.pm.assess import assess
-from thetagang_nt.pm.profit import value_bounds
-from thetagang_nt.pm.quality import Quote
-from thetagang_nt.pm.signals import (
+from thetagang_nt.pm.core.assess import assess
+from thetagang_nt.pm.core.profit import capture_ratio, value_bounds
+from thetagang_nt.pm.core.quality import Quote
+from thetagang_nt.pm.core.review import (
     P0,
     P1,
     P2,
+    SHORT_PREMIUM,
     ShortLeg,
     StrategyState,
-    dte_window,
-    outcome,
-    signals,
+    manager,
 )
-from thetagang_nt.pm.strategy_id import Seen, auto_ids
+from thetagang_nt.pm.core.strategy_id import Seen, auto_ids
+from thetagang_nt.pm.long_options import signals as long_options
+from thetagang_nt.pm.short_options import signals as short_options
+from thetagang_nt.pm.short_options.analysis import loss_multiple, premium_to_risk
 from thetagang_nt.portfolio import (
     INDEX_CONTRACTS,
     SPX,
@@ -793,11 +795,25 @@ class PortfolioMonitor(Actor):
                 pass
         inputs = {x.id: x for x in self._pm.strategies}
         limits, quality = self._pm.limits(), self._pm.quality()
+        short_limits = self._pm.short_limits()
         rows, decisions, counts = [], [], dict.fromkeys((P0, P1, P2), 0)
         for sid, (s, und, st, fig, bot) in zip(ids, entries, strict=True):
-            move = realized_move(self._closes.get(underlying_id(s), {}))
+            closes = self._closes.get(underlying_id(s), {})
+            move = realized_move(closes, self._pm.realized_vol_days)
             sigma_f = move * math.sqrt(252) if move is not None else None
-            a = assess(st, fig, book.greeks, quotes, und, sigma_f, today, now, quality)
+            a = assess(
+                st,
+                fig,
+                book.greeks,
+                quotes,
+                und,
+                sigma_f,
+                today,
+                now,
+                quality,
+                self._pm.tolerance(),
+                self._pm.grid_moves,
+            )
             net_debit, initial_dte = entry.get(sid, (fig.cost, a.dte_front))
             x = inputs.get(sid)
             invalidation = None
@@ -830,16 +846,25 @@ class PortfolioMonitor(Actor):
                 gt_h=a.eff.gt_h,
                 remaining_reward_risk=a.remaining_rr,
                 short_legs=tuple(
-                    ShortLeg(p.dte(today), p.strike) for p in st.legs if p.qty < 0
+                    ShortLeg(p.dte(today), p.strike, p.right)
+                    for p in st.legs
+                    if p.qty < 0
                 ),
                 prev_cls=self._pm_cls.get(sid),
                 thesis_valid=x.thesis_valid if x else None,
                 invalidation=invalidation,
                 worst_case_loss=worst,
                 loss_budget=x.max_loss if x else None,
+                sigma_f=sigma_f,
+                assignment_intended=x.assignment_intended if x else False,
             )
-            found = signals(state, limits)
-            out = outcome(found)
+            # management category (how it was opened), not its convexity class
+            category = manager(net_debit)
+            short = category == SHORT_PREMIUM
+            if short:
+                found, out = short_options.decide(state, short_limits)
+            else:
+                found, out = long_options.decide(state, limits)
             top = min((x.priority for x in found), default="-")
             for sig in found:
                 counts[sig.priority] += 1
@@ -860,6 +885,7 @@ class PortfolioMonitor(Actor):
                 symbol=s.lstrip("^"),
                 kind=st.name or st.kind,
                 structure=structure_label(st),
+                manager=category,
                 cls=a.cls or "unknown",
                 outcome=out,
                 top=top,
@@ -894,7 +920,29 @@ class PortfolioMonitor(Actor):
                 ("dte_front", a.dte_front),
                 (
                     "dte_window",
-                    dte_window(initial_dte) if initial_dte is not None else None,
+                    long_options.dte_window(initial_dte, limits.dte_windows)
+                    if initial_dte is not None and not short
+                    else None,
+                ),
+                # Short Options Manager: premium captured, loss multiple, and
+                # the premium still to earn per $ of risk still carried
+                (
+                    "capture",
+                    capture_ratio(a.v_exec, net_debit)
+                    if short and a.v_exec is not None
+                    else None,
+                ),
+                (
+                    "loss_multiple",
+                    loss_multiple(a.v_exec, net_debit)
+                    if short and a.v_exec is not None
+                    else None,
+                ),
+                (
+                    "premium_to_risk",
+                    premium_to_risk(a.v_exec, worst)
+                    if short and a.v_exec is not None
+                    else None,
                 ),
                 ("priority", {P0: 3, P1: 2, P2: 1}.get(top, 0)),
             ):
@@ -926,6 +974,17 @@ class PortfolioMonitor(Actor):
                 priority=priority,
             )
         f.set("pm_strategies", "Strategies the Portfolio Manager follows", len(rows))
+        for name, value, vid, source, meaning in self._pm.params():
+            f.set(
+                "pm_param",
+                "A setting the Portfolio Manager decides with ([pm])",
+                1,
+                name=name,
+                value=value,
+                vault_id=vid or "-",
+                source=source,
+                meaning=meaning,
+            )
         self._pm_known = dict(zip(ids, seen, strict=True))
         if self._journal is not None:
             try:

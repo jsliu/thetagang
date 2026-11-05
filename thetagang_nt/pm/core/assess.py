@@ -8,10 +8,10 @@ from dataclasses import dataclass
 from datetime import date, datetime
 from typing import Any
 
-from thetagang_nt.pm.classify import classify, net_greeks
-from thetagang_nt.pm.efficiency import Efficiency, efficiency
-from thetagang_nt.pm.profit import remaining, value_bounds
-from thetagang_nt.pm.quality import QualityLimits, Quote, leg_flags, values
+from thetagang_nt.pm.core.classify import GRID_MOVES, Tolerance, classify, net_greeks
+from thetagang_nt.pm.core.efficiency import Efficiency, efficiency
+from thetagang_nt.pm.core.profit import remaining, value_bounds
+from thetagang_nt.pm.core.quality import QualityLimits, Quote, leg_flags, values
 from thetagang_nt.rules import Structure, StructureFigures, option_label
 
 
@@ -37,6 +37,8 @@ def assess(
     today: date,
     now: datetime,
     limits: QualityLimits = QualityLimits(),
+    tol: Tolerance = Tolerance(),
+    moves: tuple[float, ...] = GRID_MOVES,
 ) -> Assessment:
     v_mid, v_exec = values(s.legs, quotes)
     flags = tuple(
@@ -46,7 +48,7 @@ def assess(
             p, quotes.get(p.instrument_id), greeks.get(p.instrument_id), now, limits
         )
     )
-    cls = classify(s.legs, greeks, spot, today)
+    cls = classify(s.legs, greeks, spot, today, tol, moves)
     net = net_greeks(s.legs, greeks)
     eff = (
         efficiency(cls, net["gamma"], net["theta"], spot, sigma_f, today)

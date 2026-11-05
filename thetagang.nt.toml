@@ -222,6 +222,23 @@ weight = 0.0
 # near_money = 0.02             # ...and within 2% of its strike
 # stale_secs = 300              # [T9] a quote older than this is stale
 # wide_spread = 0.25            # [T9] (ask - bid) / mid above this is wide
+# dte_windows = [[90, 28], [180, 60], [365, 120], [730, 270]]  # [T3] original life ->
+#                               # review at days left (interpolated; LEAPS keep 270)
+# gamma_tolerance = 0.01        # [T7] |net gamma| below this counts as zero (shares per $1)
+# theta_tolerance = 0.01        # [T7] |net theta| below this counts as zero ($ per day)
+# grid_moves = [-0.05, -0.02, 0.0, 0.02, 0.05]  # [M1] moves for the gamma sign check
+# realized_vol_days = 21        # [M6] daily returns behind the realised-vol forecast
+# The settings above serve the Long Options Manager (strategies opened for a
+# debit; credit_levels [T2] is superseded by S1). Strategies opened for a credit
+# go to the Short Options Manager:
+# capture_levels = [0.5, 0.7, 0.8, 0.9]  # [S1] credit captured: review / strong
+#                               # consideration / default close / normally close
+# short_dte_bands = [21, 14, 7] # [S2] front short leg DTE at or below: review /
+#                               # prefer closing or adjust / generally prefer closing
+# loss_multiples = [1.0, 2.0, 3.0]  # [S3] loss as a multiple of the credit
+# assignment_days = 7           # [S4] an in-the-money short leg this close to expiry
+# tested_moves = 1.0            # [S5] spot within this many moves of a short strike
+# tested_horizon = 5            # [S5] trading days in a move (S x sigma_f x sqrt(h/252))
 #
 # Your inputs for one strategy, by its ID on the Portfolio Manager dashboard:
 # [[pm.strategies]]
@@ -231,3 +248,5 @@ weight = 0.0
 # target = 300.0                # profit target, $
 # max_loss = 200.0              # risk budget, $: P0 when the worst case exceeds it
 # thesis_valid = true
+# assignment_intended = false   # short premium: true if expiry/assignment is the plan
+#                               # (cash-secured put, covered call): no S4 review

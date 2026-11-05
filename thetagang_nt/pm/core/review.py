@@ -1,0 +1,116 @@
+"""What both managers share when they review a strategy (vault: exit_signals,
+short_exit_signals, hold_rules, close_rules): the signal record, the strategy's
+state, the hard P0 signals and the class-change signal both signal tables list,
+and the Phase 1 outcome.
+
+A signal opens a review with a priority; it never decides or trades. Phase 1
+outcome: P0 -> CLOSE review (REVIEW only, if the data is the problem), none ->
+HOLD, else REVIEW.
+
+Which manager reviews a strategy is its management category: how it was
+opened (long premium for a debit, short premium for a credit). That is not its
+convexity class, which comes from net greeks (classify)."""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+
+P0, P1, P2 = "P0", "P1", "P2"
+
+LONG_PREMIUM = "long options"  # opened for a debit: the Long Options Manager
+SHORT_PREMIUM = "short options"  # opened for a credit: the Short Options Manager
+
+
+def manager(net_debit: float) -> str:
+    """The management category from the entry net debit ($, + paid)."""
+    return SHORT_PREMIUM if net_debit < 0 else LONG_PREMIUM
+
+
+@dataclass(frozen=True)
+class Signal:
+    priority: str
+    name: str
+    detail: str
+
+
+@dataclass(frozen=True)
+class ShortLeg:
+    dte: int
+    strike: float
+    right: str = ""  # "C" or "P"; the Short Options Manager needs it
+
+
+@dataclass(frozen=True)
+class StrategyState:
+    """What signals need about one strategy; None = not known."""
+
+    cls: str | None  # convexity class (classify); None: no greeks
+    data_flags: tuple[str, ...] = ()  # quality.leg_flags, all legs
+    net_debit: float = 0.0  # paid (+) or received (-), $
+    value_exec: float | None = None  # executable value now, $
+    max_profit: float | None = None  # at expiry, $ (finite, defined risk)
+    dte_front: int | None = None  # days to the earliest expiry
+    initial_dte: int | None = None  # days to it when opened
+    spot: float | None = None
+    single_long_delta: float | None = None  # per share, if one long option
+    net_delta: float | None = None
+    entry_delta: float | None = None
+    entry_gross_delta: float | None = None
+    gt_h: dict[int, float] = field(default_factory=dict)
+    remaining_reward_risk: float | None = None
+    short_legs: tuple[ShortLeg, ...] = ()
+    prev_cls: str | None = None
+    thesis_valid: bool | None = None  # your input
+    invalidation: tuple[str, float] | None = None  # ("below" | "above", price)
+    worst_case_loss: float | None = None  # $, positive
+    loss_budget: float | None = None  # max acceptable loss, $, positive
+    sigma_f: float | None = None  # forecast annualised realised vol (M6)
+    assignment_intended: bool = False  # your input: expiry/assignment is the plan
+
+
+def hard_signals(s: StrategyState) -> list[Signal]:
+    """P0, the same in both signal tables: data, thesis, risk budget."""
+    out: list[Signal] = []
+    if s.data_flags:
+        out.append(Signal(P0, "data unreliable", ", ".join(sorted(set(s.data_flags)))))
+    if s.thesis_valid is False:
+        out.append(Signal(P0, "thesis invalidated", "marked invalid"))
+    if s.invalidation and s.spot is not None:
+        side, level = s.invalidation
+        if (side == "below" and s.spot < level) or (side == "above" and s.spot > level):
+            out.append(
+                Signal(
+                    P0, "thesis invalidated", f"price {s.spot:,.2f} {side} {level:,.2f}"
+                )
+            )
+    if (
+        s.worst_case_loss is not None
+        and s.loss_budget is not None
+        and s.worst_case_loss > s.loss_budget
+    ):
+        out.append(
+            Signal(
+                P0,
+                "risk budget breached",
+                f"worst case -${s.worst_case_loss:,.0f} > budget ${s.loss_budget:,.0f}",
+            )
+        )
+    return out
+
+
+def class_change(s: StrategyState) -> list[Signal]:
+    """P2, in both tables: the convexity class differs from the last run."""
+    if s.prev_cls is not None and s.cls is not None and s.cls != s.prev_cls:
+        return [Signal(P2, "class change", f"{s.prev_cls} -> {s.cls}")]
+    return []
+
+
+def outcome(found: list[Signal]) -> str:
+    """Phase 1 (hold_rules): any P0 -> CLOSE review, unless the only problem is
+    the data (REVIEW - data unreliable); no signal -> HOLD; else REVIEW."""
+    p0 = [x for x in found if x.priority == P0]
+    if p0:
+        if all(x.name == "data unreliable" for x in p0):
+            return "REVIEW - data unreliable"
+        return "CLOSE review"
+    return "REVIEW" if found else "HOLD"

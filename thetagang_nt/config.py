@@ -320,6 +320,9 @@ class PMStrategyConfig(NautilusConfig, frozen=True):
     target: float | None = None  # profit target, $
     max_loss: float | None = None  # max acceptable loss (risk budget), $
     thesis_valid: bool | None = None
+    # short premium: letting it expire or be assigned is the plan (a cash-secured
+    # put, a covered call), so no assignment review [S4]
+    assignment_intended: bool = False
 
 
 class PMConfig(NautilusConfig, frozen=True):
@@ -334,7 +337,8 @@ class PMConfig(NautilusConfig, frozen=True):
     # review thresholds, by vault register ID; all hypotheses (assumptions_register)
     profit_levels: tuple[float, ...] = (0.5, 1.0, 1.5)  # [T1] return on debit
     spread_max_profit: float = 0.8  # [T1] defined-risk debit: share of max profit
-    credit_levels: tuple[float, ...] = (0.5, 0.75)  # [T2] share of the credit captured
+    # [T2] superseded by S1: credit strategies go to the Short Options Manager
+    credit_levels: tuple[float, ...] = (0.5, 0.75)
     delta_review: float = 0.8  # [T4] a single long option's |delta|
     delta_drift: float | None = None  # [T5] share of entry gross delta; unset: off
     gt_review: float = 1.0  # [T6] long convexity: GT_h below this
@@ -344,9 +348,38 @@ class PMConfig(NautilusConfig, frozen=True):
     near_money: float = 0.02  # ...and within this of its strike
     stale_secs: float = 300.0  # [T9] quote older than this
     wide_spread: float = 0.25  # [T9] (ask - bid) / mid above this
+    # [T3] (original life, review at days left), interpolated between rows
+    dte_windows: tuple[tuple[int, int], ...] = (
+        (90, 28),
+        (180, 60),
+        (365, 120),
+        (730, 270),
+    )
+    gamma_tolerance: float = (
+        0.01  # [T7] |net gamma| below this counts as zero (shares per $1)
+    )
+    theta_tolerance: float = (
+        0.01  # [T7] |net theta| below this counts as zero ($ per day)
+    )
+    grid_moves: tuple[float, ...] = (
+        -0.05,
+        -0.02,
+        0.0,
+        0.02,
+        0.05,
+    )  # [M1] gamma sign check
+    realized_vol_days: int = 21  # [M6] daily returns behind the realised-vol forecast
+    # Short Options Manager (strategies opened for a credit), short_exit_signals
+    capture_levels: tuple[float, ...] = (0.5, 0.7, 0.8, 0.9)  # [S1] credit captured
+    # [S2] front short leg's DTE at or below: review / prefer close or adjust / close
+    short_dte_bands: tuple[int, int, int] = (21, 14, 7)
+    loss_multiples: tuple[float, ...] = (1.0, 2.0, 3.0)  # [S3] loss / credit
+    assignment_days: int = 7  # [S4] an in-the-money short leg this close to expiry
+    tested_moves: float = 1.0  # [S5] spot within this many moves of a short strike
+    tested_horizon: int = 5  # [S5] trading days in a move (S * sigma_f * sqrt(h/252))
 
     def limits(self) -> Any:
-        from thetagang_nt.pm.signals import SignalLimits
+        from thetagang_nt.pm.long_options.signals import SignalLimits
 
         return SignalLimits(
             profit_levels=tuple(self.profit_levels),
@@ -359,12 +392,114 @@ class PMConfig(NautilusConfig, frozen=True):
             remaining_reward_risk=self.remaining_reward_risk,
             near_expiry_days=self.near_expiry_days,
             near_money=self.near_money,
+            dte_windows=self.dte_windows,
+        )
+
+    def short_limits(self) -> Any:
+        from thetagang_nt.pm.short_options.signals import ShortLimits
+
+        return ShortLimits(
+            capture_levels=tuple(self.capture_levels),
+            dte_bands=tuple(self.short_dte_bands),
+            loss_multiples=tuple(self.loss_multiples),
+            assignment_days=self.assignment_days,
+            tested_moves=self.tested_moves,
+            tested_horizon=self.tested_horizon,
         )
 
     def quality(self) -> Any:
-        from thetagang_nt.pm.quality import QualityLimits
+        from thetagang_nt.pm.core.quality import QualityLimits
 
         return QualityLimits(stale_secs=self.stale_secs, wide_spread=self.wide_spread)
+
+    def tolerance(self) -> Any:
+        from thetagang_nt.pm.core.classify import Tolerance
+
+        return Tolerance(gamma=self.gamma_tolerance, theta=self.theta_tolerance)
+
+    def params(self) -> list[tuple[str, str, str, str, str]]:
+        """(name, value, vault ID, default | your setting, meaning) for every
+        setting the Portfolio Manager decides with: the dashboard shows them."""
+        default = PMConfig()
+
+        def show(v: Any) -> str:
+            if isinstance(v, tuple):
+                return (
+                    ", ".join(show(x) for x in v)
+                    if v and not isinstance(v[0], tuple)
+                    else "; ".join(f"{a}d -> {b}d" for a, b in v)
+                )
+            return (
+                "off"
+                if v is None
+                else f"{v:g}"
+                if isinstance(v, float)
+                else str(v).lower()
+            )
+
+        rows = (
+            (
+                "decide",
+                "",
+                "the PM's review signals replace the bot's roll/close orders",
+            ),
+            ("profit_levels", "T1", "debit: review at these gains on the debit"),
+            (
+                "spread_max_profit",
+                "T1",
+                "defined-risk debit: review at this share of max profit",
+            ),
+            (
+                "credit_levels",
+                "T2",
+                "superseded by S1 (credit strategies: Short Options Manager)",
+            ),
+            ("dte_windows", "T3", "original life -> review when this many days remain"),
+            ("delta_review", "T4", "a single long option above this |delta|"),
+            ("delta_drift", "T5", "net delta moved by this share of entry gross delta"),
+            ("gt_review", "T6", "long convexity: GT_h below this (decay beats gamma)"),
+            ("gt_horizon", "T6", "trading days for GT_h"),
+            ("gamma_tolerance", "T7", "|net gamma| below this counts as zero"),
+            ("theta_tolerance", "T7", "|net theta| below this counts as zero"),
+            ("remaining_reward_risk", "T8", "remaining reward / risk below this"),
+            ("stale_secs", "T9", "a quote older than this many seconds is stale"),
+            ("wide_spread", "T9", "(ask - bid) / mid above this is wide"),
+            ("near_expiry_days", "", "a short leg this close to expiry..."),
+            ("near_money", "", "...and this close to its strike"),
+            ("grid_moves", "M1", "price moves for the gamma sign check"),
+            (
+                "realized_vol_days",
+                "M6",
+                "daily returns behind the realised-vol forecast",
+            ),
+            ("capture_levels", "S1", "short: review at these shares of the credit"),
+            (
+                "short_dte_bands",
+                "S2",
+                "short: front short leg DTE review / adjust / close bands",
+            ),
+            ("loss_multiples", "S3", "short: review at these losses per $ of credit"),
+            (
+                "assignment_days",
+                "S4",
+                "short: an in-the-money short leg this close to expiry",
+            ),
+            ("tested_moves", "S5", "short: spot within this many moves of a strike"),
+            ("tested_horizon", "S5", "short: trading days in one move"),
+            ("journal", "", "write the journal (Postgres)"),
+        )
+        return [
+            (
+                name,
+                show(getattr(self, name)),
+                vid,
+                "default"
+                if getattr(self, name) == getattr(default, name)
+                else "your setting",
+                meaning,
+            )
+            for name, vid, meaning in rows
+        ]
 
 
 class AppConfig(NautilusConfig, frozen=True):

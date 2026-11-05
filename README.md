@@ -290,8 +290,8 @@ lists every key with a comment.
 | `[strategy.butterfly]`, `[strategy.straddle]`, `[strategy.calendar]` | only with `[pm] decide = false`: what the bot's own rules would do for butterflies (`take_profit`, `partial_take_profit` of the max profit, `close_dte`), long straddles/strangles (`take_profit_gain`, `partial_take_profit_gain` of the debit, `leg_delta`, `roll_dte`) and calendars/diagonals (`take_profit` of the debit, `short_roll_dte`, `close_dte`). Each has `trade` (default false): true lets the bot place the recommendation (dry_run applies): close or close half as one combo with every leg in its ratio, close a straddle's winning leg, or roll a calendar's short leg to the next expiry before the long leg's for a net credit. "Roll whole" is never placed: it stays yours |
 | `[[strategy.structures]]` | `name`, `legs` (contract labels as the dashboard shows them, e.g. `"AA 20261218 40P"`): option legs you hold as one position; recognised before any automatic grouping, left to you, and never resized by the trade plan |
 | `[strategy.symbols.<SYM>]` | `no_trading`, `put_strike_limit`, `call_strike_limit`, `delta` and `max_dte` (override `credit.roll_target`), `ignore_missing_greeks` |
-| `[pm]` | the Portfolio Manager: `decide` (default true: its review signals replace the bot's roll/close rules, which then only report), `journal`, and the review thresholds by vault register ID: `profit_levels`, `spread_max_profit` (T1), `credit_levels` (T2), `delta_review` (T4), `delta_drift` (T5), `gt_review`, `gt_horizon` (T6), `remaining_reward_risk` (T8), `near_expiry_days`, `near_money`, `stale_secs`, `wide_spread` (T9) |
-| `[[pm.strategies]]` | your inputs for one strategy, by its Portfolio Manager ID (e.g. `"AA-debit-spread-1"`): `thesis`, `invalidation_below` / `invalidation_above` (a price: the thesis is invalid past it, a P0 review), `target`, `max_loss` (your risk budget: a P0 review when the worst case exceeds it), `thesis_valid` |
+| `[pm]` | the Portfolio Manager: `decide` (default true: its review signals replace the bot's roll/close rules, which then only report), `journal`, and the review thresholds by vault register ID: `profit_levels`, `spread_max_profit` (T1), `credit_levels` (T2), `delta_review` (T4), `delta_drift` (T5), `gt_review`, `gt_horizon` (T6), `remaining_reward_risk` (T8), `near_expiry_days`, `near_money`, `stale_secs`, `wide_spread` (T9), `dte_windows` (T3), `gamma_tolerance`, `theta_tolerance` (T7), `grid_moves` (M1), `realized_vol_days` (M6); for the Short Options Manager: `capture_levels` (S1), `short_dte_bands` (S2), `loss_multiples` (S3), `assignment_days` (S4), `tested_moves`, `tested_horizon` (S5). The Portfolio Manager dashboard lists every one in use, default or yours |
+| `[[pm.strategies]]` | your inputs for one strategy, by its Portfolio Manager ID (e.g. `"AA-debit-spread-1"`): `thesis`, `invalidation_below` / `invalidation_above` (a price: the thesis is invalid past it, a P0 review), `target`, `max_loss` (your risk budget: a P0 review when the worst case exceeds it), `thesis_valid`, `assignment_intended` (short premium: expiry or assignment is the plan, so no assignment review) |
 
 Remove the whole `[strategy]` section to run the monitor only. The roll,
 discretionary and VIX keys mean the same as in `thetagang`, so values can be
@@ -367,11 +367,23 @@ ID such as `AA-debit-spread-1` that survives rolls), the pure functions in
 - **Gamma/Theta efficiency** for long convexity: GT, GT_h over 1/5/10 trading
   days at the 21-day realised volatility, and the breakeven volatility.
 - **Profit**: return on debit or credit captured, remaining reward/risk.
-- **Review signals**: P0 hard (thesis invalid, risk budget breached, data
-  unreliable), P1 (profit levels, the DTE window for the strategy's original
-  life, a short leg near expiry and the money), P2 (deep-ITM long option,
-  class change, GT_h below 1, low remaining reward). The outcome is HOLD,
-  REVIEW, REVIEW - data unreliable, or CLOSE review (any other P0).
+- **Review signals**, by the strategy's manager: how it was opened, not its
+  convexity class (a debit spread can be short gamma). Both share P0 hard
+  (thesis invalid, risk budget breached, data unreliable) and P2 class change.
+  - *Long Options Manager* (opened for a debit,
+    [`pm/long_options/`](thetagang_nt/pm/long_options)): P1 profit levels on
+    the debit, the DTE window for the strategy's original life, a short leg
+    near expiry and the money; P2 deep-ITM long option, GT_h below 1, low
+    remaining reward.
+  - *Short Options Manager* (opened for a credit,
+    [`pm/short_options/`](thetagang_nt/pm/short_options)): P1 premium captured
+    (50 / 70 / 80 / 90%), the front short leg's DTE band (21 / 14 / 7 days),
+    the loss as a multiple of the credit, an in-the-money short leg near
+    expiry (assignment); P2 spot within one 5-day move of a short strike. It
+    also shows the loss multiple and the premium left per $ of risk.
+
+  The outcome is HOLD, REVIEW, REVIEW - data unreliable, or CLOSE review (any
+  other P0). Shared engines live in [`pm/core/`](thetagang_nt/pm/core).
 
 Every threshold is a hypothesis with its vault register ID, set under `[pm]`.
 Rolls are review items until the scenario engine and the HOLD/CLOSE/ROLL
@@ -395,9 +407,11 @@ never waits on it.
 
 The **Portfolio Manager** dashboard (linked from the thetagang dashboard)
 shows the review queue (every strategy not on HOLD, highest priority first,
-next to what the bot's rules say), each strategy's detail (values, class,
-efficiency, signals, your thesis and budget, P&L history, decision log,
-legs), the book's class mix and concentration, and data quality.
+with its manager, next to what the bot's rules say), each strategy's detail
+(values, class, efficiency, for short options the credit captured, loss
+multiple and premium left per $ of risk, signals, your thesis and budget, P&L
+history, decision log, legs), the book's class and manager mix and
+concentration, and data quality.
 
 ### Differences from `thetagang`'s discretionary strategy
 

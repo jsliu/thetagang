@@ -13,9 +13,9 @@ DSN = os.environ.get("JOURNAL_TEST_DSN")
 pytestmark = pytest.mark.skipif(not DSN, reason="JOURNAL_TEST_DSN not set")
 
 from thetagang_nt.journal import Journal, LegRow, StrategyRow  # noqa: E402
-from thetagang_nt.pm.assess import Assessment  # noqa: E402
-from thetagang_nt.pm.efficiency import Efficiency  # noqa: E402
-from thetagang_nt.pm.strategy_id import Seen, auto_ids  # noqa: E402
+from thetagang_nt.pm.core.assess import Assessment  # noqa: E402
+from thetagang_nt.pm.core.efficiency import Efficiency  # noqa: E402
+from thetagang_nt.pm.core.strategy_id import Seen, auto_ids  # noqa: E402
 
 DAY1, DAY2 = date(2026, 11, 2), date(2026, 11, 3)
 

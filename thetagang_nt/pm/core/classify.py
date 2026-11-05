@@ -62,6 +62,7 @@ def classify(
     spot: float | None,
     today: date,
     tol: Tolerance = Tolerance(),
+    moves: tuple[float, ...] = GRID_MOVES,
 ) -> str | None:
     """LONG / SHORT / MIXED; None without greeks (data unreliable). Mixed if
     the legs expire on different dates, or if net gamma changes sign across
@@ -80,7 +81,7 @@ def classify(
     vols = [getattr(greeks[p.instrument_id], "vol", None) for p in legs]
     if spot and all(v for v in vols):
         sign = 1 if cls == LONG else -1
-        for move in GRID_MOVES:
+        for move in moves:
             s = spot * (1 + move)
             gamma = sum(
                 p.qty * p.multiplier * bs_gamma(s, p.strike, p.dte(today) / 365, v)

@@ -6,26 +6,42 @@ from types import SimpleNamespace
 
 import pytest
 
-from thetagang_nt.pm.classify import LONG, MIXED, SHORT, bs_gamma, classify, net_greeks
-from thetagang_nt.pm.efficiency import calendar_days, efficiency
-from thetagang_nt.pm.profit import (
+from thetagang_nt.pm.core.classify import (
+    LONG,
+    MIXED,
+    SHORT,
+    bs_gamma,
+    classify,
+    net_greeks,
+)
+from thetagang_nt.pm.core.efficiency import calendar_days, efficiency
+from thetagang_nt.pm.core.profit import (
     capture_ratio,
     remaining,
     return_on_debit,
     value_bounds,
 )
-from thetagang_nt.pm.quality import Quote, leg_flags, values
-from thetagang_nt.pm.signals import (
+from thetagang_nt.pm.core.quality import Quote, leg_flags, values
+from thetagang_nt.pm.core.review import (
+    LONG_PREMIUM,
     P0,
     P1,
     P2,
+    SHORT_PREMIUM,
     ShortLeg,
     StrategyState,
-    dte_window,
+    manager,
     outcome,
-    signals,
 )
-from thetagang_nt.pm.strategy_id import Seen, auto_ids
+from thetagang_nt.pm.core.strategy_id import Seen, auto_ids
+from thetagang_nt.pm.long_options import signals as long_options
+from thetagang_nt.pm.long_options.signals import dte_window, signals
+from thetagang_nt.pm.short_options import signals as short_options
+from thetagang_nt.pm.short_options.analysis import (
+    loss_multiple,
+    moves_out,
+    premium_to_risk,
+)
 from thetagang_nt.rules import Leg, find_structures, structure_figures
 
 TODAY = date(2026, 11, 2)  # a Monday
@@ -251,3 +267,268 @@ def test_strategy_ids_survive_rolls_and_new_ones_are_numbered():
     assert auto_ids(new, known) == ["SPX-long-put-1", "SPX-long-put-2"]
     # the known ID goes to the structure still holding its leg; the other is new
     assert auto_ids([rolled, same], known) == ["AA-debit-spread-2", "AA-debit-spread-1"]
+
+
+def test_every_decision_setting_comes_from_the_toml_and_is_listed():
+    pytest.importorskip("nautilus_trader")
+    from thetagang_nt.config import PMConfig
+
+    pm = PMConfig(gamma_tolerance=0.5, dte_windows=((100, 10), (200, 50)))
+    listed = {name: (value, source) for name, value, _, source, _ in pm.params()}
+    assert listed["gamma_tolerance"] == ("0.5", "your setting")
+    assert listed["dte_windows"] == ("100d -> 10d; 200d -> 50d", "your setting")
+    assert listed["near_money"][1] == "default"
+    # the settings reach the functions that decide with them
+    assert dte_window(150, pm.limits().dte_windows) == 30  # interpolated in your table
+    assert pm.tolerance().gamma == 0.5
+    call = (leg("c", "C", 100, 1),)
+    flat = {"c": greeks(gamma=0.002, theta=-0.002)}  # x100: 0.2 gamma, -0.2 theta
+    assert classify(call, flat, 100.0, TODAY) == LONG
+    assert (
+        classify(call, flat, 100.0, TODAY, pm.tolerance()) == MIXED
+    )  # below 0.5: zero
+
+
+# ------------------------------------------------- short options manager
+
+
+def test_management_category_is_how_it_was_opened_not_its_convexity():
+    assert manager(200.0) == LONG_PREMIUM
+    assert manager(0.0) == LONG_PREMIUM
+    assert manager(-100.0) == SHORT_PREMIUM
+    # a debit spread that has turned short gamma stays with the long manager,
+    # and its class comes from greeks: the managers read cls, never assume it
+    assert manager(150.0) == LONG_PREMIUM
+
+
+def test_short_analysis_matches_the_vault_formulas():
+    # 100 credit, 40 to buy back: in profit, loss multiple -0.6
+    assert loss_multiple(-40.0, -100.0) == pytest.approx(-0.6)
+    # 250 to buy back on a 100 credit: lost 1.5x the credit
+    assert loss_multiple(-250.0, -100.0) == pytest.approx(1.5)
+    assert loss_multiple(-40.0, 200.0) is None  # opened for a debit
+    # 40 of premium left against 460 of risk
+    assert premium_to_risk(-40.0, 460.0) == pytest.approx(40 / 460)
+    assert premium_to_risk(-40.0, None) is None and premium_to_risk(-40.0, 0) is None
+    # Move_5 at S=100, sigma 20%: 100 * 0.2 * sqrt(5/252) = 2.817
+    move = 100 * 0.2 * (5 / 252) ** 0.5
+    assert moves_out("P", 95.0, 100.0, 0.2, 5) == pytest.approx(5 / move)
+    assert moves_out("C", 105.0, 100.0, 0.2, 5) == pytest.approx(5 / move)
+    assert moves_out("C", 98.0, 100.0, 0.2, 5) < 0  # in the money
+
+
+def short_names(state, lim=None):
+    return names(short_options.signals(state, lim or short_options.ShortLimits()))
+
+
+def credit(value_exec, **kw):
+    return StrategyState(cls=SHORT, net_debit=-100.0, value_exec=value_exec, **kw)
+
+
+def test_premium_capture_levels_s1():
+    def detail(v):
+        return [
+            x.detail
+            for x in short_options.signals(credit(v))
+            if x.name == "premium captured"
+        ]
+
+    assert detail(-60.0) == []  # 40% captured
+    assert detail(-50.0) == ["50% of the credit: review"]
+    assert detail(-30.0) == ["70% of the credit: strong consideration for closing"]
+    assert detail(-20.0) == ["80% of the credit: default preference to close"]
+    assert detail(-5.0) == ["95% of the credit: normally close"]
+
+
+def test_dte_bands_s2_use_the_front_short_leg():
+    def band(dte, **kw):
+        legs = (ShortLeg(dte, 90.0, "P"), ShortLeg(dte + 30, 110.0, "C"))
+        found = short_options.signals(StrategyState(cls=SHORT, short_legs=legs, **kw))
+        return [x.detail for x in found if x.name == "DTE band"]
+
+    assert band(22) == []
+    assert band(21) == ["21 days left: review"]
+    assert band(14) == ["14 days left: prefer closing or an active adjustment review"]
+    assert band(7) == ["7 days left: generally prefer closing"]
+    assert band(3, assignment_intended=True) == [
+        "3 days left: expiry or assignment intended"
+    ]
+    # no short leg known: the strategy's front expiry
+    assert names(short_options.signals(StrategyState(cls=SHORT, dte_front=10))) == [
+        (P1, "DTE band")
+    ]
+
+
+def test_loss_multiple_s3_names_the_highest_level():
+    found = short_options.signals(credit(-250.0))
+    assert [x.detail for x in found if x.name == "loss multiple"] == [
+        "loss 1.5x the credit (level 1)"
+    ]
+    assert [
+        x.detail
+        for x in short_options.signals(credit(-420.0))
+        if x.name == "loss multiple"
+    ] == ["loss 3.2x the credit (level 3)"]
+    assert short_names(credit(-150.0)) == []  # 0.5x: below the first level
+
+
+def test_assignment_s4_and_tested_strike_s5():
+    itm_put = ShortLeg(3, 100.0, "P")
+    s = StrategyState(cls=SHORT, spot=98.0, short_legs=(itm_put,), dte_front=40)
+    assert (P1, "assignment exposure") in short_names(s)
+    # intended (cash-secured put): no assignment review
+    intended = StrategyState(
+        cls=SHORT, spot=98.0, short_legs=(itm_put,), assignment_intended=True
+    )
+    assert (P1, "assignment exposure") not in short_names(intended)
+    # out of the money is not exposed
+    otm = StrategyState(cls=SHORT, spot=103.0, short_legs=(ShortLeg(3, 100.0, "P"),))
+    assert (P1, "assignment exposure") not in short_names(otm)
+    # S5: 2 points from a short put with Move_5 = 2.82: tested; 5 points: not
+    near = StrategyState(
+        cls=SHORT, spot=100.0, sigma_f=0.2, short_legs=(ShortLeg(40, 98.0, "P"),)
+    )
+    far = StrategyState(
+        cls=SHORT, spot=100.0, sigma_f=0.2, short_legs=(ShortLeg(40, 95.0, "P"),)
+    )
+    assert short_names(near) == [(P2, "short strike tested")]
+    assert short_names(far) == []
+    # no volatility forecast: no S5
+    assert (
+        short_names(StrategyState(cls=SHORT, spot=100.0, short_legs=near.short_legs))
+        == []
+    )
+
+
+def test_iron_condor_is_reviewed_as_one_strategy():
+    """Four legs, one state: the tested call side raises one S5 signal, the
+    untested put side none; capture is measured on the whole credit."""
+    condor = StrategyState(
+        cls=SHORT,
+        net_debit=-300.0,
+        value_exec=-120.0,  # 60% of the credit captured
+        spot=104.0,
+        sigma_f=0.2,
+        dte_front=30,
+        short_legs=(ShortLeg(30, 90.0, "P"), ShortLeg(30, 105.0, "C")),
+    )
+    found = short_options.signals(condor)
+    assert names(found) == [
+        (P1, "premium captured"),
+        (P2, "short strike tested"),
+    ]
+    assert found[1].detail.startswith("short 105C")
+    assert short_options.decide(condor)[1] == "REVIEW"
+
+
+def test_short_manager_shares_the_hard_signals_and_outcome():
+    bad = StrategyState(cls=None, net_debit=-100.0, data_flags=("missing quote",))
+    assert short_options.decide(bad) == (
+        long_options.signals(bad)[:1],
+        "REVIEW - data unreliable",
+    )
+    breached = credit(-300.0, worst_case_loss=600.0, loss_budget=500.0)
+    found, out = short_options.decide(breached)
+    assert found[0].name == "risk budget breached" and out == "CLOSE review"
+    assert short_options.decide(StrategyState(cls=SHORT)) == ([], "HOLD")
+    assert short_names(StrategyState(cls=MIXED, prev_cls=SHORT)) == [
+        (P2, "class change")
+    ]
+
+
+def test_the_managers_are_independent():
+    """A credit strategy at 60% captured: the long manager (T2, superseded)
+    and the short manager (S1) read it differently; neither imports the other."""
+    s = credit(-40.0)
+    assert [x.detail for x in long_options.signals(s)] == ["60% of the credit captured"]
+    assert [x.detail for x in short_options.signals(s)] == ["60% of the credit: review"]
+    from pathlib import Path
+
+    assert "short_options" not in Path(long_options.__file__).read_text()
+    assert "long_options" not in Path(short_options.__file__).read_text()
+
+
+def test_short_settings_come_from_the_toml_and_are_listed():
+    pytest.importorskip("nautilus_trader")
+    from thetagang_nt.config import PMConfig, PMStrategyConfig
+
+    pm = PMConfig(capture_levels=(0.6,), short_dte_bands=(30, 20, 10))
+    listed = {name: (value, source) for name, value, _, source, _ in pm.params()}
+    assert listed["capture_levels"] == ("0.6", "your setting")
+    assert listed["short_dte_bands"] == ("30, 20, 10", "your setting")
+    assert listed["loss_multiples"] == ("1, 2, 3", "default")
+    lim = pm.short_limits()
+    assert lim.capture_levels == (0.6,) and lim.dte_bands == (30, 20, 10)
+    assert short_names(credit(-50.0), lim) == []  # 50% < your 60%
+    assert short_names(StrategyState(cls=SHORT, dte_front=25), lim) == [
+        (P1, "DTE band")
+    ]
+    assert PMStrategyConfig(id="x").assignment_intended is False
+
+
+def test_the_monitor_sends_each_strategy_to_its_manager():
+    """Integration: the monitor's Portfolio Manager cycle on a debit call spread
+    and a credit put spread, with fake quotes and greeks, no IB."""
+    pytest.importorskip("nautilus_trader")
+    pytest.importorskip("psycopg")
+    from thetagang_nt.config import PMConfig
+    from thetagang_nt.monitor import PortfolioMonitor, _Families
+
+    def g(delta):
+        return greeks(delta=delta, gamma=0.02, theta=-0.02, vega=0.1, vol=0.3)
+
+    legs = [
+        leg("c100", "C", 100, 1, avg=3.0),
+        leg("c105", "C", 105, -1, avg=1.0),  # debit 200
+        leg("p100", "P", 100, -1, avg=3.0),
+        leg("p95", "P", 95, 1, avg=1.0),  # credit 200
+    ]
+    book_greeks = {
+        "c100": g(0.6),
+        "c105": g(0.3),
+        "p100": g(-0.4),
+        "p95": g(-0.2),
+    }
+    quotes = {
+        "c100": Quote(4.4, 4.6),
+        "c105": Quote(1.4, 1.6),
+        "p100": Quote(1.5, 1.7),  # buy back at 1.70
+        "p95": Quote(0.9, 1.1),  # sell at 0.90: 80 to close, 60% captured
+    }
+    entries = []
+    for st in find_structures(legs):
+        fig = structure_figures(st, book_greeks, TODAY)
+        entries.append(("AA", 103.0, st, fig, "-"))
+    warnings = []
+    fake = SimpleNamespace(
+        _quote=quotes.get,  # no quote time: the monitor runs on the real clock
+        _pm_known={},
+        _journal=None,
+        _pm=PMConfig(),
+        _closes={},
+        _pm_cls={},
+        _pm_last={},
+        log=SimpleNamespace(warning=warnings.append),
+    )
+    f = _Families()
+    PortfolioMonitor._portfolio_manager(
+        fake, f, entries, SimpleNamespace(greeks=book_greeks), TODAY
+    )
+    assert warnings == []
+    info = {s.labels["kind"]: s.labels for s in f.by_name["pm_info"].samples}
+    assert info["debit spread"]["manager"] == LONG_PREMIUM
+    assert info["credit spread"]["manager"] == SHORT_PREMIUM
+    assert info["debit spread"]["outcome"] == "HOLD"
+    assert info["credit spread"]["signals"] == (
+        "P1 premium captured: 60% of the credit: review"
+    )
+    fields = {
+        (s.labels["strategy"].split("-")[1], s.labels["field"]): s.value
+        for s in f.by_name["pm"].samples
+    }
+    assert fields[("credit", "capture")] == pytest.approx(0.6)
+    assert fields[("credit", "loss_multiple")] == pytest.approx(-0.6)
+    # 80 still to earn against 420 at risk (to the 500 floor of a 5-wide spread)
+    assert fields[("credit", "premium_to_risk")] == pytest.approx(80 / 420)
+    assert ("credit", "dte_window") not in fields  # T3 is the long manager's
+    assert ("debit", "dte_window") in fields and ("debit", "capture") not in fields

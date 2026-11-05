@@ -3,7 +3,7 @@ daily snapshot per strategy and (step 3) every decision. The monitor records
 each cycle; Grafana reads it. A database problem is logged and skipped: the
 dashboard never depends on it.
 
-Strategy IDs come from pm.strategy_id, matched against the strategies the
+Strategy IDs come from pm.core.strategy_id, matched against the strategies the
 journal knows, so an ID survives a roll. Positions opened before the journal
 existed get today as an estimated entry date and their IB cost as net debit."""
 
@@ -17,8 +17,8 @@ from typing import Any
 import psycopg
 from psycopg import sql
 
-from thetagang_nt.pm.assess import Assessment
-from thetagang_nt.pm.strategy_id import Seen
+from thetagang_nt.pm.core.assess import Assessment
+from thetagang_nt.pm.core.strategy_id import Seen
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS strategies (
@@ -147,7 +147,7 @@ class Journal:
 
     def known(self, today: date) -> dict[str, Seen]:
         """Open strategies, and those closed in the last few days, with their
-        open (or last) legs: what pm.strategy_id matches today's against."""
+        open (or last) legs: what pm.core.strategy_id matches today's against."""
         rows = (
             self._db()
             .execute(

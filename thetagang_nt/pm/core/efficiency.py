@@ -12,7 +12,7 @@ import math
 from dataclasses import dataclass, field
 from datetime import date, timedelta
 
-from thetagang_nt.pm.classify import LONG, SHORT
+from thetagang_nt.pm.core.classify import LONG, SHORT
 
 HORIZONS = (1, 5, 10)  # trading days
 
