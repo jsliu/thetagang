@@ -15,6 +15,7 @@ from datetime import date, datetime, timedelta
 from typing import Any
 
 import psycopg
+from psycopg import sql
 
 from thetagang_nt.pm.assess import Assessment
 from thetagang_nt.pm.strategy_id import Seen
@@ -107,15 +108,38 @@ class StrategyRow:
 
 
 class Journal:
-    def __init__(self, dsn: str) -> None:
+    def __init__(self, dsn: str, grafana_password: str | None = None) -> None:
         self._dsn = dsn
+        self._grafana_password = grafana_password
         self._conn: psycopg.Connection | None = None
 
     def _db(self) -> psycopg.Connection:
         if self._conn is None or self._conn.closed:
             self._conn = psycopg.connect(self._dsn, autocommit=True, connect_timeout=5)
             self._conn.execute(SCHEMA)
+            if self._grafana_password:
+                self._grant_grafana(self._conn, self._grafana_password)
         return self._conn
+
+    @staticmethod
+    def _grant_grafana(conn: psycopg.Connection, password: str) -> None:
+        """Grafana's login: grafana_ro, which can read the journal and nothing else."""
+        conn.execute(
+            "DO $$ BEGIN IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'grafana_ro')"
+            " THEN CREATE ROLE grafana_ro LOGIN; END IF; END $$"
+        )
+        conn.execute(
+            sql.SQL("ALTER ROLE grafana_ro WITH PASSWORD {}").format(
+                sql.Literal(password)
+            )
+        )
+        conn.execute(
+            sql.SQL("GRANT CONNECT ON DATABASE {} TO grafana_ro").format(
+                sql.Identifier(conn.info.dbname)
+            )
+        )
+        conn.execute("GRANT USAGE ON SCHEMA public TO grafana_ro")
+        conn.execute("GRANT SELECT ON ALL TABLES IN SCHEMA public TO grafana_ro")
 
     def close(self) -> None:
         if self._conn is not None:

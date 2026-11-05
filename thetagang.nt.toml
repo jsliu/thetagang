@@ -202,3 +202,32 @@ weight = 0.0
 # dte = 60                        # expiry about 60 days out
 # weight = 1.0                    # share of the candidate's delta this trade carries
 # max_contracts = 10              # never more than 10, whatever the sizing says
+
+# ---- Portfolio Manager (decision support, vault PM Knowledge Base) ------------
+# The defaults are shown; uncomment to change. Every threshold is a hypothesis
+# (vault assumptions_register ID in brackets).
+# [pm]
+# decide = true                 # its review signals replace the bot's roll/close
+#                               # orders (they only report); false: the bot's rules trade
+# journal = true                # write the journal (Postgres at $JOURNAL_DSN)
+# profit_levels = [0.5, 1.0, 1.5]  # [T1] debit: review at +50 / +100 / +150% of the debit
+# spread_max_profit = 0.8       # [T1] defined-risk debit: review at 80% of max profit
+# credit_levels = [0.5, 0.75]   # [T2] credit: review at 50 / 75% captured
+# delta_review = 0.8            # [T4] a single long option at |delta| above this
+# # delta_drift = 0.5           # [T5] net delta moved by this share of entry gross delta
+# gt_review = 1.0               # [T6] long convexity: GT_h below this (decay beats gamma)
+# gt_horizon = 5                # [T6] trading days
+# remaining_reward_risk = 0.25  # [T8] remaining reward / risk below this
+# near_expiry_days = 7          # a short leg this close to expiry...
+# near_money = 0.02             # ...and within 2% of its strike
+# stale_secs = 300              # [T9] a quote older than this is stale
+# wide_spread = 0.25            # [T9] (ask - bid) / mid above this is wide
+#
+# Your inputs for one strategy, by its ID on the Portfolio Manager dashboard:
+# [[pm.strategies]]
+# id = "AA-debit-spread-1"
+# thesis = "aluminium tariffs lift AA into earnings"
+# invalidation_below = 35.0     # P0: thesis invalid if AA trades below
+# target = 300.0                # profit target, $
+# max_loss = 200.0              # risk budget, $: P0 when the worst case exceeds it
+# thesis_valid = true

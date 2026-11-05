@@ -34,6 +34,9 @@ services:
       IB_HOST: host.docker.internal
       # the Portfolio Manager journal; the password is in deploy/.env (git-ignored)
       JOURNAL_DSN: postgresql://thetagang:${JOURNAL_DB_PASSWORD}@journal-db:5432/thetagang
+      # Grafana's read-only login (grafana_ro), created by the monitor; the same
+      # value goes in the monitoring repo's .env
+      JOURNAL_GRAFANA_PASSWORD: ${JOURNAL_GRAFANA_PASSWORD:-}
     depends_on: [journal-db]
 
   # the Portfolio Manager journal: strategies, legs, daily snapshots, decisions.

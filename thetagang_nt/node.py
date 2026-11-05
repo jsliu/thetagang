@@ -39,7 +39,11 @@ def build(path: str, role: str = "all", adhoc: tuple[str, ...] = ()) -> TradingN
     shown = extras if monitor.publish else None
     # the Portfolio Manager journal: only the dashboard's monitor writes it
     dsn = os.environ.get("JOURNAL_DSN")
-    journal = Journal(dsn) if monitor.publish and app.pm.journal and dsn else None
+    journal = (
+        Journal(dsn, os.environ.get("JOURNAL_GRAFANA_PASSWORD"))
+        if monitor.publish and app.pm.journal and dsn
+        else None
+    )
     node.trader.add_actor(
         PortfolioMonitor(
             monitor, rules=app.strategy, extras=shown, pm=app.pm, journal=journal

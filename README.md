@@ -278,7 +278,7 @@ lists every key with a comment.
 |---|---|
 | `[node]` | trader id, log level, optional log directory, optional Redis cache |
 | `[ib]` | host, port, client id, `account_id`, `market_data_type` (`REALTIME`, or `DELAYED_FROZEN` for last prices while markets are closed). Add `[ib.gateway]` to have Nautilus start IB Gateway in Docker |
-| `[monitor]` | refresh interval, metrics address and port, long-option alert delta, stress moves |
+| `[monitor]` | refresh interval, metrics address and port, stress moves |
 | `[strategy.trading]` | `dry_run`, `interval_secs`, `market_hours_only`, `approve_trades` (`auto`/`manual`), `proposal_max_age_secs`, `reprice_after_secs`, `metrics_port`, `pretrade_metrics_port` |
 | `[strategy.delta_band]` | `theta_days`, `nav_pct`: the SPX delta neutral band |
 | `[strategy.chain]` | `strikes`, `expirations`, `quote_timeout_secs`, `minimum_credit`: picking a contract by delta |
@@ -287,9 +287,11 @@ lists every key with a comment.
 | `[strategy.debit]` | debit spreads and standalone long calls/puts: `take_profit` (spreads), `long_take_profit_gain` (longs), `max_roll_debit`; `.roll_when` (`dte`, `delta`, `max_dte`, `close_if_unable_to_roll`) and `.roll_target` (`dte`, `max_dte`, `delta` of the new long leg) |
 | `[strategy.vix_call_hedge]` | `enabled`, `delta`, `target_dte`, `close_hedges_when_vix_exceeds`, `ignore_dte`, and `[[…allocation]]` bands (`lower_bound` ≤ VIXMO < `upper_bound`, first match wins, `weight` × net liquidation) |
 | `[[pretrade.candidates]]` | `name`, and `[[pretrade.candidates.trades]]`: `symbol`, `structure` (`long_call`, `short_call`, `long_put`, `short_put`, `put_credit_spread`, `call_credit_spread`, `put_debit_spread`, `call_debit_spread`), `delta`, `dte`, `width` (spreads only), `weight`, `max_contracts`: ideas `pretrade` sizes and compares |
-| `[strategy.butterfly]`, `[strategy.straddle]`, `[strategy.calendar]` | what the Structures table recommends for butterflies (`take_profit`, `partial_take_profit` of the max profit, `close_dte`), long straddles/strangles (`take_profit_gain`, `partial_take_profit_gain` of the debit, `leg_delta`, `roll_dte`) and calendars/diagonals (`take_profit` of the debit, `short_roll_dte`, `close_dte`). Each has `trade` (default false): true lets the bot place the recommendation (dry_run applies): close or close half as one combo with every leg in its ratio, close a straddle's winning leg, or roll a calendar's short leg to the next expiry before the long leg's for a net credit. "Roll whole" is never placed: it stays yours |
+| `[strategy.butterfly]`, `[strategy.straddle]`, `[strategy.calendar]` | only with `[pm] decide = false`: what the bot's own rules would do for butterflies (`take_profit`, `partial_take_profit` of the max profit, `close_dte`), long straddles/strangles (`take_profit_gain`, `partial_take_profit_gain` of the debit, `leg_delta`, `roll_dte`) and calendars/diagonals (`take_profit` of the debit, `short_roll_dte`, `close_dte`). Each has `trade` (default false): true lets the bot place the recommendation (dry_run applies): close or close half as one combo with every leg in its ratio, close a straddle's winning leg, or roll a calendar's short leg to the next expiry before the long leg's for a net credit. "Roll whole" is never placed: it stays yours |
 | `[[strategy.structures]]` | `name`, `legs` (contract labels as the dashboard shows them, e.g. `"AA 20261218 40P"`): option legs you hold as one position; recognised before any automatic grouping, left to you, and never resized by the trade plan |
 | `[strategy.symbols.<SYM>]` | `no_trading`, `put_strike_limit`, `call_strike_limit`, `delta` and `max_dte` (override `credit.roll_target`), `ignore_missing_greeks` |
+| `[pm]` | the Portfolio Manager: `decide` (default true: its review signals replace the bot's roll/close rules, which then only report), `journal`, and the review thresholds by vault register ID: `profit_levels`, `spread_max_profit` (T1), `credit_levels` (T2), `delta_review` (T4), `delta_drift` (T5), `gt_review`, `gt_horizon` (T6), `remaining_reward_risk` (T8), `near_expiry_days`, `near_money`, `stale_secs`, `wide_spread` (T9) |
+| `[[pm.strategies]]` | your inputs for one strategy, by its Portfolio Manager ID (e.g. `"AA-debit-spread-1"`): `thesis`, `invalidation_below` / `invalidation_above` (a price: the thesis is invalid past it, a P0 review), `target`, `max_loss` (your risk budget: a P0 review when the worst case exceeds it), `thesis_valid` |
 
 Remove the whole `[strategy]` section to run the monitor only. The roll,
 discretionary and VIX keys mean the same as in `thetagang`, so values can be
@@ -317,17 +319,18 @@ Alerts are sent 09:30–16:00 New York time on weekdays, repeated at most every
 | SPX delta out of band | \|beta delta $\| outside the neutral band for an hour with `dry_run = false` |
 | stress loss | a −10% SPX move (beta-weighted) would lose more than 5% of net liquidation (15 min) |
 | order sent | the bot sent a real (not dry-run) order in the last 10 minutes |
+| PM review | a strategy has an open P0 or P1 Portfolio Manager review (not "data unreliable"): the message names the strategy, its signals and what the bot's rules say |
 
 The dashboard (everything the old bot printed):
 
 | Row | Panels |
 |---|---|
-| Headline | one tile each, the latest value (shown in any time range): net liquidation, unrealized P&L, SPX delta, theta per day, vega per vol point, volga (vega change per vol point), gamma, *attention* (structures whose recommendation is to roll, close or adjust a leg now), data age |
+| Headline | one tile each, the latest value (shown in any time range): net liquidation, unrealized P&L, SPX delta, theta per day, vega per vol point, volga (vega change per vol point), gamma, *attention* (strategies with an open P0 or P1 Portfolio Manager review; click for the review queue), data age |
 | Account | available funds, cash, excess liquidity, initial and maintenance margin, buying power, cushion; SPX move today |
 | Risk | portfolio greeks now / after the SPX Δ=0 proposals / after the trade plan; stress P&L, beta-weighted and with all betas at 1; the VIX call hedge (calls held, allocation at VIXMO, close level) and what it would do |
 | By symbol | beta delta $ by symbol; today's P&L by symbol and its attribution (from SPX, unexplained, delta, gamma, theta, vega, residual); the Symbols table (beta, delta, delta $, beta delta $, gamma, theta, vega, volga) |
 | Positions summary | shares, short/long puts and calls, average strikes, weight now and target weight for SPX Δ=0, target beta delta $, share-equivalent change, side, and the net target contracts (display only) |
-| Structures | the Options section: each symbol's option legs grouped into the positions they form (your `[[strategy.structures]]` groups first, then butterflies, long straddles/strangles, verticals, calendars/diagonals, single legs), with combined cost, value, P&L, max profit and loss and breakevens at expiry (one-expiry structures), Δ Γ Θ V, whether the bot manages it (credit or debit rules) or leaves it to you, a recommendation with its reason (close, close half, adjust one leg, roll the whole structure, keep), the take-profit price, P&L % and the underlying price; butterflies, straddles, strangles, calendars/diagonals and your groups are "by hand" for now |
+| Structures | the Options section: each symbol's option legs grouped into the positions they form (your `[[strategy.structures]]` groups first, then butterflies, long straddles/strangles, verticals, calendars/diagonals, single legs), with combined cost, value, P&L, P&L %, max profit and loss and breakevens at expiry (one-expiry structures), Δ Γ Θ V and the underlying price; and the Portfolio Manager's strategy ID (click it for the strategy's review), priority and outcome |
 | Positions | quantity, cost, price, unrealized P&L, P&L ratio, DTE |
 | Trade plan | the configured trades sized to SPX Δ=0 and why (only while the trading strategy runs) |
 | Activity | VIX and VIXMO, orders per hour (dry-run orders included) |
@@ -341,6 +344,60 @@ NautilusTrader doesn't expose them.
 
 All metrics are named `thetagang_*`, so you can query them in Prometheus or
 add your own panels.
+
+### Portfolio Manager
+
+Decision support per strategy, implementing the PM Knowledge Base vault
+(`~/Documents/project/PM_Knowledge_Base`): it never trades. Where the vault and
+the bot's own rules disagree, the vault wins: with `[pm] decide = true` (the
+default) the bot's roll/close rules only report, and the Portfolio Manager's
+**review signals** tell you what to look at. You decide; the trade plan and
+the VIX hedge are unchanged.
+
+Every monitor cycle, for each strategy (the structures above, with a stable
+ID such as `AA-debit-spread-1` that survives rolls), the pure functions in
+[`thetagang_nt/pm/`](thetagang_nt/pm) compute:
+
+- **Data quality**: missing, crossed, stale or wide quotes, zero bids, no
+  greeks; **executable value** (sell at the bid, buy back at the ask) next to
+  the mid, and the cost to close now.
+- **Convexity class** from the net Gamma and Theta (long, short, mixed), never
+  from how the strategy was opened; mixed for several expiries or when gamma
+  changes sign within ±5%.
+- **Gamma/Theta efficiency** for long convexity: GT, GT_h over 1/5/10 trading
+  days at the 21-day realised volatility, and the breakeven volatility.
+- **Profit**: return on debit or credit captured, remaining reward/risk.
+- **Review signals**: P0 hard (thesis invalid, risk budget breached, data
+  unreliable), P1 (profit levels, the DTE window for the strategy's original
+  life, a short leg near expiry and the money), P2 (deep-ITM long option,
+  class change, GT_h below 1, low remaining reward). The outcome is HOLD,
+  REVIEW, REVIEW - data unreliable, or CLOSE review (any other P0).
+
+Every threshold is a hypothesis with its vault register ID, set under `[pm]`.
+Rolls are review items until the scenario engine and the HOLD/CLOSE/ROLL
+comparison (phase 2) exist.
+
+The **journal** (Postgres, the `journal-db` service) keeps the strategies and
+their legs (opened and closed), one snapshot per strategy per day and a
+decision-log row whenever a strategy's outcome or signals change. Positions
+held before the journal started have an estimated entry date. Grafana reads
+it with a read-only login. Both passwords live in `deploy/.env` (git-ignored):
+
+```bash
+# deploy/.env
+JOURNAL_DB_PASSWORD=...        # the journal database
+JOURNAL_GRAFANA_PASSWORD=...   # Grafana's read-only login; the same line goes in ../monitoring/.env
+```
+
+The monitor creates the database tables and Grafana's login (`grafana_ro`,
+SELECT only) itself. A database problem is logged and skipped; the dashboard
+never waits on it.
+
+The **Portfolio Manager** dashboard (linked from the thetagang dashboard)
+shows the review queue (every strategy not on HOLD, highest priority first,
+next to what the bot's rules say), each strategy's detail (values, class,
+efficiency, signals, your thesis and budget, P&L history, decision log,
+legs), the book's class mix and concentration, and data quality.
 
 ### Differences from `thetagang`'s discretionary strategy
 
