@@ -362,13 +362,13 @@ def test_dte_bands_s2_use_the_front_short_leg():
 def test_loss_multiple_s3_names_the_highest_level():
     found = short_options.signals(credit(-250.0))
     assert [x.detail for x in found if x.name == "loss multiple"] == [
-        "loss 1.5x the credit (level 1)"
+        "loss 1.50x the credit (level 1)"
     ]
     assert [
         x.detail
         for x in short_options.signals(credit(-420.0))
         if x.name == "loss multiple"
-    ] == ["loss 3.2x the credit (level 3)"]
+    ] == ["loss 3.20x the credit (level 3)"]
     assert short_names(credit(-150.0)) == []  # 0.5x: below the first level
 
 
@@ -532,3 +532,11 @@ def test_the_monitor_sends_each_strategy_to_its_manager():
     assert fields[("credit", "premium_to_risk")] == pytest.approx(80 / 420)
     assert ("credit", "dte_window") not in fields  # T3 is the long manager's
     assert ("debit", "dte_window") in fields and ("debit", "capture") not in fields
+
+
+def test_loss_multiple_text_never_rounds_past_its_level():
+    # 1.96x is below level 2: one decimal would print "2.0x ... (level 1)"
+    found = short_options.signals(credit(-296.39))
+    assert [x.detail for x in found if x.name == "loss multiple"] == [
+        "loss 1.96x the credit (level 1)"
+    ]

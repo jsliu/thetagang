@@ -94,7 +94,7 @@ def signals(s: StrategyState, lim: ShortLimits = ShortLimits()) -> list[Signal]:
                 Signal(
                     P1,
                     "loss multiple",
-                    f"loss {m:.1f}x the credit (level {lim.loss_multiples[n - 1]:g})",
+                    f"loss {m:.2f}x the credit (level {lim.loss_multiples[n - 1]:g})",
                 )
             )
     # P1 [S4]: assignment exposure (ex-dividend: no dividend data yet)
