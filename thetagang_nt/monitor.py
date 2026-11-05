@@ -148,6 +148,27 @@ def action_text(action: str) -> str:
     return action[:1].upper() + action[1:]
 
 
+def signals_text(found: list[Any]) -> str:
+    """One line per priority, P0 first: "P1 DTE band: 15 days left: review;
+    loss multiple: ...". "-" when there are none."""
+    by: dict[str, list[str]] = {}
+    for x in found:
+        by.setdefault(x.priority, []).append(f"{x.name}: {x.detail}")
+    return "\n".join(f"{p} " + "; ".join(v) for p, v in sorted(by.items())) or "-"
+
+
+def review_rank(found: list[Any]) -> tuple[str, int]:
+    """(priority shown, sort rank) for the review queue. Bad data is a P0 that
+    says "check the prices", not "act": the shown priority is the most urgent
+    other signal ("data" if bad data is the only one, "-" if none), and rows
+    with bad data sort just below clean rows of the same priority, so what you
+    can act on comes first. The outcome is unchanged (close_rules)."""
+    real = [x for x in found if x.name != "data unreliable"]
+    top = min((x.priority for x in real), default="data" if found else "-")
+    data = len(real) < len(found)
+    return top, max(0, 2 * {"P0": 3, "P1": 2, "P2": 1}.get(top, 0) - data)
+
+
 def equity_symbols(symbols: set[str]) -> list[str]:
     return sorted(s for s in symbols if not is_index(s))
 
@@ -854,7 +875,9 @@ class PortfolioMonitor(Actor):
                 thesis_valid=x.thesis_valid if x else None,
                 invalidation=invalidation,
                 worst_case_loss=worst,
-                loss_budget=x.max_loss if x else None,
+                loss_budget=x.max_loss
+                if x and x.max_loss is not None
+                else self._pm.max_loss,
                 sigma_f=sigma_f,
                 assignment_intended=x.assignment_intended if x else False,
             )
@@ -865,7 +888,7 @@ class PortfolioMonitor(Actor):
                 found, out = short_options.decide(state, short_limits)
             else:
                 found, out = long_options.decide(state, limits)
-            top = min((x.priority for x in found), default="-")
+            top, rank = review_rank(found)
             for sig in found:
                 counts[sig.priority] += 1
                 f.set(
@@ -889,8 +912,7 @@ class PortfolioMonitor(Actor):
                 cls=a.cls or "unknown",
                 outcome=out,
                 top=top,
-                signals="; ".join(f"{x.priority} {x.name}: {x.detail}" for x in found)
-                or "-",
+                signals=signals_text(found),
                 flags="; ".join(a.flags) or "-",
                 bot=bot,
             )
@@ -944,7 +966,7 @@ class PortfolioMonitor(Actor):
                     if short and a.v_exec is not None
                     else None,
                 ),
-                ("priority", {P0: 3, P1: 2, P2: 1}.get(top, 0)),
+                ("priority", rank),
             ):
                 if value is not None:
                     f.set(

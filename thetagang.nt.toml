@@ -210,6 +210,8 @@ weight = 0.0
 # decide = true                 # its review signals replace the bot's roll/close
 #                               # orders (they only report); false: the bot's rules trade
 # journal = true                # write the journal (Postgres at $JOURNAL_DSN)
+# max_loss = 2000.0             # risk budget, $, for every strategy: P0 CLOSE review when
+#                               # its worst case exceeds it; [[pm.strategies]] max_loss overrides
 # profit_levels = [0.5, 1.0, 1.5]  # [T1] debit: review at +50 / +100 / +150% of the debit
 # spread_max_profit = 0.8       # [T1] defined-risk debit: review at 80% of max profit
 # credit_levels = [0.5, 0.75]   # [T2] credit: review at 50 / 75% captured

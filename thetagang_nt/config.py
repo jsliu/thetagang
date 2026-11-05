@@ -333,6 +333,9 @@ class PMConfig(NautilusConfig, frozen=True):
     # the PM's review signals tell you what to look at, you decide. The trade
     # plan and the VIX hedge are unaffected. false: the bot's rules trade again
     decide: bool = True
+    # risk budget, $, for every strategy without its own [[pm.strategies]]
+    # max_loss: a P0 CLOSE review when the worst case exceeds it; unset: off
+    max_loss: float | None = None
     strategies: list[PMStrategyConfig] = []
     # review thresholds, by vault register ID; all hypotheses (assumptions_register)
     profit_levels: tuple[float, ...] = (0.5, 1.0, 1.5)  # [T1] return on debit
@@ -442,6 +445,11 @@ class PMConfig(NautilusConfig, frozen=True):
                 "decide",
                 "",
                 "the PM's review signals replace the bot's roll/close orders",
+            ),
+            (
+                "max_loss",
+                "",
+                "risk budget, $: P0 when a strategy's worst case exceeds it",
             ),
             ("profit_levels", "T1", "debit: review at these gains on the debit"),
             (

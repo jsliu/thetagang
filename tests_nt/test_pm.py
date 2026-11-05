@@ -540,3 +540,100 @@ def test_loss_multiple_text_never_rounds_past_its_level():
     assert [x.detail for x in found if x.name == "loss multiple"] == [
         "loss 1.96x the credit (level 1)"
     ]
+
+
+def test_signals_print_one_line_per_priority():
+    pytest.importorskip("nautilus_trader")
+    from thetagang_nt.monitor import signals_text
+    from thetagang_nt.pm.core.review import Signal
+
+    found = [
+        Signal(P2, "short strike tested", "short 43C in the money"),
+        Signal(P0, "data unreliable", "wide spread"),
+        Signal(P1, "DTE band", "15 days left: review"),
+        Signal(P1, "loss multiple", "loss 3.50x the credit (level 3)"),
+    ]
+    assert signals_text(found) == (
+        "P0 data unreliable: wide spread\n"
+        "P1 DTE band: 15 days left: review; loss multiple: loss 3.50x the credit (level 3)\n"
+        "P2 short strike tested: short 43C in the money"
+    )
+    assert signals_text([]) == "-"
+
+
+def test_review_queue_puts_what_you_can_act_on_first():
+    """Bad data asks you to check prices, not to act: the shown priority is
+    the most urgent other signal, and data-flagged rows sort just below clean
+    ones of the same priority; data-only rows come last."""
+    pytest.importorskip("nautilus_trader")
+    from thetagang_nt.monitor import review_rank
+    from thetagang_nt.pm.core.review import Signal
+
+    data = Signal(P0, "data unreliable", "wide spread")
+    thesis = Signal(P0, "thesis invalidated", "marked invalid")
+    profit = Signal(P1, "profit level", "+175% on the debit: high-priority review")
+    drift = Signal(P2, "efficiency", "GT_5 0.37: decay beats gamma")
+    ranks = {
+        "real P0": review_rank([thesis]),
+        "real P0, bad data": review_rank([data, thesis]),
+        "P1": review_rank([profit]),
+        "P1, bad data": review_rank([data, profit]),
+        "P2": review_rank([drift]),
+        "P2, bad data": review_rank([data, drift]),
+        "bad data only": review_rank([data]),
+        "none": review_rank([]),
+    }
+    assert [top for top, _ in ranks.values()] == [
+        "P0",
+        "P0",
+        "P1",
+        "P1",
+        "P2",
+        "P2",
+        "data",
+        "-",
+    ]
+    order = [rank for _, rank in ranks.values()]
+    assert order == sorted(order, reverse=True) and len(set(order[:-1])) == 7
+    # a data-flagged P1 still outranks every P2 and every data-only row
+    assert ranks["P1, bad data"][1] > ranks["P2"][1] > ranks["bad data only"][1]
+
+
+def test_a_default_risk_budget_applies_unless_a_strategy_sets_its_own():
+    """[pm] max_loss covers every strategy; [[pm.strategies]] max_loss wins."""
+    pytest.importorskip("nautilus_trader")
+    pytest.importorskip("psycopg")
+    from thetagang_nt.config import PMConfig, PMStrategyConfig
+    from thetagang_nt.monitor import PortfolioMonitor, _Families
+
+    # a 40/45 call spread bought for 2.00, worth 2.80 at the bid: worst case 280
+    legs = [leg("c40", "C", 40, 1, avg=3.0), leg("c45", "C", 45, -1, avg=1.0)]
+    quotes = {"c40": Quote(3.9, 4.1), "c45": Quote(0.9, 1.1)}
+    g = {"c40": greeks(delta=0.6), "c45": greeks(delta=0.3)}
+    (st,) = find_structures(legs)
+    entries = [("AA", 43.0, st, structure_figures(st, g, TODAY), "-")]
+
+    def run(pm):
+        fake = SimpleNamespace(
+            _quote=quotes.get,
+            _pm_known={},
+            _journal=None,
+            _pm=pm,
+            _closes={},
+            _pm_cls={},
+            _pm_last={},
+            log=SimpleNamespace(warning=print),
+        )
+        f = _Families()
+        PortfolioMonitor._portfolio_manager(
+            fake, f, entries, SimpleNamespace(greeks=g), TODAY
+        )
+        (info,) = f.by_name["pm_info"].samples
+        return info.labels["outcome"], info.labels["top"]
+
+    assert run(PMConfig()) == ("HOLD", "-")  # no budget: off
+    assert run(PMConfig(max_loss=200.0)) == ("CLOSE review", "P0")
+    own = PMStrategyConfig(id="AA-debit-spread-1", max_loss=500.0)
+    assert run(PMConfig(max_loss=200.0, strategies=[own])) == ("HOLD", "-")
+    listed = {n: (v, s) for n, v, _, s, _ in PMConfig(max_loss=2000.0).params()}
+    assert listed["max_loss"] == ("2000", "your setting")
