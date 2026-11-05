@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 import tomllib
 from pathlib import Path
+from typing import Any
 
 import msgspec
 from nautilus_trader.adapters.interactive_brokers.common import IB
@@ -326,6 +327,40 @@ class PMConfig(NautilusConfig, frozen=True):
 
     journal: bool = True  # write the journal to Postgres at $JOURNAL_DSN (if set)
     strategies: list[PMStrategyConfig] = []
+    # review thresholds, by vault register ID; all hypotheses (assumptions_register)
+    profit_levels: tuple[float, ...] = (0.5, 1.0, 1.5)  # [T1] return on debit
+    spread_max_profit: float = 0.8  # [T1] defined-risk debit: share of max profit
+    credit_levels: tuple[float, ...] = (0.5, 0.75)  # [T2] share of the credit captured
+    delta_review: float = 0.8  # [T4] a single long option's |delta|
+    delta_drift: float | None = None  # [T5] share of entry gross delta; unset: off
+    gt_review: float = 1.0  # [T6] long convexity: GT_h below this
+    gt_horizon: int = 5  # [T6] trading days
+    remaining_reward_risk: float = 0.25  # [T8] below this
+    near_expiry_days: int = 7  # a short leg this close to expiry...
+    near_money: float = 0.02  # ...and within this of its strike
+    stale_secs: float = 300.0  # [T9] quote older than this
+    wide_spread: float = 0.25  # [T9] (ask - bid) / mid above this
+
+    def limits(self) -> Any:
+        from thetagang_nt.pm.signals import SignalLimits
+
+        return SignalLimits(
+            profit_levels=tuple(self.profit_levels),
+            spread_max_profit=self.spread_max_profit,
+            credit_levels=tuple(self.credit_levels),
+            delta_review=self.delta_review,
+            delta_drift=self.delta_drift,
+            gt_review=self.gt_review,
+            gt_horizon=self.gt_horizon,
+            remaining_reward_risk=self.remaining_reward_risk,
+            near_expiry_days=self.near_expiry_days,
+            near_money=self.near_money,
+        )
+
+    def quality(self) -> Any:
+        from thetagang_nt.pm.quality import QualityLimits
+
+        return QualityLimits(stale_secs=self.stale_secs, wide_spread=self.wide_spread)
 
 
 class AppConfig(NautilusConfig, frozen=True):

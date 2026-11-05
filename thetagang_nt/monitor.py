@@ -26,7 +26,18 @@ from thetagang_nt.config import DiscretionaryConfig, MonitorConfig, PMConfig
 from thetagang_nt.ib_extra import AccountExtras
 from thetagang_nt.journal import Journal, LegRow, StrategyRow
 from thetagang_nt.pm.assess import assess
+from thetagang_nt.pm.profit import value_bounds
 from thetagang_nt.pm.quality import Quote
+from thetagang_nt.pm.signals import (
+    P0,
+    P1,
+    P2,
+    ShortLeg,
+    StrategyState,
+    dte_window,
+    outcome,
+    signals,
+)
 from thetagang_nt.pm.strategy_id import Seen, auto_ids
 from thetagang_nt.portfolio import (
     INDEX_CONTRACTS,
@@ -157,6 +168,9 @@ class PortfolioMonitor(Actor):
         super().__init__(config)
         self._pm = pm or PMConfig()
         self._journal = journal  # the Portfolio Manager journal (Postgres), or None
+        self._pm_known: dict[str, Seen] = {}  # IDs without a journal
+        self._pm_cls: dict[str, str | None] = {}  # last class, for class-change signals
+        self._pm_last: dict[str, tuple] = {}  # last (outcome, signals): log changes
         self._snapshot = _Snapshot()
         self._closes: dict[InstrumentId, dict[date, float]] = {}
         self._betas: dict[str, float] = {}
@@ -698,7 +712,6 @@ class PortfolioMonitor(Actor):
             und = price(self.cache, underlying_id(s))
             for st in find_structures(items, groups):
                 fig = structure_figures(st, book.greeks, today)
-                entries.append((s, und, st, fig))
                 name = structure_label(st)
                 section = SECTIONS.get(st.kind)
                 if is_index(s) or self._no_trading(s):
@@ -741,6 +754,7 @@ class PortfolioMonitor(Actor):
                     leg_order=rec[2],
                     take_profit=take_profit,
                 )
+                entries.append((s, und, st, fig, action_text(rec[0])))
                 for field, value in (
                     ("qty", fig.qty),
                     ("dte", fig.dte),
@@ -765,11 +779,10 @@ class PortfolioMonitor(Actor):
                             name=name,
                             field=field,
                         )
-        if self._journal is not None:
-            try:
-                self._record_journal(entries, book, today)
-            except Exception as e:  # noqa: BLE001 - the dashboard never depends on it
-                self.log.warning(f"Journal not written: {e!r}")
+        try:
+            self._portfolio_manager(f, entries, book, today)
+        except Exception as e:  # noqa: BLE001 - the rest of the dashboard never waits on it
+            self.log.warning(f"Portfolio Manager skipped: {e!r}")
 
     def _quote(self, iid: InstrumentId) -> Quote:
         """Bid, ask and quote time; IB sends -1 for a missing side."""
@@ -783,9 +796,12 @@ class PortfolioMonitor(Actor):
             datetime.fromtimestamp(q.ts_event / 1e9, tz=UTC),
         )
 
-    def _record_journal(self, entries: list, book: Book, today: date) -> None:
-        """Assess each strategy (pm), give it its stable ID and write the
-        journal: strategies, legs, today's snapshot."""
+    def _portfolio_manager(
+        self, f: _Families, entries: list, book: Book, today: date
+    ) -> None:
+        """The Portfolio Manager (vault): assess each strategy, give it its stable
+        ID, raise the review signals and publish them; then write the journal,
+        and a decision-log row when a strategy's outcome or signals change."""
         now = datetime.now(UTC)
         quotes = {
             p.instrument_id: self._quote(p.instrument_id)
@@ -796,14 +812,140 @@ class PortfolioMonitor(Actor):
             Seen(
                 s, st.name or st.kind, frozenset(str(p.instrument_id) for p in st.legs)
             )
-            for s, _, st, _ in entries
+            for s, _, st, _, _ in entries
         ]
-        ids = auto_ids(seen, self._journal.known(today))
-        rows = []
-        for sid, (s, und, st, fig) in zip(ids, entries, strict=True):
+        known, entry = self._pm_known, {}
+        if self._journal is not None:
+            try:
+                known = self._journal.known(today)
+            except Exception as e:  # noqa: BLE001
+                self.log.warning(f"Journal unreadable, IDs from memory: {e!r}")
+        ids = auto_ids(seen, known)
+        if self._journal is not None:
+            try:
+                entry = self._journal.entry(ids)
+            except Exception:  # noqa: BLE001 - logged above
+                pass
+        inputs = {x.id: x for x in self._pm.strategies}
+        limits, quality = self._pm.limits(), self._pm.quality()
+        rows, decisions, counts = [], [], dict.fromkeys((P0, P1, P2), 0)
+        for sid, (s, und, st, fig, bot) in zip(ids, entries, strict=True):
             move = realized_move(self._closes.get(underlying_id(s), {}))
             sigma_f = move * math.sqrt(252) if move is not None else None
-            a = assess(st, fig, book.greeks, quotes, und, sigma_f, today, now)
+            a = assess(st, fig, book.greeks, quotes, und, sigma_f, today, now, quality)
+            net_debit, initial_dte = entry.get(sid, (fig.cost, a.dte_front))
+            x = inputs.get(sid)
+            invalidation = None
+            if x is not None and x.invalidation_below is not None:
+                invalidation = ("below", x.invalidation_below)
+            elif x is not None and x.invalidation_above is not None:
+                invalidation = ("above", x.invalidation_above)
+            v_floor, _ = value_bounds(fig)
+            # phase 1 proxy for the worst-case loss: down to the expiry floor
+            # (phase 2: the scenario grid's worst cell)
+            worst = (
+                max(0.0, a.v_exec - v_floor)
+                if a.v_exec is not None and v_floor is not None
+                else None
+            )
+            single = st.legs[0] if len(st.legs) == 1 and st.legs[0].qty > 0 else None
+            g = book.greeks.get(single.instrument_id) if single else None
+            state = StrategyState(
+                cls=a.cls,
+                data_flags=a.flags,
+                net_debit=net_debit,
+                value_exec=a.v_exec,
+                max_profit=None
+                if fig.max_profit is None or math.isinf(fig.max_profit)
+                else fig.max_profit,
+                dte_front=a.dte_front,
+                initial_dte=initial_dte,
+                spot=und,
+                single_long_delta=g.delta if g else None,
+                gt_h=a.eff.gt_h,
+                remaining_reward_risk=a.remaining_rr,
+                short_legs=tuple(
+                    ShortLeg(p.dte(today), p.strike) for p in st.legs if p.qty < 0
+                ),
+                prev_cls=self._pm_cls.get(sid),
+                thesis_valid=x.thesis_valid if x else None,
+                invalidation=invalidation,
+                worst_case_loss=worst,
+                loss_budget=x.max_loss if x else None,
+            )
+            found = signals(state, limits)
+            out = outcome(found)
+            top = min((x.priority for x in found), default="-")
+            for sig in found:
+                counts[sig.priority] += 1
+                f.set(
+                    "pm_signal",
+                    "A Portfolio Manager review signal",
+                    1,
+                    strategy=sid,
+                    priority=sig.priority,
+                    name=sig.name,
+                    detail=sig.detail,
+                )
+            f.set(
+                "pm_info",
+                "A strategy as the Portfolio Manager sees it",
+                1,
+                strategy=sid,
+                symbol=s.lstrip("^"),
+                kind=st.name or st.kind,
+                structure=structure_label(st),
+                cls=a.cls or "unknown",
+                outcome=out,
+                top=top,
+                signals="; ".join(f"{x.priority} {x.name}: {x.detail}" for x in found)
+                or "-",
+                flags="; ".join(a.flags) or "-",
+                bot=bot,
+            )
+            net = a.net or {}
+            for field, value in (
+                ("v_mid", a.v_mid),
+                ("v_exec", a.v_exec),
+                (
+                    "liquidity_cost",
+                    None if a.v_mid is None or a.v_exec is None else a.v_mid - a.v_exec,
+                ),
+                ("net_debit", net_debit),
+                ("pnl_exec", None if a.v_exec is None else a.v_exec - net_debit),
+                ("delta", net.get("delta")),
+                ("gamma", net.get("gamma")),
+                ("theta", net.get("theta")),
+                ("vega", net.get("vega")),
+                ("gt", a.eff.gt),
+                ("gt_1", a.eff.gt_h.get(1)),
+                ("gt_5", a.eff.gt_h.get(5)),
+                ("gt_10", a.eff.gt_h.get(10)),
+                ("sigma_be_5", a.eff.sigma_be.get(5)),
+                ("sigma_f", sigma_f),
+                ("tg", a.eff.tg),
+                ("remaining_rr", a.remaining_rr),
+                ("worst_case_loss", worst),
+                ("dte_front", a.dte_front),
+                (
+                    "dte_window",
+                    dte_window(initial_dte) if initial_dte is not None else None,
+                ),
+                ("priority", {P0: 3, P1: 2, P2: 1}.get(top, 0)),
+            ):
+                if value is not None:
+                    f.set(
+                        "pm",
+                        "A strategy's Portfolio Manager figures",
+                        value,
+                        strategy=sid,
+                        field=field,
+                    )
+            key = (out, tuple((x.priority, x.name) for x in found))
+            if self._pm_last.get(sid) != key:
+                decisions.append((sid, out, [x.__dict__ for x in found], bot))
+                self._pm_last[sid] = key
+            self._pm_cls[sid] = a.cls
             legs = tuple(
                 LegRow(
                     str(p.instrument_id), option_label(p), p.qty, p.multiplier, p.avg_px
@@ -811,8 +953,23 @@ class PortfolioMonitor(Actor):
                 for p in st.legs
             )
             rows.append(StrategyRow(sid, s, st.name or st.kind, legs, fig.cost, und, a))
-        inputs = {x.id: x for x in self._pm.strategies}
-        self._journal.record(rows, inputs, today, now)
+        for priority, n in counts.items():
+            f.set(
+                "pm_signals",
+                "Open Portfolio Manager review signals",
+                n,
+                priority=priority,
+            )
+        f.set("pm_strategies", "Strategies the Portfolio Manager follows", len(rows))
+        self._pm_known = dict(zip(ids, seen, strict=True))
+        if self._journal is not None:
+            try:
+                self._journal.record(rows, inputs, today, now)
+                if decisions:
+                    self._journal.decide(decisions, now)
+            except Exception as e:  # noqa: BLE001 - the dashboard never depends on it
+                self._pm_last.clear()  # retry the decision rows next cycle
+                self.log.warning(f"Journal not written: {e!r}")
 
     def _actions(self, f: _Families, legs: list[Leg], book: Book, today: date) -> None:
         """What the strategy's rules would do with each position, and the price

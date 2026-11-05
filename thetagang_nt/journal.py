@@ -140,6 +140,27 @@ class Journal:
         )
         return {r[0]: Seen(r[1], r[2], frozenset(r[3])) for r in rows}
 
+    def entry(self, ids: list[str]) -> dict[str, tuple[float, int | None]]:
+        """Each known strategy's (net debit, initial DTE) at entry."""
+        rows = self._db().execute(
+            "SELECT id, net_debit, initial_dte FROM strategies WHERE id = ANY(%s)",
+            (ids,),
+        )
+        return {r[0]: (float(r[1]), r[2]) for r in rows}
+
+    def decide(
+        self, rows: list[tuple[str, str, list[dict], str]], now: datetime
+    ) -> None:
+        """The decision log: (strategy, outcome, signals, the bot's action), one
+        row each time a strategy's outcome or signals change."""
+        with self._db().transaction():
+            for sid, out, found, bot in rows:
+                self._db().execute(
+                    "INSERT INTO decisions (at, strategy_id, outcome, signals, bot_action)"
+                    " VALUES (%s, %s, %s, %s, %s)",
+                    (now, sid, out, json.dumps(found), bot),
+                )
+
     def record(
         self,
         rows: list[StrategyRow],
