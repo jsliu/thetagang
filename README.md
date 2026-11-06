@@ -475,8 +475,8 @@ ones, strategies with only bad data last; signals one line per priority;
 with its manager, next to what the bot's rules say), each strategy's detail
 (values, class, efficiency, for short options the credit captured, loss
 multiple and premium left per $ of risk, signals, your thesis and budget, P&L
-history, decision log, legs), the book's class and manager mix and
-concentration, and data quality.
+history, decision log, legs), and data quality. The book's class and manager
+mix and concentration are on the thetagang dashboard, with the whole portfolio.
 
 ### Differences from `thetagang`'s discretionary strategy
 
