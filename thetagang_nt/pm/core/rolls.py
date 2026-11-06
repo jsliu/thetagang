@@ -13,6 +13,7 @@ from datetime import date, datetime, timedelta
 from typing import Any
 
 from thetagang_nt.pm.core.efficiency import HORIZONS
+from thetagang_nt.pm.core.iv_model import IvLimits, IvModel
 from thetagang_nt.pm.core.profit import value_bounds
 from thetagang_nt.pm.core.quality import (
     QualityLimits,
@@ -20,7 +21,7 @@ from thetagang_nt.pm.core.quality import (
     leg_flags,
     values,
 )
-from thetagang_nt.pm.core.scenarios import GridSpec, grid
+from thetagang_nt.pm.core.scenarios import GridSpec, grid, repriced
 from thetagang_nt.pm.core.valuation import UtilityLimits, capital_at_risk, forward
 from thetagang_nt.rules import Leg, Structure, structure_figures, structure_label
 
@@ -118,6 +119,7 @@ class Candidate:
     es: float | None = None
     u_new: float | None = None  # its own utility, opening and later exit costs in
     fails: tuple[str, ...] = ()  # why it can't be recommended
+    u_new_iv: float | None = None  # the same utility under the joint IV model
 
 
 def evaluate(
@@ -133,6 +135,8 @@ def evaluate(
     util: UtilityLimits,
     quality: QualityLimits,
     max_loss: float | None,
+    iv_model: IvModel | None = None,
+    iv_limits: IvLimits = IvLimits(),
 ) -> Candidate | None:
     """One candidate as a new trade, through the same grid and utility as HOLD;
     None if a leg has no usable quote or greeks."""
@@ -166,6 +170,22 @@ def evaluate(
     stress = g.stress_loss()
     car = capital_at_risk(v_exec, value_bounds(fig)[0], stress)
     fwd = forward(g, half_spread, contracts, max(car or 0.0, 0.0), util)
+    u_new_iv = None
+    if iv_model is not None:
+        pnls = repriced(
+            legs,
+            greeks,
+            today,
+            carry,
+            iv_model.samples,
+            util.horizon,
+            iv_limits.term_days,
+        )
+        fwd_iv = forward(
+            g, half_spread, contracts, max(car or 0.0, 0.0), util, pnls=pnls
+        )
+        if fwd_iv:
+            u_new_iv = fwd_iv.u_hold - open_cost
     fails = sorted(flags)
     if max_loss is not None and max(g.worst_loss(), stress) > max_loss:
         fails.append("over max_loss")
@@ -180,6 +200,7 @@ def evaluate(
         fwd.es if fwd else None,
         fwd.u_hold - open_cost if fwd else None,  # forward counts the later exit
         tuple(fails),
+        u_new_iv,
     )
 
 

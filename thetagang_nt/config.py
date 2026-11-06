@@ -395,6 +395,12 @@ class PMConfig(NautilusConfig, frozen=True):
     roll_strike_tolerance: float = 0.03  # [M13] nearest listed strike within this
     vix_roll_dte: tuple[int, ...] = (30, 45, 60)  # [V1] VIX: the 30-60 day target
     roll_margin: float = 10.0  # [M7] epsilon, $: a roll must beat HOLD by this
+    # the joint price and IV history model, reported beside the IV-unchanged one
+    iv_model: bool = True  # false: no IV history requests
+    iv_window: int = 252  # [M8] trading days today's IV is ranked against
+    iv_min_samples: int = 30  # [M8] fewer in today's third: use all of history
+    iv_view_shrink: float = 0.5  # [M8] share of the expected IV change kept
+    iv_term_days: int = 30  # [M3] a leg moves by sqrt(this / DTE) of an IV change
     realized_vol_days: int = 21  # [M6] daily returns behind the realised-vol forecast
     # Short Options Manager (strategies opened for a credit), short_exit_signals
     capture_levels: tuple[float, ...] = (0.5, 0.7, 0.8, 0.9)  # [S1] credit captured
@@ -476,6 +482,16 @@ class PMConfig(NautilusConfig, frozen=True):
             strike_tolerance=self.roll_strike_tolerance,
             vix_dte=tuple(self.vix_roll_dte),
             margin=self.roll_margin,
+        )
+
+    def iv_limits(self) -> Any:
+        from thetagang_nt.pm.core.iv_model import IvLimits
+
+        return IvLimits(
+            window=self.iv_window,
+            min_samples=self.iv_min_samples,
+            shrink=self.iv_view_shrink,
+            term_days=self.iv_term_days,
         )
 
     def quality(self) -> Any:
@@ -561,6 +577,11 @@ class PMConfig(NautilusConfig, frozen=True):
             ("roll_strike_tolerance", "M13", "nearest listed strike within this"),
             ("vix_roll_dte", "V1", "long VIX: roll target DTEs"),
             ("roll_margin", "M7", "a roll must beat HOLD by more than this, $"),
+            ("iv_model", "", "load IV history for the joint price and IV model"),
+            ("iv_window", "M8", "trading days today's IV is ranked against"),
+            ("iv_min_samples", "M8", "fewer in today's third: use all of history"),
+            ("iv_view_shrink", "M8", "share of the expected IV change kept"),
+            ("iv_term_days", "M3", "a leg moves by sqrt(this / DTE) of an IV change"),
             (
                 "realized_vol_days",
                 "M6",

@@ -161,6 +161,54 @@ def _value(
     return total
 
 
+def _priced(legs: tuple[Leg, ...], greeks: dict[Any, Any]) -> list[_Priced] | None:
+    """Each leg with its own underlying and implied vol; None if one is missing."""
+    priced = []
+    front_expiry = min(p.expiry for p in legs if p.expiry)
+    for p in legs:
+        g = greeks.get(p.instrument_id)
+        und, vol = getattr(g, "underlying", None), getattr(g, "vol", None)
+        if not und or not vol or not p.is_option:
+            return None
+        priced.append(_Priced(p, und, vol, p.expiry == front_expiry))
+    return priced
+
+
+def repriced(
+    legs: tuple[Leg, ...],
+    greeks: dict[Any, Any],
+    today: date,
+    carry: float,
+    samples: tuple[tuple[float, float], ...],
+    h: int,
+    term_days: int,
+) -> list[float] | None:
+    """P&L ($) of each (return, IV change) sample after h trading days, against
+    the same model baseline as the grid. The IV change is for term_days to
+    expiry; a longer-dated leg moves by sqrt(term_days / DTE) of it (M3)."""
+    priced = _priced(legs, greeks)
+    if priced is None:
+        return None
+    v_model = _value(priced, today, 0, lambda p: 0.0, lambda p: 0.0, carry)
+    days = calendar_days(today, h)
+
+    def share(p: _Priced) -> float:
+        return min(1.0, math.sqrt(term_days / max(p.leg.dte(today), 1)))
+
+    return [
+        _value(
+            priced,
+            today,
+            days,
+            lambda p, r=r: r,
+            lambda p, c=c: c * 100 * share(p),
+            carry,
+        )
+        - v_model
+        for r, c in samples
+    ]
+
+
 def grid(
     legs: tuple[Leg, ...],
     greeks: dict[Any, Any],
@@ -172,14 +220,9 @@ def grid(
     """The 3 horizons x price x IV grid, both families, and the stress
     scenarios; None if a leg has no underlying price or implied vol. Each leg
     moves on its own underlying (a VIX option on its own future)."""
-    priced = []
-    front_expiry = min(p.expiry for p in legs if p.expiry)
-    for p in legs:
-        g = greeks.get(p.instrument_id)
-        und, vol = getattr(g, "underlying", None), getattr(g, "vol", None)
-        if not und or not vol or not p.is_option:
-            return None
-        priced.append(_Priced(p, und, vol, p.expiry == front_expiry))
+    priced = _priced(legs, greeks)
+    if priced is None:
+        return None
     v_model = _value(priced, today, 0, lambda p: 0.0, lambda p: 0.0, carry)
 
     def pnl(days: int, move: Any, iv: Any) -> float:

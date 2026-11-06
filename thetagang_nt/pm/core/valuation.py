@@ -81,15 +81,22 @@ def forward(
     contracts: float,
     capital_at_risk: float,
     lim: UtilityLimits = UtilityLimits(),
+    pnls: list[float] | None = None,
 ) -> Forward | None:
     """U_hold = E - lambda ES - C - kappa CaR h/252 and U_close = -C_close
     (roll_rules), with C_close the half-spread crossing plus commissions;
-    holding pays the same exit cost later. None without the vol-scaled family."""
+    holding pays the same exit cost later. `pnls`: equally likely P&Ls from the
+    joint model (iv_model); else the vol-scaled nodes with IV unchanged. None
+    without either."""
     h = lim.horizon
-    probs = node_probabilities(tuple(sorted({k[1] for k in g.scaled if k[0] == h})))
-    if not probs:
-        return None
-    outcomes = [(p, g.scaled[(h, z, 0)]) for z, p in probs.items()]
+    if pnls:
+        outcomes = [(1 / len(pnls), x) for x in pnls]
+    else:
+        nodes = {k[1] for k in g.scaled if k[0] == h}
+        probs = node_probabilities(tuple(sorted(nodes)))
+        if not probs:
+            return None
+        outcomes = [(p, g.scaled[(h, z, 0)]) for z, p in probs.items()]
     e = sum(p * x for p, x in outcomes)
     es = expected_shortfall(outcomes, lim.alpha)
     c_close = liquidity_cost + abs(contracts) * lim.commission

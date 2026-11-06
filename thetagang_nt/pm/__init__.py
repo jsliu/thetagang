@@ -26,6 +26,7 @@ long_options and short_options import core, never each other.
                      stress_testing
       valuation      expected_pnl,             E[P&L], ES, HOLD and CLOSE
                      risk_metrics, roll_rules  utilities (Phase 2)
+      iv_model       expected_pnl (M8)         joint price and IV history samples
       rolls          roll_rules,               roll candidates, each as a new
                      transaction_costs         trade; HOLD / CLOSE / ROLL view
     long_options/    Long Options Manager (vault: long_options_manager)

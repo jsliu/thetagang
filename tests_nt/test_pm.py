@@ -510,6 +510,9 @@ def test_the_monitor_sends_each_strategy_to_its_manager():
         _pm_cls={},
         _pm_last={},
         _rolls={},
+        _iv_hist={},
+        _iv_models={},
+        _iv_model_of=lambda *a: None,
         log=SimpleNamespace(warning=warnings.append),
     )
     f = _Families()
@@ -627,6 +630,9 @@ def test_a_default_risk_budget_applies_unless_a_strategy_sets_its_own():
             _pm_cls={},
             _pm_last={},
             _rolls={},
+            _iv_hist={},
+            _iv_models={},
+            _iv_model_of=lambda *a: None,
             log=SimpleNamespace(warning=print),
         )
         f = _Families()
@@ -728,6 +734,9 @@ def test_the_monitor_sends_vix_calls_to_the_vix_rules():
         _pm_cls={},
         _pm_last={},
         _rolls={},
+        _iv_hist={},
+        _iv_models={},
+        _iv_model_of=lambda *a: None,
         log=SimpleNamespace(warning=print),
     )
     f = _Families()
@@ -1263,3 +1272,167 @@ def test_iv_history_skips_legs_with_a_data_flag():
     quotes = {"g": Quote(2.0, 2.1), "w": Quote(1.0, 2.0), "n": Quote(1.0, 1.1)}
     (row,) = iv_rows((good, wide, none), g, quotes, NOW, QualityLimits())
     assert (row.contract, row.iv, row.underlying) == ("g", 0.31, 41.0)
+
+
+# ------------------------------------------------- phase 2: the joint IV model
+
+
+def iv_history(n=400):
+    """IV cycles between 0.2 and 0.4; the price falls when IV rises."""
+    import math
+
+    from thetagang_nt.pm.core.iv_model import IvHistory
+
+    ivs = [0.3 + 0.1 * math.sin(t / 15) for t in range(n)]
+    closes = [100 * math.exp(-0.5 * (x - 0.3) + 0.0005 * t) for t, x in enumerate(ivs)]
+    return IvHistory(tuple(closes), tuple(ivs))
+
+
+def test_iv_model_takes_no_price_view_and_matches_the_forecast():
+    import math
+    from statistics import fmean, pstdev
+
+    from thetagang_nt.pm.core.iv_model import IvLimits, build
+
+    m = build(iv_history(), 0.25, 5, IvLimits(shrink=1.0))
+    log_r = [math.log(1 + r) for r, _ in m.samples]
+    assert fmean(log_r) == pytest.approx(0.0, abs=1e-12)  # the upward drift is gone
+    assert pstdev(log_r) == pytest.approx(0.25 * math.sqrt(5 / 252))
+    # the link between price and IV survives: price down, IV up
+    from statistics import correlation
+
+    assert correlation(log_r, [c for _, c in m.samples]) < -0.5
+
+
+def test_iv_model_uses_todays_third_of_the_trailing_year_and_shrinks_the_view():
+    from statistics import fmean
+
+    from thetagang_nt.pm.core.iv_model import IvHistory, IvLimits, build
+
+    def sawtooth(n):
+        """IV climbs slowly for 40 days, then crashes: high IV falls, low IV rises."""
+        ivs = tuple(0.2 + 0.2 * (t % 40) / 40 for t in range(n))
+        return IvHistory(iv_history(n).closes, ivs)
+
+    high = sawtooth(400)  # the last day is the top of a climb
+    low = sawtooth(405)  # the last day is just after a crash
+    full = build(high, 0.25, 5, IvLimits(shrink=1.0))
+    assert full.rank > 2 / 3 and full.conditioned
+    assert full.view == pytest.approx(fmean(c for _, c in full.samples))
+    assert full.view < 0
+    assert build(low, 0.25, 5, IvLimits(shrink=1.0)).view > 0
+    # shrink keeps half the expected change, and only moves the mean
+    half = build(high, 0.25, 5, IvLimits(shrink=0.5))
+    assert half.view == pytest.approx(full.view / 2)
+    assert fmean(c for _, c in half.samples) == pytest.approx(full.view / 2)
+
+
+def test_iv_model_falls_back_or_gives_up_on_thin_data():
+    from thetagang_nt.pm.core.iv_model import IvHistory, IvLimits, build
+
+    short = iv_history(100)  # under a year: no rank, all of history
+    m = build(short, 0.25, 5)
+    assert m.rank is None and not m.conditioned and len(m.samples) == 95
+    # today's third too rare: all of history, not a handful of days
+    m = build(iv_history(), 0.25, 5, IvLimits(min_samples=10_000))
+    assert m is None or not m.conditioned
+    m = build(iv_history(), 0.25, 5, IvLimits(min_samples=300))
+    assert not m.conditioned and len(m.samples) == 395
+    assert build(iv_history(), None, 5) is None  # no forecast
+    assert build(IvHistory((100.0,) * 10, (0.2,) * 10), 0.25, 5) is None  # too short
+    flat = IvHistory((100.0,) * 100, (0.2,) * 100)
+    assert build(flat, 0.25, 5) is None  # no price moves to scale
+
+
+def test_repricing_samples_moves_long_dated_legs_less():
+    import math
+
+    from thetagang_nt.pm.core.efficiency import calendar_days
+    from thetagang_nt.pm.core.scenarios import RATE, bsm, repriced
+
+    far = TODAY + timedelta(days=120)
+    p, g = priced("c", "C", 100, 1, 100.0, 0.3, expiry=far)
+    d = calendar_days(TODAY, 5)
+    ((pnl),) = repriced((p,), {"c": g}, TODAY, RATE, ((0.02, 0.04),), 5, 30)
+    base = 100 * bsm(100, 100, 120 / 365, 0.3, True, RATE)
+    # 4 points at 30 days is sqrt(30/120) = half of that at 120 days: 2 points
+    moved = 100 * bsm(102, 100, (120 - d) / 365, 0.32, True, RATE)
+    assert pnl == pytest.approx(moved - base)
+    assert math.sqrt(30 / 120) == 0.5
+
+
+def test_forward_value_takes_equally_likely_pnls_from_the_joint_model():
+    from thetagang_nt.pm.core.scenarios import Grid
+    from thetagang_nt.pm.core.valuation import UtilityLimits, forward
+
+    lim = UtilityLimits(alpha=0.25, risk_aversion=0.0, capital_cost=0.0, commission=0.0)
+    fwd = forward(Grid(0.0, {}), 0.0, 1, 0.0, lim, pnls=[-100.0, 0.0, 50.0, 150.0])
+    assert fwd.e_pnl == pytest.approx(25.0)
+    assert fwd.es == pytest.approx(100.0)  # the worst quarter
+
+
+def test_the_monitor_reports_both_views_side_by_side():
+    pytest.importorskip("nautilus_trader")
+    pytest.importorskip("psycopg")
+    from thetagang_nt.config import PMConfig
+    from thetagang_nt.monitor import PortfolioMonitor, _Families
+    from thetagang_nt.pm.core.iv_model import build
+
+    legs = [leg("c", "C", 100, 1, avg=3.0)]
+    g = {"c": SimpleNamespace(**greeks().__dict__, underlying=100.0)}
+    (st,) = find_structures(legs)
+    entries = [("AA", 100.0, st, structure_figures(st, g, TODAY), "-")]
+    model = build(iv_history(), 0.3, 5)
+    closes = {TODAY - timedelta(days=i): 100.0 + (i % 3) for i in range(40)}
+    from thetagang_nt.portfolio import underlying_id
+
+    fake = SimpleNamespace(
+        _quote={"c": Quote(3.0, 3.1)}.get,
+        _pm_known={},
+        _journal=None,
+        _pm=PMConfig(),
+        _closes={underlying_id("AA"): closes},
+        _pm_cls={},
+        _pm_last={},
+        _rolls={},
+        _iv_model_of=lambda *a: model,
+        log=SimpleNamespace(warning=print),
+    )
+    f = _Families()
+    PortfolioMonitor._portfolio_manager(fake, f, entries, g, TODAY)
+    fields = {s.labels["field"]: s.value for s in f.by_name["pm"].samples}
+    assert {"e_pnl", "e_pnl_iv", "u_hold", "u_hold_iv", "iv_rank", "iv_view"} <= set(
+        fields
+    )
+    assert fields["e_pnl"] != fields["e_pnl_iv"]
+    (view,) = f.by_name["pm_view"].samples
+    assert view.labels["view_iv"] in ("HOLD", "CLOSE")
+    # the signals and the outcome are untouched: reported only
+    (info,) = f.by_name["pm_info"].samples
+    assert "iv" not in info.labels["signals"].lower().replace("divid", "")
+
+
+def test_a_roll_candidate_gets_a_utility_under_the_iv_model_too():
+    from dataclasses import replace
+
+    from thetagang_nt.pm.core.iv_model import build
+    from thetagang_nt.pm.core.quality import QualityLimits
+    from thetagang_nt.pm.core.rolls import compare, evaluate
+    from thetagang_nt.pm.core.scenarios import RATE, GridSpec
+    from thetagang_nt.pm.core.valuation import UtilityLimits
+
+    legs = (leg("l", "C", 100, 1), leg("s", "C", 105, -1))
+    g = {
+        "l": SimpleNamespace(**greeks(delta=0.5).__dict__, underlying=100.0),
+        "s": SimpleNamespace(**greeks(delta=0.3).__dict__, underlying=100.0),
+    }
+    quotes = {"l": Quote(4.0, 4.2), "s": Quote(1.9, 2.1)}
+    args = ("debit spread", legs, g, quotes, TODAY, NOW, RATE, 0.3, GridSpec())
+    rest = (UtilityLimits(commission=1.0), QualityLimits(), None)
+    without = evaluate(*args, *rest)
+    assert without.u_new_iv is None
+    c = evaluate(*args, *rest, build(iv_history(), 0.3, 5))
+    assert c.u_new_iv is not None and c.u_new_iv != c.u_new
+    assert c.u_new == without.u_new  # the IV-fixed figures don't change
+    # the comparison under the IV model reads u_new_iv
+    assert compare(-500.0, -20.0, [replace(c, u_new=c.u_new_iv)], 10.0).best is not None

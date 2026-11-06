@@ -11,7 +11,7 @@ from __future__ import annotations
 import asyncio
 import json
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, date, datetime, timedelta
 from typing import Any
 
@@ -30,6 +30,7 @@ from thetagang_nt.config import DiscretionaryConfig, MonitorConfig, PMConfig
 from thetagang_nt.ib_extra import AccountExtras
 from thetagang_nt.journal import IvRow, Journal, LegRow, StrategyRow
 from thetagang_nt.pm.core.assess import assess
+from thetagang_nt.pm.core.iv_model import IvHistory, IvModel, build
 from thetagang_nt.pm.core.profit import capture_ratio, value_bounds
 from thetagang_nt.pm.core.quality import Quote, leg_flags
 from thetagang_nt.pm.core.review import (
@@ -50,6 +51,7 @@ from thetagang_nt.pm.core.rolls import (
 )
 from thetagang_nt.pm.core.scenarios import RATE as SCENARIO_RATE
 from thetagang_nt.pm.core.scenarios import grid as scenario_grid
+from thetagang_nt.pm.core.scenarios import repriced
 from thetagang_nt.pm.core.strategy_id import Seen, auto_ids
 from thetagang_nt.pm.core.valuation import forward
 from thetagang_nt.pm.long_options import signals as long_options
@@ -193,6 +195,7 @@ class RollJob:
     initial_dte: int | None
     max_loss: float | None
     vix: bool
+    iv_model: IvModel | None = None
 
 
 @dataclass(frozen=True)
@@ -209,18 +212,24 @@ def publish_rolls(
     scan: RollScan | None,
     margin: float,
     now: datetime,
+    u_hold_iv: float | None = None,
 ) -> None:
     """HOLD / CLOSE / ROLL (roll_rules): the model's view of one strategy and
     its scanned candidates, compared with today's U_hold and U_close."""
     found = scan.candidates if scan else []
     choice = compare(u_hold, u_close, found, margin)
+    with_iv = compare(
+        u_hold_iv, u_close, [replace(c, u_new=c.u_new_iv) for c in found], margin
+    )
     f.set(
         "pm_view",
         "The model's HOLD / CLOSE / ROLL view (reported, not a signal)",
         1,
         strategy=sid,
         view=choice.view,
+        view_iv=with_iv.view,
         best=choice.best.label if choice.best else "-",
+        best_iv=with_iv.best.label if with_iv.best else "-",
         scanned="yes" if scan else "no",
     )
     if scan:
@@ -239,9 +248,11 @@ def publish_rolls(
             candidate=c.label,
             fails=", ".join(c.fails) or "-",
         )
-        u_roll = None
+        u_roll = u_roll_iv = None
         if c.u_new is not None and u_close is not None:
             u_roll = c.u_new + u_close
+        if c.u_new_iv is not None and u_close is not None:
+            u_roll_iv = c.u_new_iv + u_close
         for field, value in (
             ("net_open", c.net_open),
             ("open_cost", c.open_cost),
@@ -251,6 +262,13 @@ def publish_rolls(
             ("e_pnl", c.e_pnl),
             ("es", c.es),
             ("u_roll", u_roll),
+            ("u_roll_iv", u_roll_iv),
+            (
+                "roll_score_iv",
+                u_roll_iv - u_hold_iv
+                if u_roll_iv is not None and u_hold_iv is not None
+                else None,
+            ),
             (
                 "roll_score",
                 u_roll - u_hold if u_roll is not None and u_hold is not None else None,
@@ -366,6 +384,9 @@ class PortfolioMonitor(Actor):
         self._roll_jobs: dict[str, RollJob] = {}  # strategies to scan, this cycle
         self._rolls: dict[str, RollScan] = {}  # the last scan of each strategy
         self._roll_chain_day: dict[str, date] = {}  # chains loaded, per symbol
+        self._iv_hist: dict[str, IvHistory] = {}  # two years of closes and IVs
+        self._iv_day: dict[str, date] = {}  # when each was last requested
+        self._iv_models: dict[tuple[str, date], IvModel | None] = {}
 
     def on_start(self) -> None:
         if self.config.publish:
@@ -510,6 +531,8 @@ class PortfolioMonitor(Actor):
         self._snapshot.families = list(f.by_name.values())
         if self._pm.roll_scan:
             await self._scan_rolls(today)
+        if self._pm.iv_model:
+            await self._load_iv_history(symbols, today)
 
     async def _load_betas(self, symbols: list[str], today: date) -> None:
         start = self.clock.utc_now() - timedelta(days=365)
@@ -1050,6 +1073,8 @@ class PortfolioMonitor(Actor):
                     self._pm.utility_limits(),
                     self._pm.quality(),
                     job.max_loss,
+                    job.iv_model,
+                    self._pm.iv_limits(),
                 )
                 if c is not None:
                     found.append(c)
@@ -1057,6 +1082,37 @@ class PortfolioMonitor(Actor):
             self.log.warning(f"Roll scan of {sid} skipped: {e!r}")
         # recorded even when empty, so one bad strategy can't hog every cycle
         self._rolls[sid] = RollScan(now, found)
+
+    def _iv_model_of(
+        self, symbol: str, sigma_f: float | None, today: date
+    ) -> IvModel | None:
+        """Built once a day per underlying: its history and forecast barely move."""
+        key = (symbol, today)
+        if key not in self._iv_models:
+            history = self._iv_hist.get(symbol)
+            if history is None:
+                return None  # not requested yet: build when it arrives
+            self._iv_models[key] = build(
+                history, sigma_f, self._pm.utility_horizon, self._pm.iv_limits()
+            )
+        return self._iv_models[key]
+
+    async def _load_iv_history(self, symbols: set[str], today: date) -> None:
+        """One underlying per cycle, once a day: IB paces historical requests
+        (60 per 10 minutes). VIX options need a different model (M12)."""
+        if self._extras is None:
+            return
+        todo = sorted(s for s in symbols - {VIX_ROOT} if self._iv_day.get(s) != today)
+        if not todo:
+            return
+        symbol = todo[0]
+        self._iv_day[symbol] = today
+        try:
+            closes, ivs = await self._extras.iv_history(symbol)
+            self._iv_hist[symbol] = IvHistory(tuple(closes), tuple(ivs))
+            self._iv_models.pop((symbol, today), None)
+        except Exception as e:  # noqa: BLE001 - the dashboard never waits on it
+            self.log.warning(f"IV history of {symbol} not loaded: {e!r}")
 
     async def _load_roll_chain(
         self, symbol: str, targets: list[int], today: date
@@ -1206,6 +1262,27 @@ class PortfolioMonitor(Actor):
                 if grid and liquidity is not None and car is not None
                 else None
             )
+            # the joint price and IV model, beside the IV-unchanged one
+            iv_model = None if is_vix else self._iv_model_of(s, sigma_f, today)
+            fwd_iv = None
+            if iv_model and grid and liquidity is not None and car is not None:
+                pnls = repriced(
+                    st.legs,
+                    greeks,
+                    today,
+                    SCENARIO_RATE,
+                    iv_model.samples,
+                    utility.horizon,
+                    self._pm.iv_term_days,
+                )
+                fwd_iv = forward(
+                    grid,
+                    liquidity,
+                    sum(abs(p.qty) for p in st.legs),
+                    max(car, 0.0),
+                    utility,
+                    pnls=pnls,
+                )
             # LossBudget = max acceptable loss + min(0, unrealized P&L)
             max_loss = x.max_loss if x and x.max_loss is not None else self._pm.max_loss
             budget = (
@@ -1293,6 +1370,12 @@ class PortfolioMonitor(Actor):
                 ("rar", fwd.rar if fwd else None),
                 ("u_hold", fwd.u_hold if fwd else None),
                 ("u_close", fwd.u_close if fwd else None),
+                ("e_pnl_iv", fwd_iv.e_pnl if fwd_iv else None),
+                ("es_iv", fwd_iv.es if fwd_iv else None),
+                ("u_hold_iv", fwd_iv.u_hold if fwd_iv else None),
+                ("iv_rank", iv_model.rank if iv_model else None),
+                ("iv_view", iv_model.view * 100 if iv_model else None),
+                ("iv_samples", len(iv_model.samples) if iv_model else None),
                 ("wcl_1", grid.wcl(1) if grid else None),
                 ("wcl_5", grid.wcl(5) if grid else None),
                 ("wcl_10", grid.wcl(10) if grid else None),
@@ -1364,6 +1447,7 @@ class PortfolioMonitor(Actor):
                         initial_dte,
                         max_loss,
                         is_vix,
+                        iv_model,
                     )
             scan = self._rolls.get(sid)
             if scan and (now - scan.at) > 4 * rescan:
@@ -1376,6 +1460,7 @@ class PortfolioMonitor(Actor):
                 scan,
                 self._pm.roll_margin,
                 now,
+                fwd_iv.u_hold if fwd_iv else None,
             )
             key = (out, tuple((x.priority, x.name) for x in found))
             if self._pm_last.get(sid) != key:

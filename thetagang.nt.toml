@@ -252,6 +252,13 @@ weight = 0.0
 # roll_strike_tolerance = 0.03  # [M13] the nearest listed strike must be within this
 # vix_roll_dte = [30, 45, 60]   # [V1] long VIX: roll target DTEs
 # roll_margin = 10.0            # [M7] a roll must beat HOLD by more than this, $
+# The joint price and IV model, reported beside the IV-unchanged one. One underlying's
+# two years of IB bars per monitor cycle, once a day:
+# iv_model = true               # false: no IV history requests
+# iv_window = 252               # [M8] trading days today's IV is ranked against
+# iv_min_samples = 30           # [M8] fewer in today's third: use all of history
+# iv_view_shrink = 0.5          # [M8] share of the expected IV change kept
+# iv_term_days = 30             # [M3] a leg moves by sqrt(this / DTE) of an IV change
 # realized_vol_days = 21        # [M6] daily returns behind the realised-vol forecast
 # The settings above serve the Long Options Manager (strategies opened for a
 # debit; credit_levels [T2] is superseded by S1). Strategies opened for a credit

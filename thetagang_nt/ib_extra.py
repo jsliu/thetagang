@@ -13,7 +13,7 @@ import math
 import os
 from typing import Any
 
-from ib_async import IB, Contract
+from ib_async import IB, Contract, Index, Stock
 
 EXTRA_CLIENT_OFFSET = 100
 SUMMARY_TAGS = {
@@ -156,6 +156,28 @@ class AccountExtras:
         strategy names them (index roots also as "^VIX")."""
         symbols = {o["symbol"] for o in await self.open_orders()}
         return symbols | {f"^{s}" for s in symbols}
+
+    async def iv_history(self, symbol: str) -> tuple[list[float], list[float]]:
+        """Two years of daily (closes, implied vols), on the days both exist.
+        Nautilus's bars can't ask IB for implied vol; this connection can."""
+        await self.connect()
+        contract = (
+            Index(symbol[1:], "CBOE")
+            if symbol.startswith("^")
+            else Stock(symbol, "SMART", "USD")
+        )
+        await self.ib.qualifyContractsAsync(contract)
+
+        async def bars(what: str) -> dict[Any, float]:
+            got = await self.ib.reqHistoricalDataAsync(
+                contract, "", "2 Y", "1 day", what, True, 1, False, timeout=30
+            )
+            return {b.date: b.close for b in got}
+
+        ivs = await bars("OPTION_IMPLIED_VOLATILITY")
+        closes = await bars("TRADES")
+        days = sorted(ivs.keys() & closes.keys())
+        return [closes[d] for d in days], [ivs[d] for d in days]
 
     async def _learn(self, con_ids: Any) -> None:
         unknown = [c for c in con_ids if c not in self._labels]
