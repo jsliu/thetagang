@@ -15,6 +15,13 @@ def test_compute_beta():
     assert compute_beta({0: 1.0}, index) is None  # too little data
 
 
+def test_compute_beta_returns_none_for_constant_index_prices():
+    index = {day: 100.0 for day in range(20)}
+    stock = {day: 100.0 + day for day in range(20)}
+
+    assert compute_beta(stock, index) is None
+
+
 def test_bs_price_put_call_parity_and_stress():
     """With zero rates, call - put = spot - strike; short put loses more than linear."""
     from thetagang.risk import bs_price, scenario_pnl
@@ -30,6 +37,75 @@ def test_bs_price_put_call_parity_and_stress():
     down_flat = scenario_pnl([leg], -0.10, use_beta=False)  # stock -10%
     assert down_beta < down_flat < 0
     assert down_beta < 2 * down_flat  # convex: loss grows faster than the move
+
+
+@pytest.mark.parametrize(
+    ("spot", "strike", "years", "vol", "right", "expected"),
+    [
+        (110, 100, 0, 0.3, "C", 10),
+        (90, 100, 0, 0.3, "P", 10),
+        (110, 100, 0.5, 0, "C", 10),
+        (90, 100, 0.5, 0, "P", 10),
+    ],
+)
+def test_bs_price_returns_intrinsic_value_without_time_or_volatility(
+    spot, strike, years, vol, right, expected
+):
+    from thetagang.risk import bs_price
+
+    assert bs_price(spot, strike, years, vol, right) == pytest.approx(expected)
+
+
+@pytest.mark.parametrize("value", [float("nan"), float("inf"), -float("inf")])
+def test_bs_price_rejects_non_finite_inputs(value):
+    from thetagang.risk import bs_price
+
+    with pytest.raises(ValueError, match="must be finite"):
+        bs_price(value, 100, 0.5, 0.3, "C")
+
+
+def test_aggregate_book_golden_exposures_for_stock_and_short_option():
+    """Pin the signed position scaling and beta-weighted book totals."""
+    from types import SimpleNamespace
+
+    from ib_async import Option, PortfolioItem, Stock
+
+    from thetagang.risk import aggregate_book
+
+    stock = PortfolioItem(
+        Stock("AA", "SMART", "USD", conId=1), 100, 50, 0, 50, 0, 0, "A"
+    )
+    call = PortfolioItem(
+        Option("AA", "20991120", 55.0, "C", "SMART", "100", "USD", conId=2),
+        -1,
+        1,
+        0,
+        1,
+        0,
+        0,
+        "A",
+    )
+    greeks = {
+        2: SimpleNamespace(
+            delta=0.5,
+            gamma=0.02,
+            theta=-0.04,
+            vega=0.06,
+            undPrice=50.0,
+            impliedVol=0.3,
+        )
+    }
+
+    book = aggregate_book([stock, call], {"AA": 2.0}, greeks, spx_price=5000.0)
+
+    assert book.totals.plain_delta_dollars == pytest.approx(2500.0)
+    assert book.totals.delta_dollars == pytest.approx(5000.0)
+    assert book.totals.gamma == pytest.approx(-0.0008)
+    assert book.totals.theta == pytest.approx(4.0)
+    assert book.totals.vega == pytest.approx(-6.0)
+    assert book.by_symbol["AA"] == pytest.approx([2500.0, 5000.0])
+    assert book.legs[0] == (2.0, 100, 50)
+    assert book.legs[1][:4] == (2.0, -100.0, 50.0, 55.0)
 
 
 def test_scenario_pnl_survives_extreme_beta():

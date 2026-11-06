@@ -6,7 +6,7 @@ from dataclasses import dataclass, field
 from typing import Any, NamedTuple
 
 import numpy as np
-from ib_async import PortfolioItem, util
+from ib_async import PortfolioItem
 from rich.table import Table
 
 from thetagang.fmt import dfmt, ffmt, pfmt
@@ -23,7 +23,11 @@ def compute_beta(
         return None
     a = np.diff(np.log([closes[d] for d in dates]))
     b = np.diff(np.log([index_closes[d] for d in dates]))
-    return float(np.cov(a, b)[0][1] / np.var(b, ddof=1))
+    index_variance = np.var(b, ddof=1)
+    if not math.isfinite(index_variance) or index_variance <= 0:
+        return None
+    beta = float(np.cov(a, b)[0][1] / index_variance)
+    return beta if math.isfinite(beta) else None
 
 
 SCENARIO_MOVES = [-0.10, -0.05, 0.05, 0.10]
@@ -32,11 +36,31 @@ SCENARIO_MOVES = [-0.10, -0.05, 0.05, 0.10]
 def bs_price(spot: float, strike: float, years: float, vol: float, right: str) -> float:
     """Black-Scholes price per share, zero rate and dividends.
     ponytail: European, r=0; fine for stress deltas, not for pricing deep ITM American puts."""
+    inputs = (spot, strike, years, vol)
+    if not all(math.isfinite(float(value)) for value in inputs):
+        raise ValueError("Black-Scholes inputs must be finite")
+    spot, strike, years, vol = (float(value) for value in inputs)
+    if spot <= 0 or strike <= 0 or years < 0 or vol < 0:
+        raise ValueError(
+            "spot and strike must be positive; years and volatility nonnegative"
+        )
+    right = right.upper()
+    if not right.startswith(("C", "P")):
+        raise ValueError(f"unsupported option right: {right!r}")
+    if years == 0 or vol == 0:
+        intrinsic = max(spot - strike, 0.0)
+        return intrinsic if right.startswith("C") else max(strike - spot, 0.0)
+
     sd = vol * math.sqrt(years)
+    if not math.isfinite(sd) or sd == 0:
+        raise ValueError("volatility and time produce an unsupported numerical range")
     d1 = (math.log(spot / strike) + sd * sd / 2) / sd
     cdf = lambda x: 0.5 * (1 + math.erf(x / math.sqrt(2)))
     call = spot * cdf(d1) - strike * cdf(d1 - sd)
-    return call if right.upper().startswith("C") else call - spot + strike
+    price = call if right.startswith("C") else call - spot + strike
+    if not math.isfinite(price):
+        raise ValueError("Black-Scholes calculation produced a non-finite price")
+    return price
 
 
 def option_volga(g: Any, strike: float, years: float) -> float:
@@ -198,17 +222,52 @@ def is_debit_vertical(short: Any, long: Any) -> bool:
 
 def scenario_pnl(legs: list[tuple[Any, ...]], spx_move: float, use_beta: bool) -> float:
     """Estimated P&L if SPX moves by spx_move and each underlying by beta * spx_move."""
+    if not math.isfinite(spx_move):
+        raise ValueError("SPX move must be finite")
     total = 0.0
     for leg in legs:
         beta, size, spot = leg[0], leg[1], leg[2]
+        try:
+            finite_position = all(
+                math.isfinite(float(value)) for value in (beta, size, spot)
+            )
+        except (TypeError, ValueError, OverflowError):
+            finite_position = False
+        if not finite_position:
+            raise ValueError("scenario beta, size, and spot must be finite")
+        beta, size, spot = float(beta), float(size), float(spot)
+        if spot <= 0:
+            raise ValueError("scenario spot must be positive")
         # a stock can't fall more than 100% (thin-history betas can imply that)
         move = max(spx_move * (beta if use_beta else 1.0), -0.99)
         if len(leg) == 3:  # stock
             total += size * spot * move
             continue
         strike, years, vol, right, delta, gamma = leg[3:]
+        try:
+            finite_option = all(
+                math.isfinite(float(value)) for value in (strike, years, delta, gamma)
+            )
+        except (TypeError, ValueError, OverflowError):
+            finite_option = False
+        if not finite_option:
+            raise ValueError("option scenario inputs must be finite")
+        strike, years, delta, gamma = (
+            float(strike),
+            float(years),
+            float(delta),
+            float(gamma),
+        )
+        if strike <= 0 or years < 0:
+            raise ValueError("option strike must be positive and years nonnegative")
         d_spot = spot * move
-        if vol and not util.isNan(vol) and vol > 0:
+        try:
+            finite_vol = math.isfinite(float(vol))
+        except (TypeError, ValueError, OverflowError):
+            finite_vol = False
+        if finite_vol:
+            vol = float(vol)
+        if finite_vol and vol > 0:
             new = bs_price(spot + d_spot, strike, years, vol, right)
             total += size * (new - bs_price(spot, strike, years, vol, right))
         else:  # no implied vol: delta-gamma approximation
@@ -245,8 +304,13 @@ def valid_greeks(g: Any) -> bool:
     """IB model greeks with every field the risk math needs."""
     if g is None:
         return False
-    values = (g.delta, g.gamma, g.theta, g.vega, g.undPrice)
-    return all(v is not None and not util.isNan(v) for v in values)
+    try:
+        values = (g.delta, g.gamma, g.theta, g.vega, g.undPrice)
+        return all(
+            value is not None and math.isfinite(float(value)) for value in values
+        )
+    except (AttributeError, TypeError, ValueError, OverflowError):
+        return False
 
 
 def contract_greeks(

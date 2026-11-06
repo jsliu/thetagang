@@ -811,6 +811,27 @@ def test_structures_are_recognised_and_figured_as_one_position() -> None:
     )
 
 
+def test_put_credit_spread_golden_value_pnl_and_expiry_risk() -> None:
+    """A two-lot credit vertical keeps short/long legs signed through valuation."""
+    from thetagang_nt.rules import find_structures, structure_figures
+
+    spread = [
+        opt("P", 40, -2, 3.0, 4.0),
+        opt("P", 35, 2, 1.0, 0.5),
+    ]
+    (structure,) = find_structures(spread)
+    figures = structure_figures(structure, {}, TODAY)
+
+    assert structure.kind == "credit spread"
+    assert figures.qty == 2
+    assert figures.cost == pytest.approx(-400.0)  # $400 received to open
+    assert figures.value == pytest.approx(-700.0)  # $700 to close at mid
+    assert figures.pnl == pytest.approx(-300.0)
+    assert figures.max_profit == pytest.approx(400.0)
+    assert figures.max_loss == pytest.approx(-600.0)
+    assert figures.breakevens == pytest.approx((38.0,))
+
+
 def test_structure_recommendations_follow_their_kind() -> None:
     from datetime import timedelta
 
