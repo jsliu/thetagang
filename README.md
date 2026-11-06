@@ -449,7 +449,12 @@ The **journal** (Postgres, the `journal-db` service) keeps the strategies and
 their legs (opened and closed), one snapshot per strategy per day, a
 decision-log row whenever a strategy's outcome or signals change, and each held
 option's implied vol per day (`iv_history`, legs with a data flag skipped): the
-history an IV-change distribution will need. Positions
+history an IV-change distribution will need. It is also the **forward test**
+(`forecasts`, `leg_marks`, `roll_forecasts`): what the model said each day, the
+day's last good quotes, and bid and ask on every leg, kept before the outcome is
+known. The `forecast_results` view compares each forecast with the same legs 5
+recorded days later; the Portfolio Manager dashboard shows it by view. IB has no
+daily or expired option bars, so a real backtest needs bought data (Phase 3). Positions
 held before the journal started have an estimated entry date. Grafana reads
 it with a read-only login. Both passwords live in `deploy/.env` (git-ignored):
 

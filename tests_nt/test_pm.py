@@ -1980,3 +1980,86 @@ def test_no_bid_legs_skip_the_iv_sanity_check():
     assert "implausible IV" in leg_flags(
         short, Quote(0.5, 0.6, NOW), greeks(vol=9.0), NOW
     )
+
+
+# ----------------------------------------------------------- the forward test
+
+
+def test_the_monitor_records_the_forward_test_only_on_good_quotes():
+    pytest.importorskip("nautilus_trader")
+    pytest.importorskip("psycopg")
+    from thetagang_nt.config import PMConfig
+    from thetagang_nt.monitor import (
+        PortfolioMonitor,
+        RollScan,
+        _Families,
+        reliable_for_the_day,
+    )
+
+    assert reliable_for_the_day(())
+    assert reliable_for_the_day(("AA 40C: zero bid",))
+    assert not reliable_for_the_day(("AA 40C: stale quote",))
+    assert not reliable_for_the_day(("AA 40C: missing quote", "AA 40C: no greeks"))
+
+    p = leg("c", "C", 100, 1, avg=3.0)
+    g = {"c": SimpleNamespace(**greeks().__dict__, underlying=100.0)}
+    (st,) = find_structures([p])
+    entries = [("AA", 100.0, st, structure_figures(st, g, TODAY), "-")]
+    written = {}
+
+    class Journal:
+        def known(self, _today):
+            return {}
+
+        def entry(self, _ids):
+            return {}
+
+        def record(self, *a):
+            pass
+
+        def decide(self, *a):
+            pass
+
+        def record_iv(self, *a):
+            pass
+
+        def record_forecasts(self, forecasts, marks, rolls, today, now):
+            written.update(forecasts=forecasts, marks=marks, rolls=rolls)
+
+    candidate = roll_candidate()
+
+    def run(quote, scan_at):
+        now = datetime.now(timezone.utc)
+        fake = SimpleNamespace(
+            _quote=lambda _iid: quote,
+            _pm_known={},
+            _journal=Journal(),
+            _pm=PMConfig(),
+            _closes={},
+            _pm_cls={},
+            _pm_last={},
+            _rolls={"AA-long-call-1": RollScan(scan_at or now, [candidate])},
+            _smiles={},
+            _dividends={},
+            _iv_model_of=lambda *a: None,
+            _price_model_of=lambda *a: None,
+            log=SimpleNamespace(warning=print),
+        )
+        PortfolioMonitor._portfolio_manager(fake, _Families(), entries, g, now.date())
+
+    run(Quote(3.0, 3.1, datetime.now(timezone.utc)), None)
+    (row,) = written["forecasts"]
+    assert row.strategy_id == "AA-long-call-1" and row.legs_key == "c:1"
+    assert row.v_exec == pytest.approx(300.0) and row.wcl_5 is not None
+    assert row.view in ("HOLD", "CLOSE", "-")
+    (mark,) = written["marks"]
+    assert (mark.bid, mark.ask, mark.underlying) == (3.0, 3.1, 100.0)
+    assert written["rolls"][0].candidate == candidate.label
+
+    # after the close: stale quotes don't overwrite the day's forecast
+    old = datetime.now(timezone.utc) - timedelta(hours=1)
+    run(Quote(3.0, 3.1, old), None)
+    assert written["forecasts"] == []
+    # yesterday's scan isn't today's candidate
+    run(Quote(3.0, 3.1, datetime.now(timezone.utc)), old - timedelta(days=2))
+    assert written["rolls"] == []

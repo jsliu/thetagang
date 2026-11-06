@@ -10,7 +10,7 @@ existed get today as an estimated entry date and their IB cost as net debit."""
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass
+from dataclasses import astuple, dataclass, fields
 from datetime import date, datetime, timedelta
 from typing import Any
 
@@ -90,6 +90,72 @@ CREATE TABLE IF NOT EXISTS iv_history (    -- for the IV-change distribution (M8
     underlying numeric NOT NULL,           -- spot, or the VIX option's future
     PRIMARY KEY (contract, day)
 );
+-- the forward test (historical_replay): what the model said each day, kept
+-- before the outcome is known; forecast_results compares it with what happened
+CREATE TABLE IF NOT EXISTS forecasts (
+    strategy_id text NOT NULL,
+    day date NOT NULL,
+    at timestamptz NOT NULL,               -- the last good quotes that day
+    legs_key text NOT NULL,                -- a roll or resize starts a new series
+    horizon integer NOT NULL,              -- trading days of the expectation
+    outcome text NOT NULL,
+    view text NOT NULL,                    -- HOLD | CLOSE | ROLL | - (IV fixed)
+    view_iv text NOT NULL,                 -- the same under the IV history model
+    v_mid numeric NOT NULL,
+    v_exec numeric NOT NULL,
+    v_model numeric,
+    e_pnl numeric, es numeric,
+    e_pnl_iv numeric, es_iv numeric,
+    u_hold numeric, u_hold_iv numeric, u_close numeric,
+    wcl_5 numeric, wcl_10 numeric, stress_loss numeric, loss_budget numeric,
+    iv_rank numeric, iv_view numeric, sticky_gap numeric,
+    american boolean NOT NULL,
+    PRIMARY KEY (strategy_id, day)
+);
+CREATE TABLE IF NOT EXISTS leg_marks (     -- every held leg, wide or not
+    contract text NOT NULL,
+    day date NOT NULL,
+    at timestamptz NOT NULL,
+    strategy_id text NOT NULL,
+    qty numeric NOT NULL,
+    bid numeric,                           -- 0: no bid
+    ask numeric,
+    underlying numeric,
+    iv numeric,
+    PRIMARY KEY (contract, day)
+);
+CREATE TABLE IF NOT EXISTS roll_forecasts (
+    strategy_id text NOT NULL,
+    candidate text NOT NULL,
+    day date NOT NULL,
+    at timestamptz NOT NULL,               -- when it was quoted
+    net_open numeric NOT NULL,
+    open_cost numeric NOT NULL,
+    wcl_5 numeric, wcl_10 numeric, stress_loss numeric,
+    e_pnl numeric, es numeric,
+    u_new numeric, u_new_iv numeric,
+    fails text NOT NULL,
+    legs jsonb NOT NULL,                   -- contract, qty, entry price per leg
+    PRIMARY KEY (strategy_id, candidate, day)
+);
+-- a forecast and its result h recorded days later, on unchanged legs. A strategy
+-- that closes or expires before then has no later row, so it is not in here.
+CREATE OR REPLACE VIEW forecast_results AS
+SELECT strategy_id, day, later_day, horizon, outcome, view, view_iv, v_mid, v_exec,
+       e_pnl, es, e_pnl_iv, es_iv, wcl_5, stress_loss,
+       later_mid - v_mid AS realised_mid,
+       later_exec - v_exec AS realised_exec,
+       v_mid - later_mid >= COALESCE(wcl_5, 0) AS beyond_wcl
+FROM (
+    SELECT f.*,
+           lead(day, 5) OVER w AS later_day,
+           lead(v_mid, 5) OVER w AS later_mid,
+           lead(v_exec, 5) OVER w AS later_exec
+    FROM forecasts f
+    WHERE horizon = 5
+    WINDOW w AS (PARTITION BY strategy_id, legs_key ORDER BY day)
+) x
+WHERE later_day IS NOT NULL AND later_day - day <= 10;
 """
 
 RECENT_DAYS = (
@@ -130,6 +196,65 @@ class IvRow:
     right: str
     iv: float
     underlying: float
+
+
+@dataclass(frozen=True)
+class ForecastRow:
+    """Column for column, the forecasts table, without day and at."""
+
+    strategy_id: str
+    legs_key: str
+    horizon: int
+    outcome: str
+    view: str
+    view_iv: str
+    v_mid: float
+    v_exec: float
+    v_model: float | None
+    e_pnl: float | None
+    es: float | None
+    e_pnl_iv: float | None
+    es_iv: float | None
+    u_hold: float | None
+    u_hold_iv: float | None
+    u_close: float | None
+    wcl_5: float | None
+    wcl_10: float | None
+    stress_loss: float | None
+    loss_budget: float | None
+    iv_rank: float | None
+    iv_view: float | None
+    sticky_gap: float | None
+    american: bool
+
+
+@dataclass(frozen=True)
+class LegMark:
+    contract: str
+    strategy_id: str
+    qty: float
+    bid: float | None
+    ask: float | None
+    underlying: float | None
+    iv: float | None
+
+
+@dataclass(frozen=True)
+class RollForecast:
+    strategy_id: str
+    candidate: str
+    at: datetime
+    net_open: float
+    open_cost: float
+    wcl_5: float | None
+    wcl_10: float | None
+    stress_loss: float | None
+    e_pnl: float | None
+    es: float | None
+    u_new: float | None
+    u_new_iv: float | None
+    fails: str
+    legs: list[dict[str, Any]]
 
 
 class Journal:
@@ -297,6 +422,84 @@ class Journal:
                         x.thesis_valid,
                         now,
                         sid,
+                    ),
+                )
+
+    def record_forecasts(
+        self,
+        forecasts: list[ForecastRow],
+        marks: list[LegMark],
+        rolls: list[RollForecast],
+        today: date,
+        now: datetime,
+    ) -> None:
+        """The forward test, overwritten through the day: the last good values
+        stand for the day, so nothing is changed once the day is over."""
+        conn = self._db()
+        names = [f.name for f in fields(ForecastRow)]
+        insert = sql.SQL(
+            "INSERT INTO forecasts ({}, day, at) VALUES ({}, %s, %s)"
+            " ON CONFLICT (strategy_id, day) DO UPDATE SET {}, at = EXCLUDED.at"
+        ).format(
+            sql.SQL(", ").join(map(sql.Identifier, names)),
+            sql.SQL(", ").join(sql.Placeholder() * len(names)),
+            sql.SQL(", ").join(
+                sql.SQL("{0} = EXCLUDED.{0}").format(sql.Identifier(n))
+                for n in names
+                if n != "strategy_id"
+            ),
+        )
+        with conn.transaction():
+            for r in forecasts:
+                conn.execute(insert, (*astuple(r), today, now))
+            for m in marks:
+                conn.execute(
+                    """
+                    INSERT INTO leg_marks (contract, day, at, strategy_id, qty, bid,
+                        ask, underlying, iv)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    ON CONFLICT (contract, day) DO UPDATE SET at = EXCLUDED.at,
+                        strategy_id = EXCLUDED.strategy_id, qty = EXCLUDED.qty,
+                        bid = EXCLUDED.bid, ask = EXCLUDED.ask,
+                        underlying = EXCLUDED.underlying, iv = EXCLUDED.iv
+                    """,
+                    (
+                        m.contract,
+                        today,
+                        now,
+                        m.strategy_id,
+                        m.qty,
+                        m.bid,
+                        m.ask,
+                        m.underlying,
+                        m.iv,
+                    ),
+                )
+            for c in rolls:
+                conn.execute(
+                    """
+                    INSERT INTO roll_forecasts (strategy_id, candidate, day, at,
+                        net_open, open_cost, wcl_5, wcl_10, stress_loss, e_pnl, es,
+                        u_new, u_new_iv, fails, legs)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    ON CONFLICT (strategy_id, candidate, day) DO NOTHING
+                    """,
+                    (
+                        c.strategy_id,
+                        c.candidate,
+                        today,
+                        c.at,
+                        c.net_open,
+                        c.open_cost,
+                        c.wcl_5,
+                        c.wcl_10,
+                        c.stress_loss,
+                        c.e_pnl,
+                        c.es,
+                        c.u_new,
+                        c.u_new_iv,
+                        c.fails,
+                        json.dumps(c.legs),
                     ),
                 )
 

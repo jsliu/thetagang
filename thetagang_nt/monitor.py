@@ -28,7 +28,15 @@ from prometheus_client.core import GaugeMetricFamily
 from thetagang_nt import aio
 from thetagang_nt.config import DiscretionaryConfig, MonitorConfig, PMConfig
 from thetagang_nt.ib_extra import AccountExtras
-from thetagang_nt.journal import IvRow, Journal, LegRow, StrategyRow
+from thetagang_nt.journal import (
+    ForecastRow,
+    IvRow,
+    Journal,
+    LegMark,
+    LegRow,
+    RollForecast,
+    StrategyRow,
+)
 from thetagang_nt.pm.core.american import schedule
 from thetagang_nt.pm.core.assess import assess
 from thetagang_nt.pm.core.iv_model import IvHistory, IvModel, build
@@ -247,7 +255,7 @@ def publish_rolls(
     margin: float,
     now: datetime,
     u_hold_iv: float | None = None,
-) -> None:
+) -> tuple[str, str]:
     """HOLD / CLOSE / ROLL (roll_rules): the model's view of one strategy and
     its scanned candidates, compared with today's U_hold and U_close."""
     found = scan.candidates if scan else []
@@ -317,6 +325,38 @@ def publish_rolls(
                     candidate=c.label,
                     field=field,
                 )
+    return choice.view, with_iv.view
+
+
+def reliable_for_the_day(flags: tuple[str, ...]) -> bool:
+    """The forward test keeps the day's last good values: after the close quotes
+    go stale or vanish, and those must not overwrite them. A zero bid is real."""
+    return not any("stale" in x or "missing" in x or "no greeks" in x for x in flags)
+
+
+def roll_forecasts(sid: str, scan: RollScan) -> list[RollForecast]:
+    return [
+        RollForecast(
+            sid,
+            c.label,
+            scan.at,
+            c.net_open,
+            c.open_cost,
+            c.wcl.get(5),
+            c.wcl.get(10),
+            c.stress_loss,
+            c.e_pnl,
+            c.es,
+            c.u_new,
+            c.u_new_iv,
+            ", ".join(c.fails) or "-",
+            [
+                {"contract": str(p.instrument_id), "qty": p.qty, "price": p.avg_px}
+                for p in c.legs
+            ],
+        )
+        for c in scan.candidates
+    ]
 
 
 class _Snapshot:
@@ -1398,6 +1438,9 @@ class PortfolioMonitor(Actor):
         utility = self._pm.utility_limits()
         jobs: dict[str, RollJob] = {}
         ivs: list[IvRow] = []
+        forecasts: list[ForecastRow] = []
+        marks: list[LegMark] = []
+        roll_rows: list[RollForecast] = []
         rescan = timedelta(minutes=self._pm.roll_rescan_mins)
         rows, decisions, counts = [], [], dict.fromkeys((P0, P1, P2), 0)
         for sid, (s, und, st, fig, bot) in zip(ids, entries, strict=True):
@@ -1694,7 +1737,7 @@ class PortfolioMonitor(Actor):
             scan = self._rolls.get(sid)
             if scan and (now - scan.at) > 4 * rescan:
                 scan = None  # e.g. yesterday's quotes: not worth showing
-            publish_rolls(
+            view, view_iv = publish_rolls(
                 f,
                 sid,
                 fwd.u_hold if fwd else None,
@@ -1710,6 +1753,59 @@ class PortfolioMonitor(Actor):
                 self._pm_last[sid] = key
             self._pm_cls[sid] = a.cls
             ivs += iv_rows(st.legs, greeks, quotes, now, quality)
+            for p in st.legs:
+                q = quotes.get(p.instrument_id)
+                leg_g = greeks.get(p.instrument_id)
+                if q is not None and q.ask is not None:
+                    marks.append(
+                        LegMark(
+                            str(p.instrument_id),
+                            sid,
+                            p.qty,
+                            q.bid,
+                            q.ask,
+                            getattr(leg_g, "underlying", None),
+                            getattr(leg_g, "vol", None),
+                        )
+                    )
+            if scan and scan.at.date() == today:
+                roll_rows += roll_forecasts(sid, scan)
+            if (
+                a.v_mid is not None
+                and a.v_exec is not None
+                and grid
+                and reliable_for_the_day(a.flags)
+            ):
+                forecasts.append(
+                    ForecastRow(
+                        sid,
+                        "|".join(
+                            sorted(f"{p.instrument_id}:{p.qty:g}" for p in st.legs)
+                        ),
+                        utility.horizon,
+                        out,
+                        view,
+                        view_iv,
+                        a.v_mid,
+                        a.v_exec,
+                        grid.v_model,
+                        fwd.e_pnl if fwd else None,
+                        fwd.es if fwd else None,
+                        fwd_iv.e_pnl if fwd_iv else None,
+                        fwd_iv.es if fwd_iv else None,
+                        fwd.u_hold if fwd else None,
+                        fwd_iv.u_hold if fwd_iv else None,
+                        fwd.u_close if fwd else None,
+                        grid.wcl(5),
+                        grid.wcl(10),
+                        stress,
+                        budget,
+                        iv_model.rank if iv_model else None,
+                        iv_model.view * 100 if iv_model else None,
+                        max(sticky[0].values(), key=abs) if sticky else None,
+                        price_model is not None,
+                    )
+                )
             legs = tuple(
                 LegRow(
                     str(p.instrument_id), option_label(p), p.qty, p.multiplier, p.avg_px
@@ -1743,6 +1839,7 @@ class PortfolioMonitor(Actor):
             try:
                 self._journal.record(rows, inputs, today, now)
                 self._journal.record_iv(ivs, today, now)
+                self._journal.record_forecasts(forecasts, marks, roll_rows, today, now)
                 if decisions:
                     self._journal.decide(decisions, now)
             except Exception as e:  # noqa: BLE001 - the dashboard never depends on it

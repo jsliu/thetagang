@@ -3,7 +3,7 @@ Skipped unless JOURNAL_TEST_DSN is set, e.g. from deploy/:
   docker compose exec journal-db createdb -U thetagang thetagang_test"""
 
 import os
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta
 from types import SimpleNamespace
 
 import pytest
@@ -53,7 +53,9 @@ def cycle(journal, day, structures, inputs=None):
 def journal():
     j = Journal(DSN)
     db = j._db()
-    db.execute("TRUNCATE decisions, snapshots, strategy_legs, strategies, iv_history")
+    db.execute(
+        "TRUNCATE decisions, snapshots, strategy_legs, strategies, iv_history, forecasts, leg_marks, roll_forecasts"
+    )
     yield j
     j.close()
 
@@ -134,3 +136,119 @@ def test_iv_history_keeps_one_row_per_contract_per_day_the_latest(journal):
     journal.record_iv([iv(0.35)], DAY2, at)
     rows = db.execute("SELECT day, iv FROM iv_history ORDER BY day").fetchall()
     assert [(d, float(v)) for d, v in rows] == [(DAY1, 0.32), (DAY2, 0.35)]
+
+
+def forecast(
+    sid="AA-debit-spread-1", legs="c1:1|c2:-1", v_mid=200.0, v_exec=180.0, view="CLOSE"
+):
+    from thetagang_nt.journal import ForecastRow
+
+    return ForecastRow(
+        sid,
+        legs,
+        5,
+        "REVIEW",
+        view,
+        "HOLD",
+        v_mid,
+        v_exec,
+        201.0,
+        3.0,
+        40.0,
+        2.0,
+        45.0,
+        -30.0,
+        -32.0,
+        -20.0,
+        60.0,
+        90.0,
+        120.0,
+        2000.0,
+        0.8,
+        -1.0,
+        12.0,
+        True,
+    )
+
+
+def days_after(start, n):
+    """n weekdays from start, as the market would see them."""
+    out, d = [], start
+    while len(out) < n:
+        if d.weekday() < 5:
+            out.append(d)
+        d += timedelta(days=1)
+    return out
+
+
+def test_forecasts_overwrite_within_a_day_and_results_wait_five_days(journal):
+    db = journal._db()
+    days = days_after(DAY1, 7)
+    at = datetime.combine(DAY1, datetime.min.time(), UTC)
+    journal.record_forecasts([forecast(v_mid=150.0)], [], [], days[0], at)
+    journal.record_forecasts([forecast(v_mid=200.0)], [], [], days[0], at)
+    assert db.execute("SELECT count(*) FROM forecasts").fetchone()[0] == 1
+    assert db.execute("SELECT count(*) FROM forecast_results").fetchone()[0] == 0
+    for i, d in enumerate(days[1:], start=1):
+        row = forecast(v_mid=200.0 + 10 * i, v_exec=180.0 + 10 * i)
+        journal.record_forecasts([row], [], [], d, at)
+    rows = db.execute(
+        "SELECT day, later_day, realised_mid, realised_exec, e_pnl, view"
+        " FROM forecast_results ORDER BY day"
+    ).fetchall()
+    assert len(rows) == 2  # days 1 and 2 of 7 have a result five days on
+    day, later, mid, exe, e, view = rows[0]
+    assert (day, later) == (days[0], days[5])
+    assert float(mid) == 50.0 and float(exe) == 50.0
+    assert float(e) == 3.0 and view == "CLOSE"
+
+
+def test_a_roll_starts_a_new_forecast_series(journal):
+    db = journal._db()
+    days = days_after(DAY1, 6)
+    at = datetime.combine(DAY1, datetime.min.time(), UTC)
+    for i, d in enumerate(days):
+        legs = "c1:1|c2:-1" if i < 3 else "c3:1|c4:-1"
+        journal.record_forecasts([forecast(legs=legs)], [], [], d, at)
+    assert db.execute("SELECT count(*) FROM forecast_results").fetchone()[0] == 0
+
+
+def test_beyond_wcl_marks_a_loss_past_the_grids_worst(journal):
+    db = journal._db()
+    days = days_after(DAY1, 6)
+    at = datetime.combine(DAY1, datetime.min.time(), UTC)
+    for i, d in enumerate(days):
+        mid = 200.0 if i == 0 else 100.0  # lost 100, past the grid's 60
+        journal.record_forecasts([forecast(v_mid=mid)], [], [], d, at)
+    assert db.execute("SELECT beyond_wcl FROM forecast_results").fetchone()[0] is True
+
+
+def test_leg_marks_and_roll_forecasts_are_kept(journal):
+    from thetagang_nt.journal import LegMark, RollForecast
+
+    db = journal._db()
+    at = datetime.combine(DAY1, datetime.min.time(), UTC)
+    mark = LegMark("c1", "AA-debit-spread-1", 1.0, 0.0, 0.05, 41.0, None)  # no bid
+    roll = RollForecast(
+        "AA-debit-spread-1",
+        "AA 20270115 +1x40C",
+        at,
+        250.0,
+        12.0,
+        80.0,
+        110.0,
+        130.0,
+        4.0,
+        50.0,
+        -25.0,
+        -20.0,
+        "-",
+        [{"contract": "c9", "qty": 1, "price": 2.5}],
+    )
+    journal.record_forecasts([], [mark], [roll], DAY1, at)
+    journal.record_forecasts([], [], [roll], DAY1, at)  # the same scan, next cycle
+    assert db.execute("SELECT count(*) FROM roll_forecasts").fetchone()[0] == 1
+    bid, ask = db.execute("SELECT bid, ask FROM leg_marks").fetchone()
+    assert float(bid) == 0.0 and float(ask) == 0.05
+    legs = db.execute("SELECT legs FROM roll_forecasts").fetchone()[0]
+    assert legs == [{"contract": "c9", "qty": 1, "price": 2.5}]
