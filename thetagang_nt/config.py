@@ -397,6 +397,14 @@ class PMConfig(NautilusConfig, frozen=True):
     roll_margin: float = 10.0  # [M7] epsilon, $: a roll must beat HOLD by this
     # the joint price and IV history model, reported beside the IV-unchanged one
     american_pricing: bool = True  # equity and ETF options; false: all European
+    surface: bool = True  # a small smile per held expiry; needs american_pricing
+    surface_strikes: tuple[float, ...] = (
+        -0.1,
+        -0.05,
+        0.0,
+        0.05,
+        0.1,
+    )  # [M14] from spot
     iv_model: bool = True  # false: no IV history requests
     iv_window: int = 252  # [M8] trading days today's IV is ranked against
     iv_min_samples: int = 30  # [M8] fewer in today's third: use all of history
@@ -583,6 +591,8 @@ class PMConfig(NautilusConfig, frozen=True):
             ("roll_margin", "M7", "a roll must beat HOLD by more than this, $"),
             ("ex_dividend_days", "S4", "a short call this close to an ex-date"),
             ("american_pricing", "", "equity and ETF options priced as American"),
+            ("surface", "", "measure a small smile per held expiry"),
+            ("surface_strikes", "M14", "smile strikes, moves from the underlying"),
             ("iv_model", "", "load IV history for the joint price and IV model"),
             ("iv_window", "M8", "trading days today's IV is ranked against"),
             ("iv_min_samples", "M8", "fewer in today's third: use all of history"),

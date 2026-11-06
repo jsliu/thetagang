@@ -514,6 +514,7 @@ def test_the_monitor_sends_each_strategy_to_its_manager():
         _iv_models={},
         _iv_model_of=lambda *a: None,
         _dividends={},
+        _smiles={},
         _price_model_of=lambda *a: None,
         log=SimpleNamespace(warning=warnings.append),
     )
@@ -636,6 +637,7 @@ def test_a_default_risk_budget_applies_unless_a_strategy_sets_its_own():
             _iv_models={},
             _iv_model_of=lambda *a: None,
             _dividends={},
+            _smiles={},
             _price_model_of=lambda *a: None,
             log=SimpleNamespace(warning=print),
         )
@@ -742,6 +744,7 @@ def test_the_monitor_sends_vix_calls_to_the_vix_rules():
         _iv_models={},
         _iv_model_of=lambda *a: None,
         _dividends={},
+        _smiles={},
         _price_model_of=lambda *a: None,
         log=SimpleNamespace(warning=print),
     )
@@ -1410,6 +1413,7 @@ def test_the_monitor_reports_both_views_side_by_side():
         _rolls={},
         _iv_model_of=lambda *a: model,
         _dividends={},
+        _smiles={},
         _price_model_of=lambda *a: None,
         log=SimpleNamespace(warning=print),
     )
@@ -1606,3 +1610,156 @@ def test_short_leg_takes_the_next_dividend_before_its_expiry():
     y = short_leg(p, TODAY, 110.0, Quote(5.3, 5.5), ((after, 0.63),))
     assert y.dividend is None and y.ex_days is None
     assert short_leg(p, TODAY, None, None, ()).extrinsic is None
+
+
+# ----------------------------------------------- phase 2: the small IV surface
+
+
+def test_smile_interpolates_with_flat_ends():
+    from thetagang_nt.pm.core.surface import Smile
+
+    s = Smile(((-0.1, 0.40), (0.0, 0.30), (0.1, 0.26)))
+    assert s.iv_at(-0.05) == pytest.approx(0.35)
+    assert s.iv_at(0.05) == pytest.approx(0.28)
+    assert s.iv_at(-0.5) == 0.40 and s.iv_at(0.5) == 0.26  # flat past the quotes
+    assert s.iv_at(0.0) == pytest.approx(0.30)
+
+
+def test_smile_strikes_are_the_listed_ones_nearest_the_moves():
+    from thetagang_nt.pm.core.surface import strikes_around
+
+    listed = [80.0, 90.0, 95.0, 100.0, 105.0, 110.0, 130.0]
+    off = (-0.1, -0.05, 0.0, 0.05, 0.1)
+    assert strikes_around(listed, 100.0, off) == [90.0, 95.0, 100.0, 105.0, 110.0]
+    assert strikes_around([100.0], 100.0, off) == [100.0]  # sparse: fewer strikes
+    assert strikes_around([], 100.0, off) == []
+
+
+def test_smile_recovers_the_vols_and_leaves_out_bad_quotes():
+    import math
+
+    from thetagang_nt.pm.core.american import american
+    from thetagang_nt.pm.core.scenarios import RATE
+    from thetagang_nt.pm.core.surface import measure
+
+    years, divs = 60 / 365, ((20 / 365, 0.5),)
+
+    def row(k, vol):
+        call = k >= 100
+        p = american(100, k, years, vol, call, RATE, divs)
+        return (k, call, Quote(p * 0.99, p * 1.01))
+
+    rows = [row(90.0, 0.40), row(100.0, 0.30), row(110.0, 0.26)]
+    s = measure(rows, 100.0, years, divs, 0.25)
+    assert [round(v, 2) for _, v in s.points] == [0.40, 0.30, 0.26]
+    assert s.points[0][0] == pytest.approx(math.log(0.9))
+    # wide, missing or zero-bid quotes don't count; too few points: no smile
+    bad = [
+        (95.0, False, Quote(0.5, 2.0)),
+        (105.0, True, Quote(None, None)),
+        (115.0, True, Quote(0.0, 0.1)),
+    ]
+    assert len(measure(rows + bad, 100.0, years, divs, 0.25).points) == 3
+    assert measure(rows[:2] + bad, 100.0, years, divs, 0.25) is None
+
+
+def test_sticky_delta_gap_follows_the_skew_and_the_position():
+    from thetagang_nt.pm.core.scenarios import PriceModel
+    from thetagang_nt.pm.core.surface import Smile, sticky_gaps
+
+    # the usual skew: IV falls as the strike rises against spot
+    skew = Smile(((-0.2, 0.40), (0.0, 0.30), (0.2, 0.20)))
+    flat = Smile(((-0.2, 0.30), (0.0, 0.30), (0.2, 0.30)))
+    p = leg("c", "C", 100, 1, mid=None)
+    g = {"c": SimpleNamespace(underlying=100.0, vol=0.3)}
+    moves = (-0.05, 0.0, 0.05)
+
+    def gaps(legs, smiles):
+        return sticky_gaps(legs, g, TODAY, smiles, moves, 5, PriceModel())
+
+    long_gaps, share = gaps((p,), {EXP: skew})
+    assert share == 1.0
+    assert long_gaps[0.0] == pytest.approx(0.0)  # no move: the two rules agree
+    # price up: the strike is now below spot, so sticky delta reads a higher IV
+    assert long_gaps[0.05] > 0 > long_gaps[-0.05]
+    short = leg("c", "C", 100, -1, mid=None)
+    assert gaps((short,), {EXP: skew})[0][0.05] == pytest.approx(-long_gaps[0.05])
+    assert gaps((p,), {EXP: flat})[0][0.05] == pytest.approx(0.0)  # no skew, no gap
+    # a leg without a smile keeps its IV and shows in the coverage
+    later = EXP + timedelta(days=30)
+    other = leg("c", "C", 100, -1, mid=None, expiry=later)
+    _, partial = gaps((p, other), {EXP: skew})
+    assert partial == 0.5
+    assert gaps((p,), {}) is None
+    # far outside the quoted strikes: no gap, and the coverage says why
+    far = leg("c", "C", 150, 1, mid=None)
+    far_gaps, far_share = gaps((far,), {EXP: skew})
+    assert far_share == 0.0 and far_gaps[0.05] == pytest.approx(0.0)
+
+
+def test_the_monitor_measures_one_smile_per_cycle_and_publishes_the_gap(monkeypatch):
+    pytest.importorskip("nautilus_trader")
+    pytest.importorskip("psycopg")
+    import asyncio
+
+    from thetagang_nt import monitor
+    from thetagang_nt.config import PMConfig
+    from thetagang_nt.monitor import PortfolioMonitor, _Families
+    from thetagang_nt.pm.core.scenarios import PriceModel
+    from thetagang_nt.pm.core.surface import Smile
+
+    held = [
+        leg("c", "C", 100, 1, mid=3.0),
+        leg("d", "C", 100, 1, mid=3.0, expiry=EXP + timedelta(days=30)),
+    ]
+    monkeypatch.setattr(monitor, "held_legs", lambda _c: held)
+    done = []
+
+    async def measure_smile(symbol, expiry, today):
+        done.append((symbol, expiry))
+        return Smile(((-0.1, 0.35), (0.0, 0.30), (0.1, 0.27)))
+
+    fake = SimpleNamespace(
+        cache=None,
+        log=None,
+        _pm=PMConfig(),
+        _smiles={("AA", date(2020, 1, 1)): (NOW, None)},  # no longer held: dropped
+        _dividends={"AA": ()},
+        _measure_smile=measure_smile,
+    )
+    asyncio.run(PortfolioMonitor._scan_surface(fake, TODAY))
+    assert len(done) == 1 and set(fake._smiles) == {done[0]}
+    asyncio.run(PortfolioMonitor._scan_surface(fake, TODAY))
+    assert len(done) == 2 and len(fake._smiles) == 2
+    asyncio.run(PortfolioMonitor._scan_surface(fake, TODAY))
+    assert len(done) == 2  # both fresh: nothing due
+    fake._dividends = {}  # dividends not loaded: nothing measured
+    fake._smiles = {}
+    asyncio.run(PortfolioMonitor._scan_surface(fake, TODAY))
+    assert len(done) == 2
+
+    g = {"c": SimpleNamespace(**greeks().__dict__, underlying=100.0)}
+    (st,) = find_structures(held[:1])
+    entries = [("AA", 100.0, st, structure_figures(st, g, TODAY), "-")]
+    smile = Smile(((-0.1, 0.35), (0.0, 0.30), (0.1, 0.27)))
+    pm = SimpleNamespace(
+        _quote={"c": Quote(3.0, 3.1)}.get,
+        _pm_known={},
+        _journal=None,
+        _pm=PMConfig(),
+        _closes={},
+        _pm_cls={},
+        _pm_last={},
+        _rolls={},
+        _smiles={("AA", EXP): (NOW, smile)},
+        _dividends={"AA": ()},
+        _iv_model_of=lambda *a: None,
+        _price_model_of=lambda *a: PriceModel(),
+        log=SimpleNamespace(warning=print),
+    )
+    f = _Families()
+    PortfolioMonitor._portfolio_manager(pm, f, entries, g, TODAY)
+    fields = {s.labels["field"]: s.value for s in f.by_name["pm"].samples}
+    assert fields["sticky_coverage"] == 1.0 and fields["american"] == 1.0
+    moves = {s.labels["move"] for s in f.by_name["pm_sticky"].samples}
+    assert moves == {"-0.05", "-0.02", "0", "0.02", "0.05"}

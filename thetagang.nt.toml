@@ -255,6 +255,8 @@ weight = 0.0
 # The joint price and IV model, reported beside the IV-unchanged one. One underlying's
 # two years of IB bars per monitor cycle, once a day:
 # american_pricing = true       # equity and ETF options, with IB's dividends; false: European
+# surface = true                # a small smile per held expiry, for sticky-delta model risk
+# surface_strikes = [-0.1, -0.05, 0.0, 0.05, 0.1]  # [M14] smile strikes, moves from spot
 # iv_model = true               # false: no IV history requests
 # iv_window = 252               # [M8] trading days today's IV is ranked against
 # iv_min_samples = 30           # [M8] fewer in today's third: use all of history

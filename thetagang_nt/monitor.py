@@ -54,6 +54,7 @@ from thetagang_nt.pm.core.scenarios import RATE as SCENARIO_RATE
 from thetagang_nt.pm.core.scenarios import PriceModel, repriced
 from thetagang_nt.pm.core.scenarios import grid as scenario_grid
 from thetagang_nt.pm.core.strategy_id import Seen, auto_ids
+from thetagang_nt.pm.core.surface import Smile, measure, sticky_gaps, strikes_around
 from thetagang_nt.pm.core.valuation import forward
 from thetagang_nt.pm.long_options import signals as long_options
 from thetagang_nt.pm.long_options import vix as long_vix
@@ -416,6 +417,9 @@ class PortfolioMonitor(Actor):
         self._rolls: dict[str, RollScan] = {}  # the last scan of each strategy
         self._roll_chain_day: dict[str, date] = {}  # chains loaded, per symbol
         self._dividends: dict[str, tuple[tuple[date, float], ...]] = {}
+        # (symbol, expiry) -> when measured, the smile (None: too few good quotes)
+        self._smiles: dict[tuple[str, date], tuple[datetime, Smile | None]] = {}
+        self._smile_chain_day: dict[tuple[str, date], date] = {}
         self._iv_hist: dict[str, IvHistory] = {}  # two years of closes and IVs
         self._iv_day: dict[str, date] = {}  # when each was last requested
         self._iv_models: dict[tuple[str, date], IvModel | None] = {}
@@ -565,6 +569,8 @@ class PortfolioMonitor(Actor):
             await self._scan_rolls(today)
         if self._pm.iv_model or self._pm.american_pricing:
             await self._load_underlying_data(symbols, today)
+        if self._pm.surface and self._pm.american_pricing:
+            await self._scan_surface(today)
 
     async def _load_betas(self, symbols: list[str], today: date) -> None:
         start = self.clock.utc_now() - timedelta(days=365)
@@ -1132,6 +1138,69 @@ class PortfolioMonitor(Actor):
             )
         return self._iv_models[key]
 
+    async def _scan_surface(self, today: date) -> None:
+        """Measure the smile of the held expiry longest without one, once its
+        underlying's dividends are known; one per cycle, a few contracts, then
+        unsubscribed. VIX options and index options are left out."""
+        now = datetime.now(UTC)
+        rescan = timedelta(minutes=self._pm.roll_rescan_mins)
+        held = {
+            (x.symbol, x.expiry)
+            for x in held_legs(self.cache)
+            if x.is_option and x.expiry and x.symbol in self._dividends
+        }
+        self._smiles = {k: v for k, v in self._smiles.items() if k in held}
+        never = datetime.min.replace(tzinfo=UTC)
+        when = {k: self._smiles[k][0] if k in self._smiles else never for k in held}
+        due = [k for k, at in when.items() if now - at >= rescan]
+        if not due:
+            return
+        key = min(due, key=when.__getitem__)
+        smile = None
+        try:
+            smile = await self._measure_smile(key[0], key[1], today)
+        except Exception as e:  # noqa: BLE001 - the dashboard never waits on it
+            self.log.warning(f"Smile of {key[0]} {key[1]} skipped: {e!r}")
+        self._smiles[key] = (now, smile)
+
+    async def _measure_smile(
+        self, symbol: str, expiry: date, today: date
+    ) -> Smile | None:
+        und = price(self.cache, underlying_id(symbol))
+        if not und:
+            return None
+        dte = (expiry - today).days
+        if self._smile_chain_day.get((symbol, expiry)) != today:
+            self._smile_chain_day[(symbol, expiry)] = today
+            chain = {
+                "build_options_chain": True,
+                "min_expiry_days": max(dte - 1, 0),
+                "max_expiry_days": dte + 1,
+            }
+            await aio.load_contracts(self, [stock_contract(symbol) | chain])
+        options = {
+            (i.option_kind == OptionKind.CALL, float(i.strike_price)): i.id
+            for i in self.cache.instruments(VENUE, underlying=symbol)
+            if isinstance(i, OptionContract) and i.expiration_utc.date() == expiry
+        }
+        strikes = strikes_around(
+            sorted({k for _, k in options}), und, tuple(self._pm.surface_strikes)
+        )
+        # out of the money: the liquid side, without early-exercise noise
+        picks = [
+            (k, k >= und, options[(k >= und, k)])
+            for k in strikes
+            if (k >= und, k) in options
+        ]
+        await self._fresh_quotes({iid for _, _, iid in picks})
+        return measure(
+            [(k, call, self._quote(iid)) for k, call, iid in picks],
+            und,
+            dte / 365,
+            PriceModel(self._dividends[symbol]).after(today, 0),
+            self._pm.wide_spread,
+        )
+
     def _price_model_of(self, symbol: str) -> PriceModel | None:
         """American for equity and ETF options once their dividends are known;
         until then, and for index options, European."""
@@ -1338,6 +1407,25 @@ class PortfolioMonitor(Actor):
                     utility,
                     pnls=pnls,
                 )
+            # how much the grid depends on sticky strike (volatility_scenarios)
+            smiles = {
+                e: m
+                for e in {p.expiry for p in st.legs}
+                if (m := self._smiles.get((s, e), (None, None))[1])
+            }
+            sticky = (
+                sticky_gaps(
+                    st.legs,
+                    greeks,
+                    today,
+                    smiles,
+                    tuple(self._pm.grid_moves),
+                    utility.horizon,
+                    price_model,
+                )
+                if price_model and smiles
+                else None
+            )
             # LossBudget = max acceptable loss + min(0, unrealized P&L)
             max_loss = x.max_loss if x and x.max_loss is not None else self._pm.max_loss
             budget = (
@@ -1424,6 +1512,11 @@ class PortfolioMonitor(Actor):
                 ("v_exec", a.v_exec),
                 ("liquidity_cost", liquidity),
                 ("v_model", grid.v_model if grid else None),
+                (
+                    "sticky_gap",
+                    max(sticky[0].values(), key=abs) if sticky else None,
+                ),
+                ("sticky_coverage", sticky[1] if sticky else None),
                 ("american", 1.0 if price_model else 0.0),
                 ("stress_loss", stress),
                 ("loss_budget", budget),
@@ -1497,6 +1590,15 @@ class PortfolioMonitor(Actor):
                         value,
                         strategy=sid,
                         field=field,
+                    )
+            if sticky:
+                for move, gap in sticky[0].items():
+                    f.set(
+                        "pm_sticky",
+                        "Sticky-delta minus sticky-strike P&L ($), by price move",
+                        gap,
+                        strategy=sid,
+                        move=f"{move:g}",
                     )
             if grid:
                 publish_grid(f, sid, grid, self._pm.grid_spec(vix=is_vix))
