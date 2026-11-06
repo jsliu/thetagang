@@ -1247,3 +1247,19 @@ def test_the_monitor_scans_one_strategy_and_leaves_no_line_subscribed(monkeypatc
     assert view.labels["scanned"] == "yes" and view.labels["best"] == c.label
     fields = {s.labels["field"] for s in f.by_name["pm_roll"].samples}
     assert {"net_open", "wcl_5", "u_roll", "roll_score"} <= fields
+
+
+def test_iv_history_skips_legs_with_a_data_flag():
+    pytest.importorskip("nautilus_trader")
+    pytest.importorskip("psycopg")
+    from thetagang_nt.monitor import iv_rows
+    from thetagang_nt.pm.core.quality import QualityLimits
+
+    good, wide, none = leg("g", "C", 40, 1), leg("w", "C", 45, 1), leg("n", "P", 35, 1)
+    g = {
+        "g": SimpleNamespace(**greeks(vol=0.31).__dict__, underlying=41.0),
+        "w": SimpleNamespace(**greeks(vol=0.90).__dict__, underlying=41.0),
+    }
+    quotes = {"g": Quote(2.0, 2.1), "w": Quote(1.0, 2.0), "n": Quote(1.0, 1.1)}
+    (row,) = iv_rows((good, wide, none), g, quotes, NOW, QualityLimits())
+    assert (row.contract, row.iv, row.underlying) == ("g", 0.31, 41.0)

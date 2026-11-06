@@ -28,10 +28,10 @@ from prometheus_client.core import GaugeMetricFamily
 from thetagang_nt import aio
 from thetagang_nt.config import DiscretionaryConfig, MonitorConfig, PMConfig
 from thetagang_nt.ib_extra import AccountExtras
-from thetagang_nt.journal import Journal, LegRow, StrategyRow
+from thetagang_nt.journal import IvRow, Journal, LegRow, StrategyRow
 from thetagang_nt.pm.core.assess import assess
 from thetagang_nt.pm.core.profit import capture_ratio, value_bounds
-from thetagang_nt.pm.core.quality import Quote
+from thetagang_nt.pm.core.quality import Quote, leg_flags
 from thetagang_nt.pm.core.review import (
     P0,
     P1,
@@ -153,6 +153,32 @@ def publish_grid(f: _Families, sid: str, grid: Any, spec: Any) -> None:
                 horizon=str(h),
                 stat=stat,
             )
+
+
+def iv_rows(
+    legs: Any, greeks: dict, quotes: dict, now: datetime, limits: Any
+) -> list[IvRow]:
+    """Implied vols worth keeping: no leg with a data flag, because one bad IV
+    from a wide or stale quote would corrupt the IV-change distribution."""
+    out = []
+    for p in legs:
+        g = greeks.get(p.instrument_id)
+        quote = quotes.get(p.instrument_id)
+        und = getattr(g, "underlying", None)
+        if leg_flags(p, quote, g, now, limits) or not und or not p.expiry:
+            continue
+        out.append(
+            IvRow(
+                str(p.instrument_id),
+                p.symbol.lstrip("^"),
+                p.expiry,
+                p.strike,
+                p.right,
+                g.vol,
+                und,
+            )
+        )
+    return out
 
 
 @dataclass(frozen=True)
@@ -1119,6 +1145,7 @@ class PortfolioMonitor(Actor):
         short_limits, vix_limits = self._pm.short_limits(), self._pm.vix_limits()
         utility = self._pm.utility_limits()
         jobs: dict[str, RollJob] = {}
+        ivs: list[IvRow] = []
         rescan = timedelta(minutes=self._pm.roll_rescan_mins)
         rows, decisions, counts = [], [], dict.fromkeys((P0, P1, P2), 0)
         for sid, (s, und, st, fig, bot) in zip(ids, entries, strict=True):
@@ -1355,6 +1382,7 @@ class PortfolioMonitor(Actor):
                 decisions.append((sid, out, [x.__dict__ for x in found], bot))
                 self._pm_last[sid] = key
             self._pm_cls[sid] = a.cls
+            ivs += iv_rows(st.legs, greeks, quotes, now, quality)
             legs = tuple(
                 LegRow(
                     str(p.instrument_id), option_label(p), p.qty, p.multiplier, p.avg_px
@@ -1387,6 +1415,7 @@ class PortfolioMonitor(Actor):
         if self._journal is not None:
             try:
                 self._journal.record(rows, inputs, today, now)
+                self._journal.record_iv(ivs, today, now)
                 if decisions:
                     self._journal.decide(decisions, now)
             except Exception as e:  # noqa: BLE001 - the dashboard never depends on it

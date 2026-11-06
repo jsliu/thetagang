@@ -53,7 +53,7 @@ def cycle(journal, day, structures, inputs=None):
 def journal():
     j = Journal(DSN)
     db = j._db()
-    db.execute("TRUNCATE decisions, snapshots, strategy_legs, strategies")
+    db.execute("TRUNCATE decisions, snapshots, strategy_legs, strategies, iv_history")
     yield j
     j.close()
 
@@ -118,3 +118,19 @@ def test_strategies_open_roll_close_and_keep_their_ids(journal):
         (DAY2,),
     ).fetchone()
     assert float(v) == 250.0  # overwritten, not a second row
+
+
+def test_iv_history_keeps_one_row_per_contract_per_day_the_latest(journal):
+    from thetagang_nt.journal import IvRow
+
+    db = journal._db()
+    at = datetime.combine(DAY1, datetime.min.time(), UTC)
+
+    def iv(value):
+        return IvRow("c1", "AA", date(2026, 12, 18), 40.0, "C", value, 41.0)
+
+    journal.record_iv([iv(0.30)], DAY1, at)
+    journal.record_iv([iv(0.32)], DAY1, at)  # later that day: overwritten
+    journal.record_iv([iv(0.35)], DAY2, at)
+    rows = db.execute("SELECT day, iv FROM iv_history ORDER BY day").fetchall()
+    assert [(d, float(v)) for d, v in rows] == [(DAY1, 0.32), (DAY2, 0.35)]

@@ -78,6 +78,18 @@ CREATE TABLE IF NOT EXISTS decisions (
     bot_action text,
     your_action text
 );
+CREATE TABLE IF NOT EXISTS iv_history (    -- for the IV-change distribution (M8)
+    contract text NOT NULL,
+    day date NOT NULL,
+    at timestamptz NOT NULL,               -- the last good quote that day
+    symbol text NOT NULL,
+    expiry date NOT NULL,
+    strike numeric NOT NULL,
+    option_right text NOT NULL,            -- C | P
+    iv numeric NOT NULL,                   -- annualised, 0.30 = 30%
+    underlying numeric NOT NULL,           -- spot, or the VIX option's future
+    PRIMARY KEY (contract, day)
+);
 """
 
 RECENT_DAYS = (
@@ -105,6 +117,19 @@ class StrategyRow:
     net_debit: float  # $, today's cost basis of the legs
     spot: float | None
     a: Assessment
+
+
+@dataclass(frozen=True)
+class IvRow:
+    """One held option's implied vol this cycle."""
+
+    contract: str
+    symbol: str
+    expiry: date
+    strike: float
+    right: str
+    iv: float
+    underlying: float
 
 
 class Journal:
@@ -272,6 +297,33 @@ class Journal:
                         x.thesis_valid,
                         now,
                         sid,
+                    ),
+                )
+
+    def record_iv(self, rows: list[IvRow], today: date, now: datetime) -> None:
+        """Today's implied vol per held option, overwritten through the day: one
+        row per contract per day, the last good quote."""
+        conn = self._db()
+        with conn.transaction():
+            for r in rows:
+                conn.execute(
+                    """
+                    INSERT INTO iv_history (contract, day, at, symbol, expiry, strike,
+                        option_right, iv, underlying)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    ON CONFLICT (contract, day) DO UPDATE SET at = EXCLUDED.at,
+                        iv = EXCLUDED.iv, underlying = EXCLUDED.underlying
+                    """,
+                    (
+                        r.contract,
+                        today,
+                        now,
+                        r.symbol,
+                        r.expiry,
+                        r.strike,
+                        r.right,
+                        r.iv,
+                        r.underlying,
                     ),
                 )
 

@@ -423,8 +423,10 @@ Still to come in phase 2: American pricing and dividends, a volatility surface,
 and IV changes in the probabilities.
 
 The **journal** (Postgres, the `journal-db` service) keeps the strategies and
-their legs (opened and closed), one snapshot per strategy per day and a
-decision-log row whenever a strategy's outcome or signals change. Positions
+their legs (opened and closed), one snapshot per strategy per day, a
+decision-log row whenever a strategy's outcome or signals change, and each held
+option's implied vol per day (`iv_history`, legs with a data flag skipped): the
+history an IV-change distribution will need. Positions
 held before the journal started have an estimated entry date. Grafana reads
 it with a read-only login. Both passwords live in `deploy/.env` (git-ignored):
 
