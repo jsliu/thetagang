@@ -175,10 +175,9 @@ class DiscretionaryTradesMixin:
         resize_note says what happened, for the positions summary caption."""
         band = self.config.strategies.discretionary.delta_band
         now = book.totals.delta_dollars / spx_price
-        if book.missing:
+        if book.incomplete:
             self.resize_note = (
-                f"place_target_orders: no orders this run ({book.missing} option(s) "
-                "without greeks)."
+                f"place_target_orders: no orders this run ({book.incomplete})."
             )
             log.warning(self.resize_note)
             return
@@ -366,10 +365,10 @@ class DiscretionaryTradesMixin:
         if not cfg.trades:
             return None, after
         now = book.totals.delta_dollars / spx_price
-        if book.missing:
+        if book.incomplete:
             # SPX delta is incomplete without them: sizing against it could
             # open the wrong amount, so trade nothing (and skip the chain scans)
-            blocked = f"{book.missing} option(s) without greeks: no new trades"
+            blocked = f"{book.incomplete}: no new trades"
         elif abs(now) <= cfg.delta_band:
             blocked = f"SPX delta {now:+.2f} is within the band of {cfg.delta_band:g}"
         else:

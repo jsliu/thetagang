@@ -108,6 +108,28 @@ def test_aggregate_book_golden_exposures_for_stock_and_short_option():
     assert book.legs[1][:4] == (2.0, -100.0, 50.0, 55.0)
 
 
+@pytest.mark.parametrize("price", [float("nan"), 0.0, -1.0])
+def test_aggregate_book_names_a_stock_without_a_price(price):
+    """It is left out and named, so the risk tables survive and orders are blocked."""
+    from ib_async import PortfolioItem, Stock
+
+    from thetagang.risk import aggregate_book, stress_table
+
+    good = PortfolioItem(
+        Stock("AA", "SMART", "USD", conId=1), 100, 50, 0, 50, 0, 0, "A"
+    )
+    bad = PortfolioItem(
+        Stock("BB", "SMART", "USD", conId=2), 100, price, 0, 50, 0, 0, "A"
+    )
+
+    book = aggregate_book([good, bad], {"AA": 1.0, "BB": 1.0}, {}, spx_price=5000.0)
+
+    assert book.incomplete == "stock without a price: BB"
+    assert book.totals.delta_dollars == pytest.approx(5000.0)
+    assert list(book.by_symbol) == ["AA"]
+    stress_table(book.legs)  # raises on a bad leg
+
+
 def test_scenario_pnl_survives_extreme_beta():
     """A thin-history beta that implies a >100% fall must not crash the stress table."""
     from thetagang.risk import scenario_pnl

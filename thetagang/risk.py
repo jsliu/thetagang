@@ -298,6 +298,18 @@ class Book:
     option_items: dict[str, list[PortfolioItem]]  # all option positions, by symbol
     missing: int  # options without greeks
     volga_by_symbol: dict[str, float] = field(default_factory=dict)
+    unpriced: list[str] = field(default_factory=list)  # stocks without a usable price
+
+    @property
+    def incomplete(self) -> str:
+        """Why SPX delta is incomplete, for the risk tables and the order guards;
+        empty if it is complete."""
+        parts = []
+        if self.missing:
+            parts.append(f"{self.missing} option(s) without greeks")
+        if self.unpriced:
+            parts.append("stock without a price: " + ", ".join(self.unpriced))
+        return "; ".join(parts)
 
 
 def valid_greeks(g: Any) -> bool:
@@ -384,6 +396,9 @@ def aggregate_book(
         beta = betas[symbol]
         row = book.by_symbol.setdefault(symbol, [0.0, 0.0])
         if i.contract.secType == "STK":
+            if not math.isfinite(i.marketPrice) or i.marketPrice <= 0:
+                book.unpriced.append(symbol)
+                continue
             exposure = i.position * i.marketPrice
             book.legs.append((beta, i.position, i.marketPrice))
             book.prices[symbol] = i.marketPrice
@@ -465,6 +480,9 @@ def greeks_table(book: Book, after: Totals, spx_price: float) -> Table:
     if book.missing:
         table.add_section()
         table.add_row("[yellow]Options without greeks", str(book.missing), "")
+    if book.unpriced:
+        table.add_section()
+        table.add_row("[yellow]Stock without a price", ", ".join(book.unpriced), "")
     return table
 
 
