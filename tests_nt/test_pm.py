@@ -509,6 +509,7 @@ def test_the_monitor_sends_each_strategy_to_its_manager():
         _closes={},
         _pm_cls={},
         _pm_last={},
+        _rolls={},
         log=SimpleNamespace(warning=warnings.append),
     )
     f = _Families()
@@ -625,6 +626,7 @@ def test_a_default_risk_budget_applies_unless_a_strategy_sets_its_own():
             _closes={},
             _pm_cls={},
             _pm_last={},
+            _rolls={},
             log=SimpleNamespace(warning=print),
         )
         f = _Families()
@@ -725,6 +727,7 @@ def test_the_monitor_sends_vix_calls_to_the_vix_rules():
         _closes={},
         _pm_cls={},
         _pm_last={},
+        _rolls={},
         log=SimpleNamespace(warning=print),
     )
     f = _Families()
@@ -970,3 +973,277 @@ def test_a_used_up_budget_reads_as_a_negative_amount():
 
     s = StrategyState(cls=LONG, worst_case_loss=300.0, loss_budget=-485.0)
     assert hard_signals(s)[0].detail == "worst case -$300 > budget -$485"
+
+
+# ----------------------------------------------------- phase 2: roll candidates
+
+
+def listed(rights="CP", strikes=(90, 95, 100, 105, 110), days=(30, 60, 90, 120)):
+    return {
+        (r, TODAY + timedelta(days=d), float(k)): f"{r}{d}-{k}"
+        for r in rights
+        for k in strikes
+        for d in days
+    }
+
+
+def test_roll_targets_restore_the_original_life_and_vix_uses_v1():
+    from thetagang_nt.pm.core.rolls import RollLimits, target_dtes
+
+    lim = RollLimits()
+    assert target_dtes(20, 60, False, lim) == [60, 90, 120]
+    assert target_dtes(5, None, False, lim) == [30, 45, 60]  # unknown life: 30 days
+    assert target_dtes(80, 60, False, lim) == [94, 120]  # past the front, at least
+    assert target_dtes(10, 400, True, lim) == [30, 45, 60]  # V1, whatever the life
+
+
+def test_roll_candidates_keep_the_structure_and_snap_to_listed_contracts():
+    from thetagang_nt.pm.core.rolls import RollLimits, generate
+
+    lim = RollLimits(strike_shifts=(-0.05, 0.0))
+    near = TODAY + timedelta(days=30)
+    spread = (
+        leg("l", "C", 100, 2, expiry=near),
+        leg("s", "C", 105, -2, expiry=near),
+    )
+    out = generate(spread, listed(), 100.0, TODAY, [60, 90], lim)
+    assert len(out) == 4  # 2 expiries x 2 shifts
+    labels = {tuple((p.strike, p.qty, p.expiry - TODAY) for p in c) for c in out}
+    assert (
+        (95.0, 2, timedelta(days=60)),
+        (100.0, -2, timedelta(days=60)),
+    ) in labels
+    assert out[0][0].instrument_id == "C60-95"
+    # a strike too far from anything listed drops the candidate; so does the
+    # strategy itself and anything not later than today's front expiry
+    sparse = {k: v for k, v in listed().items() if k[2] in (90.0, 110.0)}
+    assert generate(spread, sparse, 100.0, TODAY, [60], RollLimits()) == []
+    held_later = (leg("l", "C", 100, 1, expiry=TODAY + timedelta(days=120)),)
+    assert generate(held_later, listed(), 100.0, TODAY, [60], RollLimits()) == []
+
+
+def test_a_calendar_rolls_with_its_gap_and_never_collapses():
+    from thetagang_nt.pm.core.rolls import RollLimits, generate
+
+    lim = RollLimits(strike_shifts=(0.0,))
+    calendar = (
+        leg("b", "C", 100, 1, expiry=TODAY + timedelta(days=60)),
+        leg("f", "C", 100, -1, expiry=TODAY + timedelta(days=30)),
+    )
+    ((back, front),) = generate(calendar, listed(), 100.0, TODAY, [60], lim)
+    assert (back.expiry - TODAY).days == 90 and (front.expiry - TODAY).days == 60
+    one_expiry = {
+        k: v for k, v in listed().items() if k[1] == TODAY + timedelta(days=60)
+    }
+    assert generate(calendar, one_expiry, 100.0, TODAY, [60], lim) == []
+
+
+def roll_candidate(max_loss=None, quotes=None):
+    from thetagang_nt.pm.core.quality import QualityLimits
+    from thetagang_nt.pm.core.rolls import evaluate
+    from thetagang_nt.pm.core.scenarios import RATE, GridSpec
+    from thetagang_nt.pm.core.valuation import UtilityLimits
+
+    legs = (leg("l", "C", 100, 1), leg("s", "C", 105, -1))
+    g = {
+        "l": SimpleNamespace(**greeks(delta=0.5).__dict__, underlying=100.0),
+        "s": SimpleNamespace(**greeks(delta=0.3).__dict__, underlying=100.0),
+    }
+    quotes = quotes or {"l": Quote(4.0, 4.2), "s": Quote(1.9, 2.1)}
+    return evaluate(
+        "debit spread",
+        legs,
+        g,
+        quotes,
+        TODAY,
+        NOW,
+        RATE,
+        0.3,
+        GridSpec(),
+        UtilityLimits(commission=1.0),
+        QualityLimits(),
+        max_loss,
+    )
+
+
+def test_a_candidate_is_judged_as_a_new_trade_with_its_own_costs():
+    c = roll_candidate()
+    # opens at the ask of the long and the bid of the short: 4.20 - 1.90
+    assert c.net_open == pytest.approx(230.0)
+    # half-spreads of 10 + 10, plus 2 contracts at $1
+    assert c.open_cost == pytest.approx(22.0)
+    assert c.fails == () and c.u_new is not None and c.e_pnl is not None
+    assert c.label == f"AA {EXP:%Y%m%d} +1x100C -1x105C"
+    # over the budget, or wide: listed, but not recommendable
+    assert roll_candidate(max_loss=1.0).fails == ("over max_loss",)
+    wide = roll_candidate(quotes={"l": Quote(3.0, 5.0), "s": Quote(1.9, 2.1)})
+    assert wide.fails == ("wide spread",)
+    # no usable quote: not a candidate at all
+    assert roll_candidate(quotes={"l": Quote(None, None), "s": Quote(1.9, 2.1)}) is None
+
+
+def test_hold_close_roll_comparison_follows_roll_rules():
+    from dataclasses import replace
+
+    from thetagang_nt.pm.core.rolls import compare
+
+    c = replace(roll_candidate(), u_new=5.0)
+    # U_roll = 5 - 20 = -15: beats HOLD by 25 and beats U_close = -20
+    choice = compare(-40.0, -20.0, [c], 10.0)
+    assert (choice.view, choice.u_roll, choice.roll_score) == ("ROLL", -15.0, 25.0)
+    assert choice.best is c
+    # within the margin of HOLD: no roll, and HOLD beats closing
+    assert compare(-18.0, -20.0, [c], 10.0).view == "HOLD"
+    # the new trade must beat cash: U_new < 0 means U_roll < U_close
+    poor = replace(c, u_new=-1.0)
+    assert compare(-60.0, -20.0, [poor], 10.0).view == "CLOSE"
+    # a candidate over its limits is never recommended, however good
+    failing = replace(c, u_new=500.0, fails=("over max_loss",))
+    assert compare(-60.0, -20.0, [failing], 10.0).best is None
+    # no probabilities (VIX): no view
+    assert compare(None, None, [c], 10.0).view == "-"
+
+
+def test_the_monitor_scans_one_strategy_and_leaves_no_line_subscribed(monkeypatch):
+    """A real Nautilus cache: the scan quotes the candidates of the strategy
+    longest without one, unsubscribes them all, keeps held legs subscribed, and
+    the dashboard gets the candidates and the model's view."""
+    pytest.importorskip("nautilus_trader")
+    pytest.importorskip("psycopg")
+    import asyncio
+
+    from nautilus_trader.cache.cache import Cache
+    from nautilus_trader.model.currencies import USD
+    from nautilus_trader.model.data import QuoteTick
+    from nautilus_trader.model.enums import AssetClass, OptionKind
+    from nautilus_trader.model.identifiers import InstrumentId, Symbol
+    from nautilus_trader.model.instruments import OptionContract
+    from nautilus_trader.model.objects import Price, Quantity
+
+    from thetagang_nt import monitor
+    from thetagang_nt.config import PMConfig
+    from thetagang_nt.monitor import (
+        PortfolioMonitor,
+        RollJob,
+        RollScan,
+        _Families,
+        publish_rolls,
+    )
+
+    cache = Cache()
+    held_expiry = date(2026, 12, 2)
+    later = date(2027, 1, 15)
+
+    def option(expiry, strike):
+        iid = InstrumentId.from_str(f"AA{expiry:%y%m%d}C{strike}.SMART")
+        return OptionContract(
+            iid,
+            Symbol(iid.symbol.value),
+            AssetClass.EQUITY,
+            USD,
+            2,
+            Price.from_str("0.01"),
+            Quantity.from_int(100),
+            Quantity.from_int(1),
+            "AA",
+            OptionKind.CALL,
+            Price.from_str(f"{strike}.00"),
+            0,
+            int(
+                datetime(
+                    expiry.year, expiry.month, expiry.day, 21, tzinfo=timezone.utc
+                ).timestamp()
+                * 1e9
+            ),
+            0,
+            0,
+        )
+
+    held_ins, new_ins = option(held_expiry, 100), option(later, 100)
+    for ins in (held_ins, new_ins):
+        cache.add_instrument(ins)
+    held = Leg(held_ins.id, "AA", "C", 100.0, held_expiry, 1, 3.0, 3.1)
+    (st,) = find_structures([held])
+    clock = {"now": 1000}
+    subscribed = set()
+
+    def quote(iid):
+        size = Quantity.from_int(10)
+        cache.add_quote_tick(
+            QuoteTick(
+                iid,
+                Price.from_str("5.00"),
+                Price.from_str("5.20"),
+                size,
+                size,
+                clock["now"],
+                clock["now"],
+            )
+        )
+
+    def subscribe(_actor, iid):
+        subscribed.add(iid)
+        quote(iid)  # IB answers a new subscription with a fresh quote
+
+    monkeypatch.setattr(monitor.aio, "subscribe", subscribe)
+    monkeypatch.setattr(
+        monitor.aio, "unsubscribe", lambda _a, iid: subscribed.discard(iid)
+    )
+    monkeypatch.setattr(monitor, "held_legs", lambda _c: [held])
+    monkeypatch.setattr(
+        monitor,
+        "option_greeks",
+        lambda _c, _g, ins, _t: SimpleNamespace(
+            delta=0.5, gamma=0.05, theta=-0.03, vega=0.1, vol=0.3, underlying=100.0
+        ),
+    )
+    loads = []
+
+    async def load_contracts(_actor, contracts):
+        loads.append(contracts)
+
+    monkeypatch.setattr(monitor.aio, "load_contracts", load_contracts)
+    warnings = []
+    other_scan = RollScan(datetime.now(timezone.utc), [])
+    job = RollJob("AA", st, 100.0, 0.3, 30, 60, 2000.0, False)
+    fake = SimpleNamespace(
+        cache=cache,
+        greeks=None,
+        clock=SimpleNamespace(timestamp_ns=lambda: clock["now"]),
+        log=SimpleNamespace(warning=warnings.append),
+        _pm=PMConfig(roll_strike_shifts=(0.0,), roll_dte_multiples=(1.25,)),
+        _roll_jobs={"AA-long-call-1": job, "BB-long-call-1": job},
+        _rolls={"BB-long-call-1": other_scan},  # scanned just now: not due
+        _roll_chain_day={},
+        _quote=lambda iid: Quote(5.0, 5.2, datetime.now(timezone.utc)),
+    )
+    fake._load_roll_chain = lambda *a: PortfolioMonitor._load_roll_chain(fake, *a)
+    fake._fresh_quotes = lambda ids: PortfolioMonitor._fresh_quotes(fake, ids)
+    asyncio.run(PortfolioMonitor._scan_rolls(fake, TODAY))
+    assert warnings == []
+    assert subscribed == set()  # every candidate line given back
+    ((chain,),) = loads
+    assert chain["symbol"] == "AA" and chain["build_options_chain"]
+    assert fake._rolls["BB-long-call-1"] is other_scan
+    ((c,)) = fake._rolls["AA-long-call-1"].candidates
+    assert c.legs[0].instrument_id == new_ins.id  # the later expiry, same strike
+    # the chain is loaded once a day, however many scans
+    fake._rolls.clear()
+    asyncio.run(PortfolioMonitor._scan_rolls(fake, TODAY))
+    assert len(loads) == 1
+    # a failing scan is recorded, so it can't hog every cycle
+    fake._rolls.clear()
+    fake._load_roll_chain = lambda *a: (_ for _ in ()).throw(ValueError("IB down"))
+    asyncio.run(PortfolioMonitor._scan_rolls(fake, TODAY))
+    assert fake._rolls["AA-long-call-1"].candidates == []
+    assert len(warnings) == 1
+
+    f = _Families()
+    scan = RollScan(datetime.now(timezone.utc), [c])
+    publish_rolls(
+        f, "AA-long-call-1", -30.0, -20.0, scan, 10.0, datetime.now(timezone.utc)
+    )
+    (view,) = f.by_name["pm_view"].samples
+    assert view.labels["scanned"] == "yes" and view.labels["best"] == c.label
+    fields = {s.labels["field"] for s in f.by_name["pm_roll"].samples}
+    assert {"net_open", "wcl_5", "u_roll", "roll_score"} <= fields

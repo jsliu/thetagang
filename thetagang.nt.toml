@@ -240,6 +240,18 @@ weight = 0.0
 # risk_aversion = 0.1           # [M7] lambda: utility cost per $ of Expected Shortfall
 # capital_cost = 0.05           # [M7] kappa: yearly cost of the capital at risk
 # commission = 0.65             # [M9] $ per contract to trade
+# Roll candidates (vault roll_rules), reported, never orders. One strategy not on
+# HOLD is scanned per monitor cycle, its candidates quoted a few at a time:
+# roll_scan = true              # false: no scans, no extra market data lines
+# roll_quote_lines = 12         # market data lines a scan may use at once (IB limits them)
+# roll_rescan_mins = 30         # how often a strategy's candidates are refreshed
+# roll_dte_multiples = [1.0, 1.5, 2.0]  # [M13] new front DTE, multiples of the original life
+# roll_min_life = 30            # [M13] a shorter or unknown life counts as this
+# roll_min_extension = 14       # [M13] days past the current front expiry, at least
+# roll_strike_shifts = [-0.05, 0.0, 0.05]  # [M13] strike shifts, share of the underlying
+# roll_strike_tolerance = 0.03  # [M13] the nearest listed strike must be within this
+# vix_roll_dte = [30, 45, 60]   # [V1] long VIX: roll target DTEs
+# roll_margin = 10.0            # [M7] a roll must beat HOLD by more than this, $
 # realized_vol_days = 21        # [M6] daily returns behind the realised-vol forecast
 # The settings above serve the Long Options Manager (strategies opened for a
 # debit; credit_levels [T2] is superseded by S1). Strategies opened for a credit

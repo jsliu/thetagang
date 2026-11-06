@@ -8,8 +8,10 @@ cache under BETAS_KEY for the strategy."""
 
 from __future__ import annotations
 
+import asyncio
 import json
 import math
+from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
 from typing import Any
 
@@ -17,7 +19,9 @@ from nautilus_trader.common.actor import Actor
 from nautilus_trader.core.datetime import unix_nanos_to_dt
 from nautilus_trader.model.currencies import USD
 from nautilus_trader.model.data import Bar, BarType
+from nautilus_trader.model.enums import OptionKind
 from nautilus_trader.model.identifiers import InstrumentId
+from nautilus_trader.model.instruments import OptionContract
 from prometheus_client import REGISTRY, start_http_server
 from prometheus_client.core import GaugeMetricFamily
 
@@ -37,6 +41,13 @@ from thetagang_nt.pm.core.review import (
     StrategyState,
     manager,
 )
+from thetagang_nt.pm.core.rolls import (
+    Candidate,
+    compare,
+    evaluate,
+    generate,
+    target_dtes,
+)
 from thetagang_nt.pm.core.scenarios import RATE as SCENARIO_RATE
 from thetagang_nt.pm.core.scenarios import grid as scenario_grid
 from thetagang_nt.pm.core.strategy_id import Seen, auto_ids
@@ -48,6 +59,7 @@ from thetagang_nt.pm.short_options.analysis import loss_multiple, premium_to_ris
 from thetagang_nt.portfolio import (
     INDEX_CONTRACTS,
     SPX,
+    VENUE,
     VIX,
     VIX_ROOT,
     VIXMO,
@@ -103,6 +115,7 @@ from thetagang_nt.rules import (
 )
 
 BETAS_KEY = "thetagang.betas"
+ROLL_QUOTE_POLLS = 20  # 0.25 s apart: how long a batch of candidates may take
 
 
 def position_labels(leg: Leg) -> dict[str, str]:
@@ -140,6 +153,92 @@ def publish_grid(f: _Families, sid: str, grid: Any, spec: Any) -> None:
                 horizon=str(h),
                 stat=stat,
             )
+
+
+@dataclass(frozen=True)
+class RollJob:
+    """What a roll scan needs about one strategy not on HOLD."""
+
+    symbol: str
+    structure: Any
+    underlying: float
+    sigma_f: float | None
+    front_dte: int
+    initial_dte: int | None
+    max_loss: float | None
+    vix: bool
+
+
+@dataclass(frozen=True)
+class RollScan:
+    at: datetime
+    candidates: list[Candidate]
+
+
+def publish_rolls(
+    f: _Families,
+    sid: str,
+    u_hold: float | None,
+    u_close: float | None,
+    scan: RollScan | None,
+    margin: float,
+    now: datetime,
+) -> None:
+    """HOLD / CLOSE / ROLL (roll_rules): the model's view of one strategy and
+    its scanned candidates, compared with today's U_hold and U_close."""
+    found = scan.candidates if scan else []
+    choice = compare(u_hold, u_close, found, margin)
+    f.set(
+        "pm_view",
+        "The model's HOLD / CLOSE / ROLL view (reported, not a signal)",
+        1,
+        strategy=sid,
+        view=choice.view,
+        best=choice.best.label if choice.best else "-",
+        scanned="yes" if scan else "no",
+    )
+    if scan:
+        f.set(
+            "pm_roll_scan_age",
+            "Seconds since this strategy's roll candidates were quoted",
+            (now - scan.at).total_seconds(),
+            strategy=sid,
+        )
+    for c in found:
+        f.set(
+            "pm_roll_info",
+            "A roll candidate; why it can't be recommended, if so",
+            1,
+            strategy=sid,
+            candidate=c.label,
+            fails=", ".join(c.fails) or "-",
+        )
+        u_roll = None
+        if c.u_new is not None and u_close is not None:
+            u_roll = c.u_new + u_close
+        for field, value in (
+            ("net_open", c.net_open),
+            ("open_cost", c.open_cost),
+            ("wcl_5", c.wcl.get(5)),
+            ("wcl_10", c.wcl.get(10)),
+            ("stress_loss", c.stress_loss),
+            ("e_pnl", c.e_pnl),
+            ("es", c.es),
+            ("u_roll", u_roll),
+            (
+                "roll_score",
+                u_roll - u_hold if u_roll is not None and u_hold is not None else None,
+            ),
+        ):
+            if value is not None:
+                f.set(
+                    "pm_roll",
+                    "A roll candidate's figures ($)",
+                    value,
+                    strategy=sid,
+                    candidate=c.label,
+                    field=field,
+                )
 
 
 class _Snapshot:
@@ -238,6 +337,9 @@ class PortfolioMonitor(Actor):
         self._iv_open: tuple[date | None, dict[InstrumentId, float]] = (None, {})
         self._vix_hedge = "-"  # what the VIX call hedge would do, set by _actions
         self._vix_chain_day: date | None = None  # VIX chain loaded for parity
+        self._roll_jobs: dict[str, RollJob] = {}  # strategies to scan, this cycle
+        self._rolls: dict[str, RollScan] = {}  # the last scan of each strategy
+        self._roll_chain_day: dict[str, date] = {}  # chains loaded, per symbol
 
     def on_start(self) -> None:
         if self.config.publish:
@@ -380,6 +482,8 @@ class PortfolioMonitor(Actor):
                         )
         f.set("last_update_timestamp_seconds", "Last refresh", self.clock.timestamp())
         self._snapshot.families = list(f.by_name.values())
+        if self._pm.roll_scan:
+            await self._scan_rolls(today)
 
     async def _load_betas(self, symbols: list[str], today: date) -> None:
         start = self.clock.utc_now() - timedelta(days=365)
@@ -861,6 +965,113 @@ class PortfolioMonitor(Actor):
         except Exception as e:  # noqa: BLE001 - the rest of the dashboard never waits on it
             self.log.warning(f"Portfolio Manager skipped: {e!r}")
 
+    async def _scan_rolls(self, today: date) -> None:
+        """Quote the candidates of the strategy longest without a scan
+        (roll_rules: the same structure, shifted in expiry and strike) and
+        evaluate each as a new trade. Reported, never orders."""
+        now = datetime.now(UTC)
+        rescan = timedelta(minutes=self._pm.roll_rescan_mins)
+        never = datetime.min.replace(tzinfo=UTC)
+        when = {
+            sid: self._rolls[sid].at if sid in self._rolls else never
+            for sid in self._roll_jobs
+        }
+        due = [sid for sid, at in when.items() if now - at >= rescan]
+        if not due:
+            return
+        sid = min(due, key=when.__getitem__)
+        job = self._roll_jobs[sid]
+        lim = self._pm.roll_limits()
+        found: list[Candidate] = []
+        try:
+            targets = target_dtes(job.front_dte, job.initial_dte, job.vix, lim)
+            await self._load_roll_chain(job.symbol, targets, today)
+            chain = {
+                (
+                    "C" if i.option_kind == OptionKind.CALL else "P",
+                    i.expiration_utc.date(),
+                    float(i.strike_price),
+                ): i.id
+                for i in self.cache.instruments(VENUE, underlying=job.symbol)
+                if isinstance(i, OptionContract)
+            }
+            candidates = generate(
+                job.structure.legs, chain, job.underlying, today, targets, lim
+            )
+            ids = {p.instrument_id for c in candidates for p in c}
+            if job.vix:  # each option's future comes from put-call parity
+                ins = [self.cache.instrument(i) for i in ids]
+                ids |= {q.id for i in ins if i and (q := parity_partner(self.cache, i))}
+            await self._fresh_quotes(ids)
+            greeks = {}
+            for iid in ids:
+                ins = self.cache.instrument(iid)
+                g = option_greeks(self.cache, self.greeks, ins, today) if ins else None
+                if g is not None:
+                    greeks[iid] = g
+            quotes = {iid: self._quote(iid) for iid in ids}
+            for legs in candidates:
+                c = evaluate(
+                    job.structure.kind,
+                    legs,
+                    greeks,
+                    quotes,
+                    today,
+                    now,
+                    0.0 if job.vix else SCENARIO_RATE,
+                    None if job.vix else job.sigma_f,
+                    self._pm.grid_spec(vix=job.vix),
+                    self._pm.utility_limits(),
+                    self._pm.quality(),
+                    job.max_loss,
+                )
+                if c is not None:
+                    found.append(c)
+        except Exception as e:  # noqa: BLE001 - the dashboard never waits on it
+            self.log.warning(f"Roll scan of {sid} skipped: {e!r}")
+        # recorded even when empty, so one bad strategy can't hog every cycle
+        self._rolls[sid] = RollScan(now, found)
+
+    async def _load_roll_chain(
+        self, symbol: str, targets: list[int], today: date
+    ) -> None:
+        """The option chain around the target expiries, at most once a day."""
+        if self._roll_chain_day.get(symbol) == today:
+            return
+        self._roll_chain_day[symbol] = today
+        base = (
+            {"secType": "IND", "symbol": symbol[1:], "exchange": "CBOE"}
+            if is_index(symbol)
+            else stock_contract(symbol)
+        )
+        chain = {
+            "build_options_chain": True,
+            "min_expiry_days": max(min(targets) - 15, 0),
+            "max_expiry_days": max(targets) + 45,
+        }
+        await aio.load_contracts(self, [base | chain])
+
+    async def _fresh_quotes(self, ids: set[InstrumentId]) -> None:
+        """Subscribe a few at a time, wait for a quote newer than the request (the
+        cache keeps old ones), unsubscribe: IB limits market data lines."""
+        held = {x.instrument_id for x in held_legs(self.cache)}
+        todo = sorted(ids - held, key=str)
+        size = self._pm.roll_quote_lines
+        for i in range(0, len(todo), size):
+            batch = todo[i : i + size]
+            since = self.clock.timestamp_ns()
+            for iid in batch:
+                aio.subscribe(self, iid)
+            try:
+                for _ in range(ROLL_QUOTE_POLLS):
+                    ticks = [self.cache.quote_tick(iid) for iid in batch]
+                    if all(q is not None and q.ts_event >= since for q in ticks):
+                        break
+                    await asyncio.sleep(0.25)
+            finally:
+                for iid in batch:
+                    aio.unsubscribe(self, iid)
+
     def _quote(self, iid: InstrumentId) -> Quote:
         """Bid, ask and quote time; IB sends -1 for a missing side."""
         q = self.cache.quote_tick(iid)
@@ -907,6 +1118,8 @@ class PortfolioMonitor(Actor):
         limits, quality = self._pm.limits(), self._pm.quality()
         short_limits, vix_limits = self._pm.short_limits(), self._pm.vix_limits()
         utility = self._pm.utility_limits()
+        jobs: dict[str, RollJob] = {}
+        rescan = timedelta(minutes=self._pm.roll_rescan_mins)
         rows, decisions, counts = [], [], dict.fromkeys((P0, P1, P2), 0)
         for sid, (s, und, st, fig, bot) in zip(ids, entries, strict=True):
             closes = self._closes.get(underlying_id(s), {})
@@ -1114,6 +1327,29 @@ class PortfolioMonitor(Actor):
                     )
             if grid:
                 publish_grid(f, sid, grid, self._pm.grid_spec(vix=is_vix))
+                if out != "HOLD" and und:
+                    jobs[sid] = RollJob(
+                        s,
+                        st,
+                        und,
+                        sigma_f,
+                        a.dte_front,
+                        initial_dte,
+                        max_loss,
+                        is_vix,
+                    )
+            scan = self._rolls.get(sid)
+            if scan and (now - scan.at) > 4 * rescan:
+                scan = None  # e.g. yesterday's quotes: not worth showing
+            publish_rolls(
+                f,
+                sid,
+                fwd.u_hold if fwd else None,
+                fwd.u_close if fwd else None,
+                scan,
+                self._pm.roll_margin,
+                now,
+            )
             key = (out, tuple((x.priority, x.name) for x in found))
             if self._pm_last.get(sid) != key:
                 decisions.append((sid, out, [x.__dict__ for x in found], bot))
@@ -1146,6 +1382,8 @@ class PortfolioMonitor(Actor):
                 meaning=meaning,
             )
         self._pm_known = dict(zip(ids, seen, strict=True))
+        self._roll_jobs = jobs
+        self._rolls = {k: v for k, v in self._rolls.items() if k in ids}
         if self._journal is not None:
             try:
                 self._journal.record(rows, inputs, today, now)

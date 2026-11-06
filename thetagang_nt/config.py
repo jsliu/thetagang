@@ -381,6 +381,20 @@ class PMConfig(NautilusConfig, frozen=True):
     risk_aversion: float = 0.1  # [M7] lambda, $ of utility per $ of ES
     capital_cost: float = 0.05  # [M7] kappa, per year on capital at risk
     commission: float = 0.65  # [M9] $ per contract
+    # roll candidates (roll_rules, vix_roll_management), reported, never orders.
+    # One strategy not on HOLD is scanned per monitor cycle; its candidates are
+    # quoted a few at a time and unsubscribed, because IB limits market data lines
+    roll_scan: bool = True
+    roll_quote_lines: int = 12  # market data lines a scan may use at once
+    roll_rescan_mins: int = 30  # a strategy's candidates are refreshed this often
+    # [M13] same structure: new front DTE at these multiples of the original life
+    roll_dte_multiples: tuple[float, ...] = (1.0, 1.5, 2.0)
+    roll_min_life: int = 30  # [M13] a shorter or unknown life counts as this
+    roll_min_extension: int = 14  # [M13] days past the current front expiry
+    roll_strike_shifts: tuple[float, ...] = (-0.05, 0.0, 0.05)  # [M13] of underlying
+    roll_strike_tolerance: float = 0.03  # [M13] nearest listed strike within this
+    vix_roll_dte: tuple[int, ...] = (30, 45, 60)  # [V1] VIX: the 30-60 day target
+    roll_margin: float = 10.0  # [M7] epsilon, $: a roll must beat HOLD by this
     realized_vol_days: int = 21  # [M6] daily returns behind the realised-vol forecast
     # Short Options Manager (strategies opened for a credit), short_exit_signals
     capture_levels: tuple[float, ...] = (0.5, 0.7, 0.8, 0.9)  # [S1] credit captured
@@ -449,6 +463,19 @@ class PMConfig(NautilusConfig, frozen=True):
             risk_aversion=self.risk_aversion,
             capital_cost=self.capital_cost,
             commission=self.commission,
+        )
+
+    def roll_limits(self) -> Any:
+        from thetagang_nt.pm.core.rolls import RollLimits
+
+        return RollLimits(
+            dte_multiples=tuple(self.roll_dte_multiples),
+            min_life=self.roll_min_life,
+            min_extension=self.roll_min_extension,
+            strike_shifts=tuple(self.roll_strike_shifts),
+            strike_tolerance=self.roll_strike_tolerance,
+            vix_dte=tuple(self.vix_roll_dte),
+            margin=self.roll_margin,
         )
 
     def quality(self) -> Any:
@@ -524,6 +551,16 @@ class PMConfig(NautilusConfig, frozen=True):
             ("risk_aversion", "M7", "lambda: utility cost per $ of ES"),
             ("capital_cost", "M7", "kappa: yearly cost of capital at risk"),
             ("commission", "M9", "$ per contract to trade"),
+            ("roll_scan", "", "scan roll candidates (reported, never orders)"),
+            ("roll_quote_lines", "", "market data lines a roll scan may use at once"),
+            ("roll_rescan_mins", "", "minutes between scans of one strategy"),
+            ("roll_dte_multiples", "M13", "new front DTE, multiples of original life"),
+            ("roll_min_life", "M13", "a shorter or unknown life counts as this"),
+            ("roll_min_extension", "M13", "days past the current front expiry"),
+            ("roll_strike_shifts", "M13", "strike shifts, share of the underlying"),
+            ("roll_strike_tolerance", "M13", "nearest listed strike within this"),
+            ("vix_roll_dte", "V1", "long VIX: roll target DTEs"),
+            ("roll_margin", "M7", "a roll must beat HOLD by more than this, $"),
             (
                 "realized_vol_days",
                 "M6",

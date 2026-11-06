@@ -44,6 +44,16 @@ def expected_shortfall(outcomes: list[tuple[float, float]], alpha: float) -> flo
     return -total / alpha
 
 
+def capital_at_risk(
+    v_exec: float | None, v_floor: float | None, stress_loss: float | None
+) -> float | None:
+    """CaR (risk_metrics): down to the expiry floor for defined risk, else the
+    worst stress loss (no broker margin here)."""
+    if v_exec is not None and v_floor is not None:
+        return v_exec - v_floor
+    return stress_loss
+
+
 @dataclass(frozen=True)
 class UtilityLimits:
     """Register IDs in brackets; all hypotheses with starting values chosen
