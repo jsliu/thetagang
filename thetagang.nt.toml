@@ -254,6 +254,7 @@ weight = 0.0
 # roll_margin = 10.0            # [M7] a roll must beat HOLD by more than this, $
 # The joint price and IV model, reported beside the IV-unchanged one. One underlying's
 # two years of IB bars per monitor cycle, once a day:
+# american_pricing = true       # equity and ETF options, with IB's dividends; false: European
 # iv_model = true               # false: no IV history requests
 # iv_window = 252               # [M8] trading days today's IV is ranked against
 # iv_min_samples = 30           # [M8] fewer in today's third: use all of history
@@ -269,6 +270,8 @@ weight = 0.0
 #                               # prefer closing or adjust / generally prefer closing
 # loss_multiples = [1.0, 2.0, 3.0]  # [S3] loss as a multiple of the credit
 # assignment_days = 7           # [S4] an in-the-money short leg this close to expiry
+# ex_dividend_days = 10         # [S4] an in-the-money short call this close to an ex-date,
+#                               # its extrinsic value below the dividend (either manager)
 # tested_moves = 1.0            # [S5] spot within this many moves of a short strike
 # tested_horizon = 5            # [S5] trading days in a move (S x sigma_f x sqrt(h/252))
 # Long VIX calls (vault vix_options_management) replace T1 and T3 with:

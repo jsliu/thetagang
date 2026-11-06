@@ -21,7 +21,7 @@ from thetagang_nt.pm.core.quality import (
     leg_flags,
     values,
 )
-from thetagang_nt.pm.core.scenarios import GridSpec, grid, repriced
+from thetagang_nt.pm.core.scenarios import GridSpec, PriceModel, grid, repriced
 from thetagang_nt.pm.core.valuation import UtilityLimits, capital_at_risk, forward
 from thetagang_nt.rules import Leg, Structure, structure_figures, structure_label
 
@@ -137,6 +137,7 @@ def evaluate(
     max_loss: float | None,
     iv_model: IvModel | None = None,
     iv_limits: IvLimits = IvLimits(),
+    model: PriceModel | None = None,
 ) -> Candidate | None:
     """One candidate as a new trade, through the same grid and utility as HOLD;
     None if a leg has no usable quote or greeks."""
@@ -149,7 +150,11 @@ def evaluate(
     }
     if flags & set(UNUSABLE):
         return None
-    g = grid(legs, greeks, today, carry, sigma_f, spec)
+    legs = tuple(
+        replace(p, mid=(quotes[p.instrument_id].bid + quotes[p.instrument_id].ask) / 2)
+        for p in legs
+    )
+    g = grid(legs, greeks, today, carry, sigma_f, spec, model)
     v_mid, v_exec = values(legs, quotes)
     if g is None or v_mid is None or v_exec is None:
         return None
@@ -180,6 +185,7 @@ def evaluate(
             iv_model.samples,
             util.horizon,
             iv_limits.term_days,
+            model,
         )
         fwd_iv = forward(
             g, half_spread, contracts, max(car or 0.0, 0.0), util, pnls=pnls

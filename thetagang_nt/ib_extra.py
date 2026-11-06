@@ -179,6 +179,25 @@ class AccountExtras:
         days = sorted(ivs.keys() & closes.keys())
         return [closes[d] for d in days], [ivs[d] for d in days]
 
+    async def dividends(self, symbol: str) -> tuple[Any, float | None, float | None]:
+        """(next date, next amount, next 12 months) from IB's dividend tick, one
+        market data line for a moment; Nones for a stock that pays none."""
+        await self.connect()
+        contract = Stock(symbol, "SMART", "USD")
+        await self.ib.qualifyContractsAsync(contract)
+        ticker = self.ib.reqMktData(contract, "456", False, False)
+        try:
+            for _ in range(16):
+                if ticker.dividends:
+                    break
+                await asyncio.sleep(0.25)
+        finally:
+            self.ib.cancelMktData(contract)
+        d = ticker.dividends
+        if not d:
+            return None, None, None
+        return d.nextDate, _number(d.nextAmount), _number(d.next12Months)
+
     async def _learn(self, con_ids: Any) -> None:
         unknown = [c for c in con_ids if c not in self._labels]
         if unknown:

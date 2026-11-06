@@ -29,6 +29,7 @@ from thetagang_nt import aio
 from thetagang_nt.config import DiscretionaryConfig, MonitorConfig, PMConfig
 from thetagang_nt.ib_extra import AccountExtras
 from thetagang_nt.journal import IvRow, Journal, LegRow, StrategyRow
+from thetagang_nt.pm.core.american import schedule
 from thetagang_nt.pm.core.assess import assess
 from thetagang_nt.pm.core.iv_model import IvHistory, IvModel, build
 from thetagang_nt.pm.core.profit import capture_ratio, value_bounds
@@ -50,8 +51,8 @@ from thetagang_nt.pm.core.rolls import (
     target_dtes,
 )
 from thetagang_nt.pm.core.scenarios import RATE as SCENARIO_RATE
+from thetagang_nt.pm.core.scenarios import PriceModel, repriced
 from thetagang_nt.pm.core.scenarios import grid as scenario_grid
-from thetagang_nt.pm.core.scenarios import repriced
 from thetagang_nt.pm.core.strategy_id import Seen, auto_ids
 from thetagang_nt.pm.core.valuation import forward
 from thetagang_nt.pm.long_options import signals as long_options
@@ -157,6 +158,35 @@ def publish_grid(f: _Families, sid: str, grid: Any, spec: Any) -> None:
             )
 
 
+def short_leg(
+    p: Leg,
+    today: date,
+    spot: float | None,
+    quote: Quote | None,
+    dividends: tuple[tuple[date, float], ...],
+) -> ShortLeg:
+    """A short leg, with what the ex-dividend check needs for a call."""
+    coming = [
+        (when, amount)
+        for when, amount in dividends
+        if today <= when and p.expiry and when < p.expiry
+    ]
+    extrinsic = None
+    if spot and quote and quote.bid is not None and quote.ask is not None:
+        intrinsic = (
+            max(spot - p.strike, 0.0) if p.right == "C" else max(p.strike - spot, 0.0)
+        )
+        extrinsic = max((quote.bid + quote.ask) / 2 - intrinsic, 0.0)
+    return ShortLeg(
+        p.dte(today),
+        p.strike,
+        p.right,
+        coming[0][1] if coming else None,
+        (coming[0][0] - today).days if coming else None,
+        extrinsic,
+    )
+
+
 def iv_rows(
     legs: Any, greeks: dict, quotes: dict, now: datetime, limits: Any
 ) -> list[IvRow]:
@@ -196,6 +226,7 @@ class RollJob:
     max_loss: float | None
     vix: bool
     iv_model: IvModel | None = None
+    price_model: PriceModel | None = None
 
 
 @dataclass(frozen=True)
@@ -384,6 +415,7 @@ class PortfolioMonitor(Actor):
         self._roll_jobs: dict[str, RollJob] = {}  # strategies to scan, this cycle
         self._rolls: dict[str, RollScan] = {}  # the last scan of each strategy
         self._roll_chain_day: dict[str, date] = {}  # chains loaded, per symbol
+        self._dividends: dict[str, tuple[tuple[date, float], ...]] = {}
         self._iv_hist: dict[str, IvHistory] = {}  # two years of closes and IVs
         self._iv_day: dict[str, date] = {}  # when each was last requested
         self._iv_models: dict[tuple[str, date], IvModel | None] = {}
@@ -531,8 +563,8 @@ class PortfolioMonitor(Actor):
         self._snapshot.families = list(f.by_name.values())
         if self._pm.roll_scan:
             await self._scan_rolls(today)
-        if self._pm.iv_model:
-            await self._load_iv_history(symbols, today)
+        if self._pm.iv_model or self._pm.american_pricing:
+            await self._load_underlying_data(symbols, today)
 
     async def _load_betas(self, symbols: list[str], today: date) -> None:
         start = self.clock.utc_now() - timedelta(days=365)
@@ -1023,7 +1055,9 @@ class PortfolioMonitor(Actor):
         never = datetime.min.replace(tzinfo=UTC)
         when = {
             sid: self._rolls[sid].at if sid in self._rolls else never
-            for sid in self._roll_jobs
+            for sid, job in self._roll_jobs.items()
+            # after its dividends and IV history: a scan before them is half a scan
+            if self._iv_day.get(job.symbol) == today or job.vix
         }
         due = [sid for sid, at in when.items() if now - at >= rescan]
         if not due:
@@ -1075,6 +1109,7 @@ class PortfolioMonitor(Actor):
                     job.max_loss,
                     job.iv_model,
                     self._pm.iv_limits(),
+                    job.price_model,
                 )
                 if c is not None:
                     found.append(c)
@@ -1097,9 +1132,17 @@ class PortfolioMonitor(Actor):
             )
         return self._iv_models[key]
 
-    async def _load_iv_history(self, symbols: set[str], today: date) -> None:
-        """One underlying per cycle, once a day: IB paces historical requests
-        (60 per 10 minutes). VIX options need a different model (M12)."""
+    def _price_model_of(self, symbol: str) -> PriceModel | None:
+        """American for equity and ETF options once their dividends are known;
+        until then, and for index options, European."""
+        if not self._pm.american_pricing or symbol not in self._dividends:
+            return None
+        return PriceModel(self._dividends[symbol])
+
+    async def _load_underlying_data(self, symbols: set[str], today: date) -> None:
+        """Dividends and IV history, one underlying per cycle, once a day: IB
+        paces historical requests (60 per 10 minutes). VIX options need a
+        different IV model (M12) and pay no dividends."""
         if self._extras is None:
             return
         todo = sorted(s for s in symbols - {VIX_ROOT} if self._iv_day.get(s) != today)
@@ -1107,6 +1150,15 @@ class PortfolioMonitor(Actor):
             return
         symbol = todo[0]
         self._iv_day[symbol] = today
+        if self._pm.american_pricing and not is_index(symbol):
+            try:
+                self._dividends[symbol] = schedule(
+                    *await self._extras.dividends(symbol), today
+                )
+            except Exception as e:  # noqa: BLE001 - stays European until it loads
+                self.log.warning(f"Dividends of {symbol} not loaded: {e!r}")
+        if not self._pm.iv_model:
+            return
         try:
             closes, ivs = await self._extras.iv_history(symbol)
             self._iv_hist[symbol] = IvHistory(tuple(closes), tuple(ivs))
@@ -1231,6 +1283,7 @@ class PortfolioMonitor(Actor):
             v_floor, _ = value_bounds(fig)
             # the scenario grid (scenario_engine): VIX options on their future
             is_vix = s == VIX_ROOT
+            price_model = self._price_model_of(s)
             grid = scenario_grid(
                 st.legs,
                 greeks,
@@ -1238,6 +1291,7 @@ class PortfolioMonitor(Actor):
                 0.0 if is_vix else SCENARIO_RATE,
                 None if is_vix else sigma_f,  # no sigma_F for VIX futures yet
                 self._pm.grid_spec(vix=is_vix),
+                price_model,
             )
             worst = grid.worst_loss() if grid else None
             stress = grid.stress_loss() if grid else None
@@ -1274,6 +1328,7 @@ class PortfolioMonitor(Actor):
                     iv_model.samples,
                     utility.horizon,
                     self._pm.iv_term_days,
+                    price_model,
                 )
                 fwd_iv = forward(
                     grid,
@@ -1307,7 +1362,13 @@ class PortfolioMonitor(Actor):
                 gt_h=a.eff.gt_h,
                 remaining_reward_risk=a.remaining_rr,
                 short_legs=tuple(
-                    ShortLeg(p.dte(today), p.strike, p.right)
+                    short_leg(
+                        p,
+                        today,
+                        und,
+                        quotes.get(p.instrument_id),
+                        self._dividends.get(s, ()),
+                    )
                     for p in st.legs
                     if p.qty < 0
                 ),
@@ -1362,6 +1423,8 @@ class PortfolioMonitor(Actor):
                 ("v_mid", a.v_mid),
                 ("v_exec", a.v_exec),
                 ("liquidity_cost", liquidity),
+                ("v_model", grid.v_model if grid else None),
+                ("american", 1.0 if price_model else 0.0),
                 ("stress_loss", stress),
                 ("loss_budget", budget),
                 ("capital_at_risk", car),
@@ -1448,6 +1511,7 @@ class PortfolioMonitor(Actor):
                         max_loss,
                         is_vix,
                         iv_model,
+                        price_model,
                     )
             scan = self._rolls.get(sid)
             if scan and (now - scan.at) > 4 * rescan:

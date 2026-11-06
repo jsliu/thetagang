@@ -290,7 +290,7 @@ lists every key with a comment.
 | `[strategy.butterfly]`, `[strategy.straddle]`, `[strategy.calendar]` | only with `[pm] decide = false`: what the bot's own rules would do for butterflies (`take_profit`, `partial_take_profit` of the max profit, `close_dte`), long straddles/strangles (`take_profit_gain`, `partial_take_profit_gain` of the debit, `leg_delta`, `roll_dte`) and calendars/diagonals (`take_profit` of the debit, `short_roll_dte`, `close_dte`). Each has `trade` (default false): true lets the bot place the recommendation (dry_run applies): close or close half as one combo with every leg in its ratio, close a straddle's winning leg, or roll a calendar's short leg to the next expiry before the long leg's for a net credit. "Roll whole" is never placed: it stays yours |
 | `[[strategy.structures]]` | `name`, `legs` (contract labels as the dashboard shows them, e.g. `"AA 20261218 40P"`): option legs you hold as one position; recognised before any automatic grouping, left to you, and never resized by the trade plan |
 | `[strategy.symbols.<SYM>]` | `no_trading`, `put_strike_limit`, `call_strike_limit`, `delta` and `max_dte` (override `credit.roll_target`), `ignore_missing_greeks` |
-| `[pm]` | the Portfolio Manager: `decide` (default true: its review signals replace the bot's roll/close rules, which then only report), `journal`, `max_loss` (a risk budget in $ for every strategy: a P0 review when its worst case exceeds it; a strategy's own `max_loss` overrides it), and the review thresholds by vault register ID: `profit_levels`, `spread_max_profit` (T1), `credit_levels` (T2), `delta_review` (T4), `delta_drift` (T5), `gt_review`, `gt_horizon` (T6), `remaining_reward_risk` (T8), `near_expiry_days`, `near_money`, `stale_secs`, `wide_spread` (T9), `dte_windows` (T3), `gamma_tolerance`, `theta_tolerance` (T7), `grid_moves`, `iv_shifts` (M1), `vix_moves`, `vix_iv_shifts` (M11), `realized_vol_days` (M6), `utility_horizon`, `es_alpha`, `risk_aversion`, `capital_cost`, `roll_margin` (M7), `commission` (M9), `roll_scan`, `roll_quote_lines`, `roll_rescan_mins`, `roll_dte_multiples`, `roll_min_life`, `roll_min_extension`, `roll_strike_shifts`, `roll_strike_tolerance` (M13), `vix_roll_dte` (V1), `iv_model`, `iv_window`, `iv_min_samples`, `iv_view_shrink` (M8), `iv_term_days` (M3); for the Short Options Manager: `capture_levels` (S1), `short_dte_bands` (S2), `loss_multiples` (S3), `assignment_days` (S4), `tested_moves`, `tested_horizon` (S5); for long VIX options: `vix_profit_levels` (V2), `vix_loss_levels` (V3), `vix_review_dte` (V7). The Portfolio Manager dashboard's *Trading rules in use* table lists the trading rules (T1, T3–T6, T8, S1–S5, V1–V3, V7, `decide`), default or yours; model and data settings act but are not listed |
+| `[pm]` | the Portfolio Manager: `decide` (default true: its review signals replace the bot's roll/close rules, which then only report), `journal`, `max_loss` (a risk budget in $ for every strategy: a P0 review when its worst case exceeds it; a strategy's own `max_loss` overrides it), and the review thresholds by vault register ID: `profit_levels`, `spread_max_profit` (T1), `credit_levels` (T2), `delta_review` (T4), `delta_drift` (T5), `gt_review`, `gt_horizon` (T6), `remaining_reward_risk` (T8), `near_expiry_days`, `near_money`, `stale_secs`, `wide_spread` (T9), `dte_windows` (T3), `gamma_tolerance`, `theta_tolerance` (T7), `grid_moves`, `iv_shifts` (M1), `vix_moves`, `vix_iv_shifts` (M11), `realized_vol_days` (M6), `utility_horizon`, `es_alpha`, `risk_aversion`, `capital_cost`, `roll_margin` (M7), `commission` (M9), `roll_scan`, `roll_quote_lines`, `roll_rescan_mins`, `roll_dte_multiples`, `roll_min_life`, `roll_min_extension`, `roll_strike_shifts`, `roll_strike_tolerance` (M13), `vix_roll_dte` (V1), `iv_model`, `iv_window`, `iv_min_samples`, `iv_view_shrink` (M8), `iv_term_days` (M3), `american_pricing`; for the Short Options Manager: `capture_levels` (S1), `short_dte_bands` (S2), `loss_multiples` (S3), `assignment_days`, `ex_dividend_days` (S4), `tested_moves`, `tested_horizon` (S5); for long VIX options: `vix_profit_levels` (V2), `vix_loss_levels` (V3), `vix_review_dte` (V7). The Portfolio Manager dashboard's *Trading rules in use* table lists the trading rules (T1, T3–T6, T8, S1–S5, V1–V3, V7, `decide`), default or yours; model and data settings act but are not listed |
 | `[[pm.strategies]]` | your inputs for one strategy, by its Portfolio Manager ID (e.g. `"AA-debit-spread-1"`): `thesis`, `invalidation_below` / `invalidation_above` (a price: the thesis is invalid past it, a P0 review), `target`, `max_loss` (your risk budget: a P0 review when the worst case exceeds it), `thesis_valid`, `assignment_intended` (short premium: expiry or assignment is the plan, so no assignment review) |
 
 Remove the whole `[strategy]` section to run the monitor only. The roll,
@@ -368,8 +368,14 @@ ID such as `AA-debit-spread-1` that survives rolls), the pure functions in
   days at the 21-day realised volatility, and the breakeven volatility.
 - **Profit**: return on debit or credit captured, remaining reward/risk.
 - **Scenario grid** ([`pm/core/scenarios.py`](thetagang_nt/pm/core/scenarios.py)):
-  every leg repriced (generalised Black-Scholes on its own underlying,
-  Black-76 for VIX options on their future; model baseline, not the mid) after
+  every leg repriced from a model baseline, not the mid. Equity and ETF options
+  are American with discrete dividends
+  ([`pm/core/american.py`](thetagang_nt/pm/core/american.py): Barone-Adesi and
+  Whaley for puts, Black's pseudo-American for calls, checked against a binomial
+  tree in the tests; IV re-implied by the same model). IB gives one dated dividend
+  and a 12-month total, so later dividends are estimates. Until an underlying's
+  dividends load, and for index options, it is Black-Scholes; VIX options are
+  Black-76 on their future. Cells are after
   1, 5 and 10 trading days, at price moves of ±2 / ±5% and ±2 / ±1 realised
   moves, and IV shifts of ±5 / ±10 points (VIX: futures −20…+30%, IV ±10 / ±20).
   Legs expiring inside the horizon go to intrinsic, with their strikes as extra
@@ -410,7 +416,8 @@ ID such as `AA-debit-spread-1` that survives rolls), the pure functions in
     [`pm/short_options/`](thetagang_nt/pm/short_options)): P1 premium captured
     (50 / 70 / 80 / 90%), the front short leg's DTE band (21 / 14 / 7 days),
     the loss as a multiple of the credit, an in-the-money short leg near
-    expiry (assignment); P2 spot within one 5-day move of a short strike. It
+    expiry (assignment), and, in either manager, an in-the-money short call
+    near an ex-date with extrinsic value below the dividend; P2 spot within one 5-day move of a short strike. It
     also shows the loss multiple and the premium left per $ of risk.
 
   The outcome is HOLD, REVIEW, REVIEW - data unreliable, or CLOSE review (any
@@ -428,8 +435,7 @@ contracts at a time and unsubscribes them (`roll_quote_lines`,
 `roll_rescan_mins`; `roll_scan = false` turns it off).
 
 Every threshold is a hypothesis with its vault register ID, set under `[pm]`.
-Still to come in phase 2: American pricing and dividends, and a volatility
-surface.
+Still to come in phase 2: a volatility surface.
 
 The **journal** (Postgres, the `journal-db` service) keeps the strategies and
 their legs (opened and closed), one snapshot per strategy per day, a

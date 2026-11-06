@@ -513,6 +513,8 @@ def test_the_monitor_sends_each_strategy_to_its_manager():
         _iv_hist={},
         _iv_models={},
         _iv_model_of=lambda *a: None,
+        _dividends={},
+        _price_model_of=lambda *a: None,
         log=SimpleNamespace(warning=warnings.append),
     )
     f = _Families()
@@ -633,6 +635,8 @@ def test_a_default_risk_budget_applies_unless_a_strategy_sets_its_own():
             _iv_hist={},
             _iv_models={},
             _iv_model_of=lambda *a: None,
+            _dividends={},
+            _price_model_of=lambda *a: None,
             log=SimpleNamespace(warning=print),
         )
         f = _Families()
@@ -737,6 +741,8 @@ def test_the_monitor_sends_vix_calls_to_the_vix_rules():
         _iv_hist={},
         _iv_models={},
         _iv_model_of=lambda *a: None,
+        _dividends={},
+        _price_model_of=lambda *a: None,
         log=SimpleNamespace(warning=print),
     )
     f = _Families()
@@ -1224,6 +1230,7 @@ def test_the_monitor_scans_one_strategy_and_leaves_no_line_subscribed(monkeypatc
         _roll_jobs={"AA-long-call-1": job, "BB-long-call-1": job},
         _rolls={"BB-long-call-1": other_scan},  # scanned just now: not due
         _roll_chain_day={},
+        _iv_day={"AA": TODAY},
         _quote=lambda iid: Quote(5.0, 5.2, datetime.now(timezone.utc)),
     )
     fake._load_roll_chain = lambda *a: PortfolioMonitor._load_roll_chain(fake, *a)
@@ -1234,6 +1241,12 @@ def test_the_monitor_scans_one_strategy_and_leaves_no_line_subscribed(monkeypatc
     ((chain,),) = loads
     assert chain["symbol"] == "AA" and chain["build_options_chain"]
     assert fake._rolls["BB-long-call-1"] is other_scan
+    # not scanned before its dividends and IV history have loaded
+    waiting = RollJob("CC", st, 100.0, 0.3, 30, 60, 2000.0, False)
+    fake._roll_jobs["CC-long-call-1"] = waiting
+    asyncio.run(PortfolioMonitor._scan_rolls(fake, TODAY))
+    assert "CC-long-call-1" not in fake._rolls
+    del fake._roll_jobs["CC-long-call-1"]
     ((c,)) = fake._rolls["AA-long-call-1"].candidates
     assert c.legs[0].instrument_id == new_ins.id  # the later expiry, same strike
     # the chain is loaded once a day, however many scans
@@ -1396,6 +1409,8 @@ def test_the_monitor_reports_both_views_side_by_side():
         _pm_last={},
         _rolls={},
         _iv_model_of=lambda *a: model,
+        _dividends={},
+        _price_model_of=lambda *a: None,
         log=SimpleNamespace(warning=print),
     )
     f = _Families()
@@ -1436,3 +1451,158 @@ def test_a_roll_candidate_gets_a_utility_under_the_iv_model_too():
     assert c.u_new == without.u_new  # the IV-fixed figures don't change
     # the comparison under the IV model reads u_new_iv
     assert compare(-500.0, -20.0, [replace(c, u_new=c.u_new_iv)], 10.0).best is not None
+
+
+# -------------------------------------- phase 2: American pricing and dividends
+
+
+def binomial(s0, k, t, v, call, r, dividends=(), steps=800):
+    """The reference: Cox-Ross-Rubinstein on the escrowed price (option_repricing)."""
+    import math
+
+    import numpy as np
+
+    inside = [(x, d) for x, d in dividends if 0 < x < t]
+    dt = t / steps
+    escrowed = s0 - sum(d * math.exp(-r * x) for x, d in inside)
+    u = math.exp(v * math.sqrt(dt))
+    p = (math.exp(r * dt) - 1 / u) / (u - 1 / u)
+    disc = math.exp(-r * dt)
+    st = escrowed * u ** (2 * np.arange(steps + 1) - steps)
+    value = np.maximum(st - k, 0) if call else np.maximum(k - st, 0)
+    for i in range(steps - 1, -1, -1):
+        now = i * dt
+        pv = sum(d * math.exp(-r * (x - now)) for x, d in inside if x > now)
+        st = escrowed * u ** (2 * np.arange(i + 1) - i) + pv
+        value = disc * (p * value[1:] + (1 - p) * value[:-1])
+        value = np.maximum(value, st - k if call else k - st)
+    return float(value[0])
+
+
+@pytest.mark.parametrize("call", [True, False])
+@pytest.mark.parametrize("years", [30 / 365, 0.25, 1.0])
+@pytest.mark.parametrize("vol", [0.25, 0.6])
+@pytest.mark.parametrize("ratio", [0.85, 1.0, 1.15])
+def test_american_prices_converge_to_a_binomial_tree(call, years, vol, ratio):
+    from thetagang_nt.pm.core.american import american
+
+    dividends = ((years / 2, 0.5),)
+    tree = binomial(100, 100 * ratio, years, vol, call, 0.0425, dividends)
+    model = american(100, 100 * ratio, years, vol, call, 0.0425, dividends)
+    # measured on typical inputs; extreme ones reach about 4% of the option's value
+    assert abs(model - tree) <= max(0.25, 0.03 * tree)
+
+
+def test_american_price_properties():
+    from thetagang_nt.pm.core.american import american, european, implied_vol
+
+    r = 0.0425
+    # no dividend in its life: an American call is the European one
+    assert american(100, 100, 0.5, 0.3, True, r) == european(
+        100, 100, 0.5, 0.3, True, r
+    )
+    assert american(100, 100, 0.5, 0.3, True, r, ((1.0, 2.0),)) == pytest.approx(
+        european(100, 100, 0.5, 0.3, True, r)
+    )
+    # a put is worth more than the European one, and at least its intrinsic value
+    assert american(100, 110, 1.0, 0.2, False, r) > european(
+        100, 110, 1.0, 0.2, False, r
+    )
+    assert american(60, 100, 1.0, 0.2, False, r) == pytest.approx(40.0)
+    # a dividend lowers a call and raises a put
+    assert american(100, 100, 1.0, 0.3, True, r, ((0.5, 2.0),)) < american(
+        100, 100, 1.0, 0.3, True, r
+    )
+    assert american(100, 100, 1.0, 0.3, False, r, ((0.5, 2.0),)) > american(
+        100, 100, 1.0, 0.3, False, r
+    )
+    # expired: intrinsic
+    assert american(105, 100, 0, 0.3, True, r) == 5.0
+    # deep in the money with a dividend: never more than waiting for it is worth
+    assert american(100, 130, 1.0, 0.2, False, r, ((0.5, 1.0),)) == pytest.approx(30.0)
+    # implied vol round trip, and none where no vol can match
+    p = american(100, 95, 0.5, 0.4, False, r, ((0.2, 1.0),))
+    assert implied_vol(p, 100, 95, 0.5, False, r, ((0.2, 1.0),)) == pytest.approx(
+        0.4, abs=1e-3
+    )
+    assert implied_vol(1.0, 100, 50, 0.5, True, r) is None  # below intrinsic
+
+
+def test_dividend_schedule_repeats_what_ib_gives():
+    from thetagang_nt.pm.core.american import schedule
+
+    assert schedule(None, None, None, TODAY) == ()  # pays none
+    assert schedule(TODAY - timedelta(days=1), 1.0, 4.0, TODAY) == ()  # stale
+    next_date = TODAY + timedelta(days=10)
+    s = schedule(next_date, 1.0, 4.0, TODAY, years=1)
+    assert s[0] == (next_date, 1.0) and len(s) == 4  # quarterly
+    assert (s[1][0] - s[0][0]).days == 91
+    assert len(schedule(next_date, 0.15, 0.15, TODAY, years=1)) == 1  # yearly (KWEB)
+
+
+def test_the_grid_prices_american_from_a_baseline_at_the_mid():
+    from thetagang_nt.pm.core.scenarios import RATE, PriceModel, grid
+
+    p = leg("p", "P", 100, 1, mid=6.0)
+    g = {"p": SimpleNamespace(underlying=100.0, vol=0.5)}
+    euro = grid((p,), g, TODAY, RATE, None)
+    am = grid((p,), g, TODAY, RATE, None, model=PriceModel())
+    # IV re-implied by the same model: the baseline is the mid
+    assert am.v_model == pytest.approx(600.0, abs=1.0)
+    assert euro.v_model != am.v_model
+    # a dividend inside the horizon is gone from the later cells' future
+    ex = TODAY + timedelta(days=3)
+    paying = grid((p,), g, TODAY, RATE, None, model=PriceModel(((ex, 2.0),)))
+    assert paying.v_model == pytest.approx(600.0, abs=1.0)
+    assert paying.fixed[(10, 0.0, 0)] != am.fixed[(10, 0.0, 0)]
+    # no vol can match the mid: the leg keeps the vol it came with
+    low = leg("p", "P", 100, 1, mid=0.0001)
+    assert grid((low,), g, TODAY, RATE, None, model=PriceModel()).v_model > 100
+
+
+def test_s4_ex_dividend_check_in_both_managers():
+    def state(cls=SHORT, **kw):
+        leg_ = ShortLeg(
+            20,
+            105.0,
+            "C",
+            kw.pop("dividend", 0.63),
+            kw.pop("ex_days", 7),
+            kw.pop("extrinsic", 0.40),
+        )
+        return StrategyState(
+            cls=cls, spot=kw.pop("spot", 110.0), short_legs=(leg_,), **kw
+        )
+
+    want = "short 105C: ex-dividend in 7 days, $0.63 > $0.40 extrinsic"
+    for found in (short_options.signals(state()), long_options.signals(state())):
+        assert want in [x.detail for x in found if x.priority == P1]
+
+    def details(s):
+        return [x.detail for x in short_options.signals(s) if "ex-dividend" in x.detail]
+
+    assert (
+        details(state(extrinsic=0.80)) == []
+    )  # time value worth more than the dividend
+    assert details(state(spot=100.0)) == []  # out of the money
+    assert details(state(ex_days=30)) == []  # too far off
+    assert details(state(dividend=None, ex_days=None)) == []  # pays none
+    assert details(state(assignment_intended=True)) == []  # your plan
+    put = ShortLeg(20, 115.0, "P", 0.63, 7, 0.10)
+    assert details(StrategyState(cls=SHORT, spot=110.0, short_legs=(put,))) == []
+
+
+def test_short_leg_takes_the_next_dividend_before_its_expiry():
+    pytest.importorskip("nautilus_trader")
+    pytest.importorskip("psycopg")
+    from thetagang_nt.monitor import short_leg
+
+    p = leg("c", "C", 105, -1)  # expires in 30 days
+    soon = TODAY + timedelta(days=7)
+    after = TODAY + timedelta(days=60)
+    x = short_leg(p, TODAY, 110.0, Quote(5.3, 5.5), ((soon, 0.63), (after, 0.63)))
+    assert (x.dividend, x.ex_days) == (0.63, 7)
+    assert x.extrinsic == pytest.approx(0.4)  # mid 5.40 less intrinsic 5
+    y = short_leg(p, TODAY, 110.0, Quote(5.3, 5.5), ((after, 0.63),))
+    assert y.dividend is None and y.ex_days is None
+    assert short_leg(p, TODAY, None, None, ()).extrinsic is None

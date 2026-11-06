@@ -18,6 +18,7 @@ from thetagang_nt.pm.core.review import (
     Signal,
     StrategyState,
     class_change,
+    ex_dividend,
     hard_signals,
     outcome,
 )
@@ -45,6 +46,7 @@ class ShortLimits:
     dte_bands: tuple[int, int, int] = (21, 14, 7)
     loss_multiples: tuple[float, ...] = (1.0, 2.0, 3.0)  # [S3]
     assignment_days: int = 7  # [S4] an in-the-money short leg this close to expiry
+    ex_dividend_days: int = 10  # [S4] a short call this close to an ex-date
     tested_moves: float = 1.0  # [S5] spot within this many Move_h of a short strike
     tested_horizon: int = 5  # [S5] trading days in Move_h
 
@@ -97,7 +99,8 @@ def signals(s: StrategyState, lim: ShortLimits = ShortLimits()) -> list[Signal]:
                     f"loss {m:.2f}x the credit (level {lim.loss_multiples[n - 1]:g})",
                 )
             )
-    # P1 [S4]: assignment exposure (ex-dividend: no dividend data yet)
+    # P1 [S4]: assignment exposure, near expiry here; before an ex-date below
+    out += ex_dividend(s, lim.ex_dividend_days)
     if s.spot and not s.assignment_intended:
         for x in shorts:
             if x.dte <= lim.assignment_days and is_itm(x.right, x.strike, s.spot):

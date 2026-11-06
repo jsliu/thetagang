@@ -396,6 +396,7 @@ class PMConfig(NautilusConfig, frozen=True):
     vix_roll_dte: tuple[int, ...] = (30, 45, 60)  # [V1] VIX: the 30-60 day target
     roll_margin: float = 10.0  # [M7] epsilon, $: a roll must beat HOLD by this
     # the joint price and IV history model, reported beside the IV-unchanged one
+    american_pricing: bool = True  # equity and ETF options; false: all European
     iv_model: bool = True  # false: no IV history requests
     iv_window: int = 252  # [M8] trading days today's IV is ranked against
     iv_min_samples: int = 30  # [M8] fewer in today's third: use all of history
@@ -408,6 +409,7 @@ class PMConfig(NautilusConfig, frozen=True):
     short_dte_bands: tuple[int, int, int] = (21, 14, 7)
     loss_multiples: tuple[float, ...] = (1.0, 2.0, 3.0)  # [S3] loss / credit
     assignment_days: int = 7  # [S4] an in-the-money short leg this close to expiry
+    ex_dividend_days: int = 10  # [S4] a short call this close to an ex-date
     tested_moves: float = 1.0  # [S5] spot within this many moves of a short strike
     tested_horizon: int = 5  # [S5] trading days in a move (S * sigma_f * sqrt(h/252))
     # Long VIX calls (vault vix_options_management): replace T1 and T3 for VIX
@@ -429,6 +431,7 @@ class PMConfig(NautilusConfig, frozen=True):
             remaining_reward_risk=self.remaining_reward_risk,
             near_expiry_days=self.near_expiry_days,
             near_money=self.near_money,
+            ex_dividend_days=self.ex_dividend_days,
             dte_windows=self.dte_windows,
         )
 
@@ -440,6 +443,7 @@ class PMConfig(NautilusConfig, frozen=True):
             dte_bands=tuple(self.short_dte_bands),
             loss_multiples=tuple(self.loss_multiples),
             assignment_days=self.assignment_days,
+            ex_dividend_days=self.ex_dividend_days,
             tested_moves=self.tested_moves,
             tested_horizon=self.tested_horizon,
         )
@@ -577,6 +581,8 @@ class PMConfig(NautilusConfig, frozen=True):
             ("roll_strike_tolerance", "M13", "nearest listed strike within this"),
             ("vix_roll_dte", "V1", "long VIX: roll target DTEs"),
             ("roll_margin", "M7", "a roll must beat HOLD by more than this, $"),
+            ("ex_dividend_days", "S4", "a short call this close to an ex-date"),
+            ("american_pricing", "", "equity and ETF options priced as American"),
             ("iv_model", "", "load IV history for the joint price and IV model"),
             ("iv_window", "M8", "trading days today's IV is ranked against"),
             ("iv_min_samples", "M8", "fewer in today's third: use all of history"),

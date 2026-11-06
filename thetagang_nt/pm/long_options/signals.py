@@ -17,6 +17,7 @@ from thetagang_nt.pm.core.review import (
     Signal,
     StrategyState,
     class_change,
+    ex_dividend,
     hard_signals,
     outcome,
 )
@@ -43,6 +44,7 @@ class SignalLimits:
     remaining_reward_risk: float = 0.25  # [T8] below this
     near_expiry_days: int = 7  # a short leg this close to expiry...
     near_money: float = 0.02  # ...within this of its strike
+    ex_dividend_days: int = 10  # [S4] a short call this close to an ex-date
     dte_windows: tuple[tuple[int, int], ...] = DTE_WINDOWS  # [T3]
 
 
@@ -150,6 +152,7 @@ def signals(s: StrategyState, lim: SignalLimits = SignalLimits()) -> list[Signal
         + profit_signals(s, lim)
         + time_signals(s, lim)
         + near_expiry_signals(s, lim)
+        + ex_dividend(s, lim.ex_dividend_days)
         + drift_signals(s, lim)
     )
 

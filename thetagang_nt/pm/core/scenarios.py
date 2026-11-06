@@ -9,9 +9,11 @@ for equity and index options (no dividends), carry 0 (Black-76) for VIX
 options on their matching future. The baseline is that model at today's
 inputs, never the market mid, so model-vs-market gaps never enter a P&L.
 
-ponytail: European pricing; American early exercise and discrete dividends
-need a binomial tree and a dividend feed (vault Phase 2, option_repricing).
-Sticky strike, parallel IV per leg; no surface yet (volatility_surface)."""
+With a PriceModel (equity and ETF options, once their dividends are known) legs
+are American with discrete dividends (pm.core.american), each leg's IV re-implied
+from its mid by the same model, so the baseline stays near the mid. Index options
+stay European. Sticky strike, parallel IV per leg; no surface yet
+(volatility_surface)."""
 
 from __future__ import annotations
 
@@ -21,6 +23,7 @@ from datetime import date
 from statistics import median
 from typing import Any
 
+from thetagang_nt.pm.core.american import american, implied_vol
 from thetagang_nt.pm.core.efficiency import HORIZONS, calendar_days
 from thetagang_nt.rules import Leg
 
@@ -52,6 +55,21 @@ def bsm(
     if call:
         return fwd * _n(d1) - disc * _n(d2)
     return disc * _n(-d2) - fwd * _n(-d1)
+
+
+@dataclass(frozen=True)
+class PriceModel:
+    """American exercise, with the dividends to come: (ex-date, $ per share)."""
+
+    dividends: tuple[tuple[date, float], ...] = ()
+
+    def after(self, today: date, days: int) -> tuple[tuple[float, float], ...]:
+        """Those still to come `days` from today, in years from then."""
+        return tuple(
+            (((when - today).days - days) / 365, amount)
+            for when, amount in self.dividends
+            if (when - today).days > days
+        )
 
 
 @dataclass(frozen=True)
@@ -147,29 +165,55 @@ def _value(
     move: Any,
     iv: Any,
     carry: float,
+    model: PriceModel | None = None,
 ) -> float:
     """Strategy value ($) with `days` calendar days elapsed; move(p) and iv(p)
     give each leg's price move and IV points."""
     total = 0.0
+    dividends = model.after(today, days) if model else ()
     for p in priced:
         years = (p.leg.dte(today) - days) / 365
         vol = max(p.vol + iv(p) / 100, MIN_VOL)
-        price = bsm(
-            p.und * (1 + move(p)), p.leg.strike, years, vol, p.leg.right == "C", carry
-        )
+        und = p.und * (1 + move(p))
+        call = p.leg.right == "C"
+        if model:
+            price = american(und, p.leg.strike, years, vol, call, RATE, dividends)
+        else:
+            price = bsm(und, p.leg.strike, years, vol, call, carry)
         total += p.leg.qty * p.leg.multiplier * price
     return total
 
 
-def _priced(legs: tuple[Leg, ...], greeks: dict[Any, Any]) -> list[_Priced] | None:
-    """Each leg with its own underlying and implied vol; None if one is missing."""
+def _priced(
+    legs: tuple[Leg, ...],
+    greeks: dict[Any, Any],
+    today: date,
+    model: PriceModel | None = None,
+) -> list[_Priced] | None:
+    """Each leg with its own underlying and implied vol; None if one is missing.
+    With a model, the vol is re-implied from the leg's mid by that model; where
+    no vol matches the mid, the leg keeps its European one."""
     priced = []
+    dividends = model.after(today, 0) if model else ()
     front_expiry = min(p.expiry for p in legs if p.expiry)
     for p in legs:
         g = greeks.get(p.instrument_id)
         und, vol = getattr(g, "underlying", None), getattr(g, "vol", None)
         if not und or not vol or not p.is_option:
             return None
+        if model and p.mid:
+            vol = (
+                implied_vol(
+                    p.mid,
+                    und,
+                    p.strike,
+                    p.dte(today) / 365,
+                    p.right == "C",
+                    RATE,
+                    dividends,
+                )
+                or vol
+            )
         priced.append(_Priced(p, und, vol, p.expiry == front_expiry))
     return priced
 
@@ -182,14 +226,15 @@ def repriced(
     samples: tuple[tuple[float, float], ...],
     h: int,
     term_days: int,
+    model: PriceModel | None = None,
 ) -> list[float] | None:
     """P&L ($) of each (return, IV change) sample after h trading days, against
     the same model baseline as the grid. The IV change is for term_days to
     expiry; a longer-dated leg moves by sqrt(term_days / DTE) of it (M3)."""
-    priced = _priced(legs, greeks)
+    priced = _priced(legs, greeks, today, model)
     if priced is None:
         return None
-    v_model = _value(priced, today, 0, lambda p: 0.0, lambda p: 0.0, carry)
+    v_model = _value(priced, today, 0, lambda p: 0.0, lambda p: 0.0, carry, model)
     days = calendar_days(today, h)
 
     def share(p: _Priced) -> float:
@@ -203,6 +248,7 @@ def repriced(
             lambda p, r=r: r,
             lambda p, c=c: c * 100 * share(p),
             carry,
+            model,
         )
         - v_model
         for r, c in samples
@@ -216,17 +262,18 @@ def grid(
     carry: float,
     sigma_f: float | None,
     spec: GridSpec = GridSpec(),
+    model: PriceModel | None = None,
 ) -> Grid | None:
     """The 3 horizons x price x IV grid, both families, and the stress
     scenarios; None if a leg has no underlying price or implied vol. Each leg
     moves on its own underlying (a VIX option on its own future)."""
-    priced = _priced(legs, greeks)
+    priced = _priced(legs, greeks, today, model)
     if priced is None:
         return None
-    v_model = _value(priced, today, 0, lambda p: 0.0, lambda p: 0.0, carry)
+    v_model = _value(priced, today, 0, lambda p: 0.0, lambda p: 0.0, carry, model)
 
     def pnl(days: int, move: Any, iv: Any) -> float:
-        return _value(priced, today, days, move, iv, carry) - v_model
+        return _value(priced, today, days, move, iv, carry, model) - v_model
 
     moves = set(spec.moves)
     last_day = calendar_days(today, max(HORIZONS))

@@ -38,6 +38,9 @@ class ShortLeg:
     dte: int
     strike: float
     right: str = ""  # "C" or "P"; the Short Options Manager needs it
+    dividend: float | None = None  # next dividend before its expiry, $ per share
+    ex_days: int | None = None  # days to that ex-date
+    extrinsic: float | None = None  # its value above intrinsic, $ per share
 
 
 @dataclass(frozen=True)
@@ -114,6 +117,30 @@ def hard_signals(s: StrategyState) -> list[Signal]:
             )
         )
     return out
+
+
+def ex_dividend(s: StrategyState, window: int) -> list[Signal]:
+    """P1 (assignment_risk, S4): an in-the-money short call whose extrinsic value
+    is below the next dividend, close to the ex-date: exercising is rational for
+    the holder. Any manager's: a debit spread's short leg can be assigned too."""
+    if s.assignment_intended or not s.spot:
+        return []
+    return [
+        Signal(
+            P1,
+            "assignment exposure",
+            f"short {x.strike:g}C: ex-dividend in {x.ex_days} days,"
+            f" ${x.dividend:.2f} > ${x.extrinsic:.2f} extrinsic",
+        )
+        for x in s.short_legs
+        if x.right == "C"
+        and x.strike < s.spot
+        and x.dividend is not None
+        and x.ex_days is not None
+        and x.extrinsic is not None
+        and x.ex_days <= window
+        and x.dividend > x.extrinsic
+    ]
 
 
 def class_change(s: StrategyState) -> list[Signal]:
