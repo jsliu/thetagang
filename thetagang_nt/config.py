@@ -350,7 +350,8 @@ class PMConfig(NautilusConfig, frozen=True):
     near_expiry_days: int = 7  # a short leg this close to expiry...
     near_money: float = 0.02  # ...and within this of its strike
     stale_secs: float = 300.0  # [T9] quote older than this
-    wide_spread: float = 0.25  # [T9] (ask - bid) / mid above this
+    wide_spread: float = 0.25  # [T9] P2 when (ask - bid) / mid is above this...
+    wide_spread_min: float = 0.05  # [T9] ...and ask - bid above this, $ per share
     # [T3] (original life, review at days left), interpolated between rows
     dte_windows: tuple[tuple[int, int], ...] = (
         (90, 28),
@@ -509,7 +510,11 @@ class PMConfig(NautilusConfig, frozen=True):
     def quality(self) -> Any:
         from thetagang_nt.pm.core.quality import QualityLimits
 
-        return QualityLimits(stale_secs=self.stale_secs, wide_spread=self.wide_spread)
+        return QualityLimits(
+            stale_secs=self.stale_secs,
+            wide_spread=self.wide_spread,
+            wide_spread_min=self.wide_spread_min,
+        )
 
     def tolerance(self) -> Any:
         from thetagang_nt.pm.core.classify import Tolerance
@@ -567,7 +572,8 @@ class PMConfig(NautilusConfig, frozen=True):
             ("theta_tolerance", "T7", "|net theta| below this counts as zero"),
             ("remaining_reward_risk", "T8", "remaining reward / risk below this"),
             ("stale_secs", "T9", "a quote older than this many seconds is stale"),
-            ("wide_spread", "T9", "(ask - bid) / mid above this is wide"),
+            ("wide_spread", "T9", "P2: (ask - bid) / mid above this is wide..."),
+            ("wide_spread_min", "T9", "...and ask - bid above this, $ per share"),
             ("near_expiry_days", "", "a short leg this close to expiry..."),
             ("near_money", "", "...and this close to its strike"),
             ("grid_moves", "M1", "scenario grid price moves (and gamma sign check)"),

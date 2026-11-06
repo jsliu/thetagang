@@ -70,6 +70,7 @@ class StrategyState:
     loss_budget: float | None = None  # max acceptable loss, $, positive
     sigma_f: float | None = None  # forecast annualised realised vol (M6)
     assignment_intended: bool = False  # your input: expiry/assignment is the plan
+    wide_legs: tuple[tuple[str, float, float], ...] = ()  # quality.wide_legs
 
 
 def _money(x: float) -> str:
@@ -141,6 +142,17 @@ def ex_dividend(s: StrategyState, window: int) -> list[Signal]:
         and x.ex_days <= window
         and x.dividend > x.extrinsic
     ]
+
+
+def liquidity(s: StrategyState) -> list[Signal]:
+    """P2: wide spreads are a real cost, not bad data, but on so wide a quote the
+    mid is a guess, so the model's values for those legs are rough."""
+    if not s.wide_legs:
+        return []
+    legs = "; ".join(
+        f"{label} {pct:.0%}, ${cost:,.0f} to cross" for label, pct, cost in s.wide_legs
+    )
+    return [Signal(P2, "wide spread", f"{legs}: mid and model values are rough")]
 
 
 def class_change(s: StrategyState) -> list[Signal]:

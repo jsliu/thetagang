@@ -223,7 +223,9 @@ weight = 0.0
 # near_expiry_days = 7          # a short leg this close to expiry...
 # near_money = 0.02             # ...and within 2% of its strike
 # stale_secs = 300              # [T9] a quote older than this is stale
-# wide_spread = 0.25            # [T9] (ask - bid) / mid above this is wide
+# wide_spread = 0.25            # [T9] P2 "wide spread" (a real cost, not bad data) when
+#                               # (ask - bid) / mid is above this...
+# wide_spread_min = 0.05        # [T9] ...and ask - bid is above this, $ per share
 # dte_windows = [[90, 28], [180, 60], [365, 120], [730, 270]]  # [T3] original life ->
 #                               # review at days left (interpolated; LEAPS keep 270)
 # gamma_tolerance = 0.01        # [T7] |net gamma| below this counts as zero (shares per $1)

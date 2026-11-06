@@ -19,6 +19,7 @@ from thetagang_nt.pm.core.review import (
     class_change,
     ex_dividend,
     hard_signals,
+    liquidity,
     outcome,
 )
 
@@ -134,7 +135,7 @@ def drift_signals(s: StrategyState, lim: SignalLimits) -> list[Signal]:
         drift = abs(s.net_delta - s.entry_delta)
         if drift > lim.delta_drift * s.entry_gross_delta:
             out.append(Signal(P2, "delta drift", f"{drift:,.0f} shares since entry"))
-    out += class_change(s)
+    out += class_change(s) + liquidity(s)
     gt = s.gt_h.get(lim.gt_horizon)
     if s.cls == LONG and gt is not None and gt < lim.gt_review:
         out.append(

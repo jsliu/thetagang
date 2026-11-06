@@ -198,6 +198,36 @@ class AccountExtras:
             return None, None, None
         return d.nextDate, _number(d.nextAmount), _number(d.next12Months)
 
+    async def quotes(
+        self, wanted: set[tuple[str, str, float, str]], seconds: float = 3.0
+    ) -> dict[tuple[str, str, float, str], tuple[float | None, float | None]]:
+        """(bid, ask) of held options, by (symbol, yyyymmdd, strike, right), read
+        for a moment on this connection. Nautilus's adapter drops a side IB marks
+        -1, so it can't see an option with no bid; here that side is None."""
+        await self.connect()
+        contracts = {}
+        for p in self.ib.positions():
+            c = p.contract
+            key = (c.symbol, c.lastTradeDateOrContractMonth, float(c.strike), c.right)
+            if c.secType == "OPT" and key in wanted:
+                contracts[key] = c
+        if not contracts:
+            return {}
+        await self.ib.qualifyContractsAsync(*contracts.values())
+        tickers = {
+            k: self.ib.reqMktData(c, "", False, False) for k, c in contracts.items()
+        }
+        try:
+            await asyncio.sleep(seconds)
+        finally:
+            for c in contracts.values():
+                self.ib.cancelMktData(c)
+
+        def side(x: Any) -> float | None:
+            return x if x is not None and x == x and x > 0 else None
+
+        return {k: (side(t.bid), side(t.ask)) for k, t in tickers.items()}
+
     async def _learn(self, con_ids: Any) -> None:
         unknown = [c for c in con_ids if c not in self._labels]
         if unknown:

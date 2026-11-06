@@ -81,9 +81,8 @@ def test_leg_flags_catch_unreliable_data():
     old = NOW - timedelta(minutes=10)
     assert "stale quote" in leg_flags(long, Quote(2.9, 3.1, old), greeks(), NOW)
     assert "zero bid" in leg_flags(long, Quote(0.0, 0.05), greeks(), NOW)
-    assert "wide spread" in leg_flags(
-        long, Quote(0.5, 1.0), greeks(), NOW
-    )  # 67% of mid
+    # a wide market is real, not bad data: a liquidity signal, not a flag
+    assert "wide spread" not in leg_flags(long, Quote(0.5, 1.0), greeks(), NOW)
     assert "no greeks" in leg_flags(long, Quote(2.9, 3.1), None, NOW)
     assert "implausible IV" in leg_flags(long, Quote(2.9, 3.1), greeks(vol=9.0), NOW)
     mini = leg("m", "C", 40, 1, mult=10.0)
@@ -841,6 +840,7 @@ def test_the_monitor_prices_vix_calls_on_the_matching_future(monkeypatch):
         greeks=None,  # the VIX path prices with Black-76 itself
         _rules=None,
         _vix_hedge="VIX hedge: hold",
+        _direct={},
         _portfolio_manager=lambda f, entries, greeks, today: sent.update(
             entries=entries, greeks=greeks
         ),
@@ -878,7 +878,6 @@ def priced(iid, right, strike, qty, und, vol, expiry=EXP):
 
 
 def test_scenario_grid_reprices_every_cell_from_a_model_baseline():
-    from thetagang_nt.pm.core.efficiency import calendar_days
     from thetagang_nt.pm.core.scenarios import RATE, bsm, grid
 
     p, g = priced("c", "C", 100, 1, 100.0, 0.3)
@@ -937,7 +936,6 @@ def test_vix_grid_moves_each_leg_on_its_own_future():
     assert {k[1] for k in s.fixed} == {-0.2, -0.1, 0.0, 0.15, 0.3}
     assert set(s.stress) == {"spike", "fade", "regime shift"}
     # spike: front future +30%, back +15%; front IV +20, back +10 (1 day)
-    from thetagang_nt.pm.core.efficiency import calendar_days
 
     d = calendar_days(TODAY, 1)
     spike = (
@@ -1363,7 +1361,6 @@ def test_iv_model_falls_back_or_gives_up_on_thin_data():
 def test_repricing_samples_moves_long_dated_legs_less():
     import math
 
-    from thetagang_nt.pm.core.efficiency import calendar_days
     from thetagang_nt.pm.core.scenarios import RATE, bsm, repriced
 
     far = TODAY + timedelta(days=120)
@@ -1763,3 +1760,223 @@ def test_the_monitor_measures_one_smile_per_cycle_and_publishes_the_gap(monkeypa
     assert fields["sticky_coverage"] == 1.0 and fields["american"] == 1.0
     moves = {s.labels["move"] for s in f.by_name["pm_sticky"].samples}
     assert moves == {"-0.05", "-0.02", "0", "0.02", "0.05"}
+
+
+# ------------------------------------------- no bid, stale quotes and liquidity
+
+
+def test_no_bid_is_a_bid_of_zero_flagged_on_long_legs_only():
+    short, long_ = leg("s", "C", 50, -1), leg("l", "C", 50, 1)
+    q = Quote(0.0, 0.01, NOW)
+    assert leg_flags(short, q, greeks(), NOW) == ()  # bought back at the ask
+    assert leg_flags(long_, q, greeks(), NOW) == ("zero bid",)
+    assert "missing quote" in leg_flags(short, Quote(0.5, None, NOW), greeks(), NOW)
+    assert values((short,), {"s": q}) == pytest.approx((-0.5, -1.0))
+    assert values((long_,), {"l": q}) == pytest.approx((0.5, 0.0))
+
+
+def test_wide_spreads_skip_ticks_and_price_the_cost_to_cross():
+    from thetagang_nt.pm.core.quality import is_wide, wide_legs
+
+    assert is_wide(Quote(1.0, 3.9))
+    assert not is_wide(Quote(0.02, 0.03))  # 40%, but one tick
+    assert not is_wide(Quote(0.0, 0.01))  # no bid, a cent of ask
+    assert is_wide(Quote(0.0, 0.75))  # no bid and a real ask
+    assert not is_wide(Quote(2.0, 2.1))
+    assert not is_wide(Quote(None, 0.5)) and not is_wide(None)
+    p = leg("b", "P", 19, 5)
+    ((label, pct, cost),) = wide_legs((p,), {"b": Quote(1.0, 3.9)})
+    assert label == f"AA {EXP:%Y%m%d} 19P"
+    assert pct == pytest.approx(2.9 / 2.45)
+    assert cost == pytest.approx(725.0)  # half of 2.90, 5 contracts
+
+
+def test_a_wide_spread_is_a_p2_signal_that_leaves_other_signals_working():
+    from thetagang_nt.pm.core.review import P2 as _P2
+
+    wide = (("BKSY 19P", 1.18, 725.0),)
+    for found, out in (
+        long_options.decide(StrategyState(cls=LONG, wide_legs=wide)),
+        short_options.decide(StrategyState(cls=SHORT, wide_legs=wide)),
+        long_vix.decide(StrategyState(cls=LONG, wide_legs=wide)),
+    ):
+        assert out == "REVIEW"  # not "REVIEW - data unreliable"
+        assert [(x.priority, x.name) for x in found] == [(_P2, "wide spread")]
+        assert "118%, $725 to cross" in found[0].detail
+        assert "rough" in found[0].detail
+    # a P0 behind a wide spread reaches CLOSE review; before, data hid nothing less
+    s = StrategyState(cls=LONG, wide_legs=wide, thesis_valid=False)
+    assert long_options.decide(s)[1] == "CLOSE review"
+
+
+def test_quote_prefers_a_recent_direct_read_when_the_adapter_cant_know():
+    pytest.importorskip("nautilus_trader")
+    pytest.importorskip("psycopg")
+    from thetagang_nt.config import PMConfig
+    from thetagang_nt.monitor import PortfolioMonitor
+
+    now = datetime.now(timezone.utc)
+
+    def tick(bid, ask, age):
+        return SimpleNamespace(
+            bid_price=SimpleNamespace(as_double=lambda: bid),
+            ask_price=SimpleNamespace(as_double=lambda: ask),
+            ts_event=(now - timedelta(seconds=age)).timestamp() * 1e9,
+        )
+
+    def read(q, direct):
+        fake = SimpleNamespace(
+            cache=SimpleNamespace(quote_tick=lambda _: q),
+            _direct={"x": direct} if direct else {},
+            _pm=PMConfig(),
+        )
+        return PortfolioMonitor._quote(fake, "x")
+
+    fresh = Quote(0.0, 0.05, now)
+    # the adapter never saw the no-bid option at all
+    assert read(None, fresh) is fresh
+    # it keeps an old bid after IB shows none, even if its ask just ticked
+    assert read(tick(0.5, 0.6, 1), fresh) is fresh
+    # two-sided direct: the newer of the two wins, so a quiet quote isn't stale
+    quiet = tick(1.0, 1.2, 900)
+    two_sided = Quote(1.0, 1.2, now)
+    assert read(quiet, two_sided) is two_sided
+    newer = read(tick(1.1, 1.3, -5), two_sided)
+    assert (newer.bid, newer.ask) == (1.1, 1.3)
+    # a direct read older than the stale limit no longer counts
+    old = Quote(0.0, 0.05, now - timedelta(seconds=900))
+    assert read(tick(1.0, 1.2, 1), old).bid == 1.0
+    assert read(None, None).bid is None
+
+
+def test_direct_quotes_rotate_and_a_gone_market_is_dropped():
+    pytest.importorskip("nautilus_trader")
+    pytest.importorskip("psycopg")
+    import asyncio
+
+    from thetagang_nt.config import PMConfig
+    from thetagang_nt.monitor import PortfolioMonitor
+
+    legs = [leg(f"c{i}", "C", 100 + i, -1) for i in range(5)]
+    asked = []
+
+    async def quotes(wanted):
+        asked.append(wanted)
+        out = {k: (None, 0.05) for k in wanted}
+        out.pop(("AA", f"{EXP:%Y%m%d}", 101, "C"), None)  # no market at all
+        return out
+
+    fake = SimpleNamespace(
+        cache=SimpleNamespace(quote_tick=lambda _: None),
+        log=SimpleNamespace(warning=print, info=print),
+        _extras=SimpleNamespace(quotes=quotes),
+        _direct={"gone": Quote(1.0, 1.1, NOW)},  # no longer held
+        _pm=PMConfig(roll_quote_lines=2),
+    )
+    asyncio.run(PortfolioMonitor._read_direct_quotes(fake, legs))
+    assert len(asked[0]) == 2
+    assert fake._direct["c0"].bid == 0.0 and fake._direct["c0"].ask == 0.05
+    assert "c1" not in fake._direct and "gone" not in fake._direct
+    asyncio.run(PortfolioMonitor._read_direct_quotes(fake, legs))
+    # oldest first: the ones not yet read, not the same two again
+    assert ("AA", f"{EXP:%Y%m%d}", 100, "C") not in asked[1]
+    asyncio.run(PortfolioMonitor._read_direct_quotes(fake, []))  # nothing held
+    fake._extras = None
+    asyncio.run(PortfolioMonitor._read_direct_quotes(fake, legs))  # no connection
+
+
+def test_iv_history_skips_no_bid_and_wide_legs():
+    pytest.importorskip("nautilus_trader")
+    pytest.importorskip("psycopg")
+    from thetagang_nt.monitor import iv_rows
+    from thetagang_nt.pm.core.quality import QualityLimits
+
+    short = leg("s", "C", 50, -1)
+    g = {"s": SimpleNamespace(**greeks().__dict__, underlying=41.0)}
+    assert iv_rows((short,), g, {"s": Quote(0.0, 0.01)}, NOW, QualityLimits()) == []
+    assert iv_rows((short,), g, {"s": Quote(1.0, 3.0)}, NOW, QualityLimits()) == []
+    assert len(iv_rows((short,), g, {"s": Quote(1.0, 1.1)}, NOW, QualityLimits())) == 1
+
+
+def test_a_premium_gives_greeks_when_the_cache_has_no_price():
+    pytest.importorskip("nautilus_trader")
+    from nautilus_trader.cache.cache import Cache
+    from nautilus_trader.model.currencies import USD
+    from nautilus_trader.model.enums import AssetClass, OptionKind
+    from nautilus_trader.model.identifiers import InstrumentId, Symbol
+    from nautilus_trader.model.instruments import OptionContract
+    from nautilus_trader.model.objects import Price, Quantity
+
+    from thetagang_nt.portfolio import option_greeks
+
+    iid = InstrumentId.from_str("AA261218C00050000.SMART")
+    ins = OptionContract(
+        iid,
+        Symbol(iid.symbol.value),
+        AssetClass.EQUITY,
+        USD,
+        2,
+        Price.from_str("0.01"),
+        Quantity.from_int(100),
+        Quantity.from_int(1),
+        "AA",
+        OptionKind.CALL,
+        Price.from_str("50.00"),
+        0,
+        int(datetime(2026, 12, 18, 21, tzinfo=timezone.utc).timestamp() * 1e9),
+        0,
+        0,
+    )
+    cache = Cache()
+    cache.add_instrument(ins)
+    assert option_greeks(cache, None, ins, TODAY) is None  # no price at all
+    assert option_greeks(cache, None, ins, TODAY, premium=0.05) is None  # no spot
+
+
+def test_a_leg_expiring_today_cannot_lose_on_a_later_move():
+    from thetagang_nt.pm.core.scenarios import RATE, grid
+
+    today_leg, g = priced("s", "C", 110, -2, 100.0, 0.5, expiry=TODAY)
+    s = grid((today_leg,), {"s": g}, TODAY, RATE, 0.5)
+    # out of the money and expiring now: nothing moves it before it is gone
+    assert s.worst_loss() == pytest.approx(0.0)
+    assert s.stress_loss() == pytest.approx(0.0)
+
+
+def test_an_in_the_money_leg_at_expiry_becomes_stock_and_keeps_moving():
+    from thetagang_nt.pm.core.scenarios import RATE, grid
+
+    itm, g = priced("s", "C", 90, -1, 100.0, 0.5, expiry=TODAY)
+    s = grid((itm,), {"s": g}, TODAY, RATE, None)
+    # assigned today at 90, short stock: at +5% after 10 days it owes 105 - 90
+    assert s.fixed[(10, 0.05, 0)] == pytest.approx(-1500.0 - s.v_model)
+    # and gains if the stock then falls below the strike's value today
+    assert s.fixed[(10, -0.05, 0)] == pytest.approx(-500.0 - s.v_model)
+
+
+def test_a_leg_expiring_inside_the_horizon_settles_on_its_own_days_move():
+    import math
+
+    from thetagang_nt.pm.core.efficiency import calendar_days
+    from thetagang_nt.pm.core.scenarios import RATE, grid
+
+    # expires in 3 days; the 10-day horizon's +5% is only part way there by then
+    soon = TODAY + timedelta(days=3)
+    days = calendar_days(TODAY, 10)
+    at_expiry = 100 * (1 + 0.05 * math.sqrt(3 / days))
+    assert 100 < at_expiry < 104  # below a 104 strike at its expiry...
+    otm, g = priced("s", "C", 104, -1, 100.0, 0.5, expiry=soon)
+    s = grid((otm,), {"s": g}, TODAY, RATE, None)
+    # ...so it expires worthless, though the horizon's price is above the strike
+    assert s.fixed[(10, 0.05, 0)] == pytest.approx(-s.v_model)
+    near, g2 = priced("s", "C", 101, -1, 100.0, 0.5, expiry=soon)
+    s2 = grid((near,), {"s": g2}, TODAY, RATE, None)
+    assert s2.fixed[(10, 0.05, 0)] == pytest.approx(-(105 - 101) * 100 - s2.v_model)
+
+
+def test_no_bid_legs_skip_the_iv_sanity_check():
+    short = leg("s", "C", 50, -1)
+    assert leg_flags(short, Quote(0.0, 0.01, NOW), greeks(vol=9.0), NOW) == ()
+    assert "implausible IV" in leg_flags(
+        short, Quote(0.5, 0.6, NOW), greeks(vol=9.0), NOW
+    )

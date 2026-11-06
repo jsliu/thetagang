@@ -176,12 +176,30 @@ def _value(
         vol = max(p.vol + iv(p) / 100, MIN_VOL)
         und = p.und * (1 + move(p))
         call = p.leg.right == "C"
-        if model:
+        if years <= 0 and days > 0:
+            price = _settled(p, today, days, move(p), und, call)
+        elif model:
             price = american(und, p.leg.strike, years, vol, call, RATE, dividends)
         else:
             price = bsm(und, p.leg.strike, years, vol, call, carry)
         total += p.leg.qty * p.leg.multiplier * price
     return total
+
+
+def _settled(
+    p: _Priced, today: date, days: int, x: float, und: float, call: bool
+) -> float:
+    """A leg that expires inside the horizon (scenario_engine): it settles on the
+    price at its own expiry, the move scaled by sqrt(time) to that day. Out of the
+    money it is gone; in the money it becomes stock, repriced at the scenario's
+    price, so it keeps its exposure after expiry. An option expiring today cannot
+    lose on a move that comes later."""
+    left = max(p.leg.dte(today), 0)
+    at_expiry = p.und * (1 + x * math.sqrt(left / days))
+    strike = p.leg.strike
+    if call:
+        return und - strike if at_expiry > strike else 0.0
+    return strike - und if at_expiry < strike else 0.0
 
 
 def _priced(

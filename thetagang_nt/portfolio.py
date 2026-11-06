@@ -233,13 +233,26 @@ def option_greeks(
     ins: OptionContract,
     today: date,
     forward: float | None = None,
+    premium: float | None = None,
 ) -> Greeks | None:
     """Nautilus GreeksCalculator greeks implied from the option's mid. VIX options
     price off their expiry's VIX future, not the index: Black-76 (carry 0) on the
     parity forward (or `forward`), through the same Rust pricer. None, counted
-    as missing greeks, without a usable option price or implied vol."""
-    if price(cache, ins.id) is None:  # no two-sided quote or last trade
+    as missing greeks, without a usable option price or implied vol. `premium`:
+    the option's price when the cache has none (no bid: half its ask)."""
+    if premium is None and price(cache, ins.id) is None:  # no quote or last trade
         return None
+    if premium is not None and ins.underlying != VIX_ROOT:
+        und = price(cache, underlying_id(ins.underlying))
+        if und is None:
+            return None
+        is_call = ins.option_kind == OptionKind.CALL
+        strike, years = float(ins.strike_price), years_to(ins, today)
+        g = imply_vol_and_greeks(und, RATE, RATE, is_call, strike, years, premium)
+        if not _ok(g.delta, g.gamma, g.theta, g.vega, g.vol) or g.vol < MIN_VOL:
+            return None
+        g_volga = volga(g.vega, und, strike, years, g.vol, RATE)
+        return Greeks(g.delta, g.gamma, g.theta, g.vega, und, g.vol, g.price, g_volga)
     if ins.underlying != VIX_ROOT:
         g = calc.instrument_greeks(ins.id)
         if g is None or not _ok(g.delta, g.gamma, g.theta, g.vega, g.vol):
@@ -258,7 +271,8 @@ def option_greeks(
             g.price,
             g_volga,
         )
-    opt, und = price(cache, ins.id), forward or index_forward(cache, ins)
+    opt = premium if premium is not None else price(cache, ins.id)
+    und = forward or index_forward(cache, ins)
     if opt is None or und is None:
         return None
     is_call = ins.option_kind == OptionKind.CALL

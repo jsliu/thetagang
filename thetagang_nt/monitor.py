@@ -33,7 +33,7 @@ from thetagang_nt.pm.core.american import schedule
 from thetagang_nt.pm.core.assess import assess
 from thetagang_nt.pm.core.iv_model import IvHistory, IvModel, build
 from thetagang_nt.pm.core.profit import capture_ratio, value_bounds
-from thetagang_nt.pm.core.quality import Quote, leg_flags
+from thetagang_nt.pm.core.quality import Quote, is_wide, leg_flags, wide_legs
 from thetagang_nt.pm.core.review import (
     P0,
     P1,
@@ -191,14 +191,16 @@ def short_leg(
 def iv_rows(
     legs: Any, greeks: dict, quotes: dict, now: datetime, limits: Any
 ) -> list[IvRow]:
-    """Implied vols worth keeping: no leg with a data flag, because one bad IV
-    from a wide or stale quote would corrupt the IV-change distribution."""
+    """Implied vols worth keeping: no leg with a data flag, no bid or a wide
+    spread, because one bad IV would corrupt the IV-change distribution."""
     out = []
     for p in legs:
         g = greeks.get(p.instrument_id)
         quote = quotes.get(p.instrument_id)
         und = getattr(g, "underlying", None)
         if leg_flags(p, quote, g, now, limits) or not und or not p.expiry:
+            continue
+        if not quote.bid or is_wide(quote, limits):  # the mid is a guess
             continue
         out.append(
             IvRow(
@@ -417,6 +419,7 @@ class PortfolioMonitor(Actor):
         self._rolls: dict[str, RollScan] = {}  # the last scan of each strategy
         self._roll_chain_day: dict[str, date] = {}  # chains loaded, per symbol
         self._dividends: dict[str, tuple[tuple[date, float], ...]] = {}
+        self._direct: dict[InstrumentId, Quote] = {}  # read from IB directly
         # (symbol, expiry) -> when measured, the smile (None: too few good quotes)
         self._smiles: dict[tuple[str, date], tuple[datetime, Smile | None]] = {}
         self._smile_chain_day: dict[tuple[str, date], date] = {}
@@ -522,6 +525,7 @@ class PortfolioMonitor(Actor):
         ):  # --role trade: the betas are all the strategy needs
             return
 
+        await self._read_direct_quotes(legs)
         summary, daily = await self._read_extras()
         orders = await self._read_orders()
         f = _Families()
@@ -1033,6 +1037,23 @@ class PortfolioMonitor(Actor):
                 g := option_greeks(self.cache, self.greeks, ins, today)
             ):
                 greeks[x.instrument_id] = g
+        for x in legs:  # no bid: the cache has no price, so half the ask gives one
+            direct = self._direct.get(x.instrument_id)
+            if x.is_option and x.instrument_id not in greeks and direct:
+                ins = self.cache.instrument(x.instrument_id)
+                g = (
+                    option_greeks(
+                        self.cache,
+                        self.greeks,
+                        ins,
+                        today,
+                        premium=(direct.bid + direct.ask) / 2,
+                    )
+                    if ins
+                    else None
+                )
+                if g is not None:
+                    greeks[x.instrument_id] = g
         for st in find_structures(vix_legs, groups):
             front = greeks.get(
                 min(st.legs, key=lambda p: p.expiry or today).instrument_id
@@ -1275,17 +1296,71 @@ class PortfolioMonitor(Actor):
                 for iid in batch:
                     aio.unsubscribe(self, iid)
 
-    def _quote(self, iid: InstrumentId) -> Quote:
-        """Bid, ask and quote time; IB sends -1 for a missing side."""
-        q = self.cache.quote_tick(iid)
-        if q is None:
-            return Quote(None, None)
-        bid, ask = q.bid_price.as_double(), q.ask_price.as_double()
-        return Quote(
-            bid if bid >= 0 else None,
-            ask if ask > 0 else None,
-            datetime.fromtimestamp(q.ts_event / 1e9, tz=UTC),
+    async def _read_direct_quotes(self, legs: list[Leg]) -> None:
+        """A few held options per cycle, oldest first, read from IB directly. The
+        adapter drops a side IB marks -1, so it never sees an option with no bid,
+        keeps an old bid after it has gone, and a quiet market looks stale."""
+        if self._extras is None:
+            return
+        never = datetime.min.replace(tzinfo=UTC)
+        options = [x for x in legs if x.is_option and x.expiry]
+        options.sort(
+            key=lambda x: (
+                getattr(self._direct.get(x.instrument_id), "time", never) or never
+            )
         )
+        batch = options[: self._pm.roll_quote_lines]
+
+        def key(x: Leg) -> tuple[str, str, float, str]:
+            return (x.symbol.lstrip("^"), f"{x.expiry:%Y%m%d}", x.strike, x.right)
+
+        try:
+            got = await self._extras.quotes({key(x) for x in batch})
+        except Exception as e:  # noqa: BLE001 - the adapter's quotes still stand
+            self.log.warning(f"Direct quotes not read: {e!r}")
+            return
+        now = datetime.now(UTC)
+        for x in batch:
+            bid, ask = got.get(key(x), (None, None))
+            tick = self.cache.quote_tick(x.instrument_id)
+            if (
+                bid is None
+                and ask is not None
+                and tick
+                and tick.bid_price.as_double() > 0
+            ):
+                self.log.info(
+                    f"{option_label(x)}: no bid at IB, the adapter still has "
+                    f"{tick.bid_price.as_double():g}"
+                )
+            if ask is not None:  # no bid is a bid of 0; no ask is no market
+                self._direct[x.instrument_id] = Quote(bid or 0.0, ask, now)
+            else:
+                self._direct.pop(x.instrument_id, None)
+        held = {x.instrument_id for x in legs}
+        self._direct = {k: v for k, v in self._direct.items() if k in held}
+
+    def _quote(self, iid: InstrumentId) -> Quote:
+        """Bid, ask and quote time: the adapter's, unless a recent direct read
+        shows no bid (it keeps the old one), or is newer, or it has none."""
+        q = self.cache.quote_tick(iid)
+        adapter = Quote(None, None)
+        if q is not None:
+            bid, ask = q.bid_price.as_double(), q.ask_price.as_double()
+            adapter = Quote(
+                bid if bid >= 0 else None,
+                ask if ask > 0 else None,
+                datetime.fromtimestamp(q.ts_event / 1e9, tz=UTC),
+            )
+        direct = self._direct.get(iid)
+        if direct is None or direct.time is None:
+            return adapter
+        age = (datetime.now(UTC) - direct.time).total_seconds()
+        if age > self._pm.stale_secs:
+            return adapter
+        if direct.bid == 0 or adapter.bid is None or adapter.ask is None:
+            return direct
+        return direct if adapter.time is None or direct.time > adapter.time else adapter
 
     def _portfolio_manager(
         self, f: _Families, entries: list, greeks: dict, today: date
@@ -1468,6 +1543,7 @@ class PortfolioMonitor(Actor):
                 loss_budget=budget,
                 sigma_f=sigma_f,
                 assignment_intended=x.assignment_intended if x else False,
+                wide_legs=wide_legs(st.legs, quotes, quality),
             )
             # management category (how it was opened), not its convexity class
             category = manager(net_debit)

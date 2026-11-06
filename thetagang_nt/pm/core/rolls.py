@@ -20,6 +20,7 @@ from thetagang_nt.pm.core.quality import (
     Quote,
     leg_flags,
     values,
+    wide_legs,
 )
 from thetagang_nt.pm.core.scenarios import GridSpec, PriceModel, grid, repriced
 from thetagang_nt.pm.core.valuation import UtilityLimits, capital_at_risk, forward
@@ -193,6 +194,8 @@ def evaluate(
         if fwd_iv:
             u_new_iv = fwd_iv.u_hold - open_cost
     fails = sorted(flags)
+    if wide_legs(legs, quotes, quality):
+        fails.append("wide spread")
     if max_loss is not None and max(g.worst_loss(), stress) > max_loss:
         fails.append("over max_loss")
     return Candidate(

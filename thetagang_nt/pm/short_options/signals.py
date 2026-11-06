@@ -20,6 +20,7 @@ from thetagang_nt.pm.core.review import (
     class_change,
     ex_dividend,
     hard_signals,
+    liquidity,
     outcome,
 )
 from thetagang_nt.pm.short_options.analysis import loss_multiple, moves_out
@@ -125,7 +126,7 @@ def signals(s: StrategyState, lim: ShortLimits = ShortLimits()) -> list[Signal]:
                         f" ({lim.tested_horizon}-day moves)",
                     )
                 )
-    out += class_change(s)
+    out += class_change(s) + liquidity(s)
     return out
 
 
