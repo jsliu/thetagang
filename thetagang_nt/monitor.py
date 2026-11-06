@@ -1719,6 +1719,16 @@ class PortfolioMonitor(Actor):
                         strategy=sid,
                         move=f"{move:g}",
                     )
+            for expiry, smile in smiles.items():
+                for moneyness, iv in smile.points:
+                    f.set(
+                        "pm_smile",
+                        "Measured IV (0.30 = 30%), by strike's % distance from spot",
+                        iv,
+                        strategy=sid,
+                        expiry=expiry.isoformat(),
+                        move=f"{math.expm1(moneyness) * 100:.1f}",
+                    )
             if grid:
                 publish_grid(f, sid, grid, self._pm.grid_spec(vix=is_vix))
                 if out != "HOLD" and und:

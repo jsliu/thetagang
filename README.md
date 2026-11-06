@@ -396,8 +396,8 @@ ID such as `AA-debit-spread-1` that survives rolls), the pure functions in
 - **Small IV surface** ([`pm/core/surface.py`](thetagang_nt/pm/core/surface.py)):
   a smile per held expiry from about 5 out-of-the-money strikes around the money,
   one expiry per cycle, quoted and unsubscribed like the roll scan. The grid stays
-  sticky strike; the dashboard shows how its 5-day P&L changes if IV stays with
-  moneyness instead. Model risk, not a signal. VIX and index options are left out.
+  sticky strike; the dashboard shows the measured smile and how the grid's 5-day
+  P&L changes if IV stays with moneyness instead. Model risk, not a signal. VIX and index options are left out.
 - **Joint price and IV model**
   ([`pm/core/iv_model.py`](thetagang_nt/pm/core/iv_model.py)), reported beside
   that one: each underlying's two years of daily IV and price bars from IB, the

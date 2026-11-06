@@ -1760,6 +1760,15 @@ def test_the_monitor_measures_one_smile_per_cycle_and_publishes_the_gap(monkeypa
     assert fields["sticky_coverage"] == 1.0 and fields["american"] == 1.0
     moves = {s.labels["move"] for s in f.by_name["pm_sticky"].samples}
     assert moves == {"-0.05", "-0.02", "0", "0.02", "0.05"}
+    points = {
+        (s.labels["expiry"], s.labels["move"]): s.value
+        for s in f.by_name["pm_smile"].samples
+    }
+    assert points == {
+        (EXP.isoformat(), "-9.5"): 0.35,
+        (EXP.isoformat(), "0.0"): 0.30,
+        (EXP.isoformat(), "10.5"): 0.27,
+    }
 
 
 # ------------------------------------------- no bid, stale quotes and liquidity
