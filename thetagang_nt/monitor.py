@@ -663,6 +663,12 @@ class PortfolioMonitor(Actor):
 
     def _positions(self, f: _Families, legs: list[Leg], today: date) -> None:
         unrealized = 0.0
+        kept: dict[str, float] = {}  # $ realised on closed options, per underlying
+        if self._journal is not None:
+            try:
+                kept = self._journal.kept_premium()
+            except Exception as e:  # noqa: BLE001
+                self.log.warning(f"Journal unreadable, stock breakeven at cost: {e!r}")
         for leg, row, stripe in position_rows(legs):
             labels = position_labels(leg)
             und = price(self.cache, underlying_id(leg.symbol))
@@ -674,10 +680,11 @@ class PortfolioMonitor(Actor):
             f.set("position_avg_price", "Cost basis per share", leg.avg_px, **labels)
             f.set(
                 "position_breakeven",
-                "Underlying price at expiry with no P&L (this leg alone; stock: cost)",
+                "Underlying price at expiry with no P&L (this leg alone; stock:"
+                " cost less what its closed options realised)",
                 breakeven(leg.right, leg.strike, leg.avg_px)
                 if leg.is_option
-                else leg.avg_px,
+                else leg.avg_px - kept.get(leg.symbol, 0.0) / leg.qty,
                 **labels,
             )
             if leg.mid is None:

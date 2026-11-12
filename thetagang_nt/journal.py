@@ -257,6 +257,30 @@ class RollForecast:
     legs: list[dict[str, Any]]
 
 
+def closed_leg_pnl(
+    qty: float,
+    entry: float,
+    multiplier: float,
+    expiry: date,
+    closed_on: date,
+    bid: float | None,
+    ask: float | None,
+) -> float | None:
+    """$ realised on an option leg no longer held. Gone after its expiry, it
+    settled at 0: expired, or assigned/exercised, the shares then carrying the
+    strike. Gone earlier, it was closed at its last mark's mid; None without one.
+    ponytail: the last mark's mid (minutes old), not the fill; a partial close
+    or a contract traded again after closing isn't told apart."""
+    if closed_on > expiry:
+        exit_px = 0.0
+    else:
+        quotes = [x for x in (bid, ask) if x]
+        if not quotes:
+            return None
+        exit_px = sum(quotes) / len(quotes)
+    return (exit_px - entry) * qty * multiplier
+
+
 class Journal:
     def __init__(self, dsn: str, grafana_password: str | None = None) -> None:
         self._dsn = dsn
@@ -313,6 +337,46 @@ class Journal:
             .fetchall()
         )
         return {r[0]: Seen(r[1], r[2], frozenset(r[3])) for r in rows}
+
+    def kept_premium(self) -> dict[str, float]:
+        """Per underlying, $ realised on its option legs no longer held by any
+        strategy (a regrouped leg is still held): what lowers a stock's
+        breakeven. Only what the journal saw."""
+        rows = self._db().execute(
+            """
+            WITH legs AS (
+                SELECT s.underlying, l.contract, l.label, l.multiplier,
+                    (array_agg(l.qty ORDER BY l.opened_on))[1] AS qty,
+                    (array_agg(l.entry_price ORDER BY l.opened_on))[1] AS entry,
+                    max(l.closed_on) AS closed_on
+                FROM strategy_legs l JOIN strategies s ON s.id = l.strategy_id
+                GROUP BY s.underlying, l.contract, l.label, l.multiplier
+                HAVING bool_and(l.closed_on IS NOT NULL)
+            )
+            SELECT legs.underlying, legs.label, legs.qty, legs.entry,
+                legs.multiplier, legs.closed_on, m.bid, m.ask
+            FROM legs LEFT JOIN LATERAL (
+                SELECT bid, ask FROM leg_marks
+                WHERE contract = legs.contract AND day <= legs.closed_on
+                ORDER BY day DESC LIMIT 1
+            ) m ON true
+            """
+        )
+        out: dict[str, float] = {}
+        for und, label, qty, entry, mult, closed_on, bid, ask in rows:
+            expiry = date.fromisoformat(label.split()[1])  # "MS 20261106 197.5C"
+            pnl = closed_leg_pnl(
+                float(qty),
+                float(entry),
+                float(mult),
+                expiry,
+                closed_on,
+                None if bid is None else float(bid),
+                None if ask is None else float(ask),
+            )
+            if pnl is not None:
+                out[und] = out.get(und, 0.0) + pnl
+        return out
 
     def entry(self, ids: list[str]) -> dict[str, tuple[float, int | None]]:
         """Each known strategy's (net debit, initial DTE) at entry."""

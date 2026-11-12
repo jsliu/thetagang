@@ -252,3 +252,39 @@ def test_leg_marks_and_roll_forecasts_are_kept(journal):
     assert float(bid) == 0.0 and float(ask) == 0.05
     legs = db.execute("SELECT legs FROM roll_forecasts").fetchone()[0]
     assert legs == [{"contract": "c9", "qty": 1, "price": 2.5}]
+
+
+def test_kept_premium_counts_closed_option_legs_once(journal):
+    from thetagang_nt.journal import LegMark
+
+    at = datetime(2026, 11, 5, tzinfo=UTC)
+
+    def held(day, *legs):
+        journal.record(
+            [
+                StrategyRow(sid, "MS", kind, (leg,), -50.0, 7.0, assessment())
+                for sid, kind, leg in legs
+            ],
+            {},
+            day,
+            at,
+        )
+
+    expired = LegRow("c1", "MS 20261106 197.5C", -2.0, 100.0, 0.21)
+    bought = LegRow("p1", "MS 20261218 170P", -1.0, 100.0, 2.50)
+    regrouped = LegRow("c2", "MS 20261218 200C", -1.0, 100.0, 1.00)
+    d1, d2, d3 = date(2026, 11, 5), date(2026, 11, 9), date(2026, 11, 10)
+    held(
+        d1,
+        ("MS-short-call-1", "short call", expired),
+        ("MS-short-put-1", "short put", bought),
+        ("MS-short-call-2", "short call", regrouped),
+    )
+    # the put is bought back at a mid of 1.00 on d2, before its expiry
+    journal.record_forecasts(
+        [], [LegMark("p1", "MS-short-put-1", -1.0, 0.95, 1.05, 190.0, 0.3)], [], d2, at
+    )
+    # d3: the call expired, the put is gone, the 200C moved into a group
+    held(d3, ("MS-group-1", "my group", regrouped))
+    # 0.21 x 2 kept + (2.50 - 1.00) bought back; the regrouped 200C still held
+    assert journal.kept_premium() == {"MS": pytest.approx(42.0 + 150.0)}
