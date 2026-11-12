@@ -260,6 +260,9 @@ def test_strategy_ids_survive_rolls_and_new_ones_are_numbered():
     assert auto_ids([same], known) == ["AA-debit-spread-1"]
     assert auto_ids([rolled], known) == ["AA-debit-spread-1"]
     assert auto_ids([one_leg], known) == ["AA-debit-spread-1"]
+    # regrouped legs are a new strategy, even sharing a contract
+    regrouped = Seen("AA", "long risk reversal", frozenset({1, 7}))
+    assert auto_ids([regrouped], known) == ["AA-long-risk-reversal-1"]
     new = [
         Seen("^SPX", "long put", frozenset({5})),
         Seen("^SPX", "long put", frozenset({6})),
@@ -907,6 +910,9 @@ def test_scenario_grid_reprices_every_cell_from_a_model_baseline():
     assert s.stress_loss() == -s.stress["event IV crush"] > -s.stress["gap down"] > 0
     # no realised-vol forecast: no vol-scaled family
     assert grid((p,), {"c": g}, TODAY, RATE, None).scaled == {}
+    # 600% realised vol: -2 Move_10 passes -100%, the price stops at 0
+    wild = grid((p,), {"c": g}, TODAY, RATE, 6.0)
+    assert wild.scaled[(10, -2, 0)] == pytest.approx(-wild.v_model)
     # no implied vol: no grid at all
     assert (
         grid((p,), {"c": SimpleNamespace(underlying=100.0, vol=None)}, TODAY, RATE, 0.3)

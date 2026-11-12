@@ -46,7 +46,7 @@ def bsm(
 ) -> float:
     """Generalised Black-Scholes price per share; intrinsic at or after expiry.
     carry = rate: Black-Scholes; carry = 0: Black-76 on a future."""
-    if years <= 0 or vol <= 0:
+    if years <= 0 or vol <= 0 or und <= 0 or strike <= 0:
         return max(und - strike, 0.0) if call else max(strike - und, 0.0)
     sd = vol * math.sqrt(years)
     d1 = (math.log(und / strike) + (carry + 0.5 * vol * vol) * years) / sd
@@ -174,7 +174,7 @@ def _value(
     for p in priced:
         years = (p.leg.dte(today) - days) / 365
         vol = max(p.vol + iv(p) / 100, MIN_VOL)
-        und = p.und * (1 + move(p))
+        und = max(p.und * (1 + move(p)), 0.0)  # a vol-scaled move can pass -100%
         call = p.leg.right == "C"
         if years <= 0 and days > 0:
             price = _settled(p, today, days, move(p), und, call)

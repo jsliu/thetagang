@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import json
 import math
+import traceback
 from dataclasses import dataclass, replace
 from datetime import UTC, date, datetime, timedelta
 from typing import Any
@@ -1111,7 +1112,10 @@ class PortfolioMonitor(Actor):
         try:
             self._portfolio_manager(f, entries, greeks, today)
         except Exception as e:  # noqa: BLE001 - the rest of the dashboard never waits on it
-            self.log.warning(f"Portfolio Manager skipped: {e!r}")
+            where = traceback.extract_tb(e.__traceback__)[-1]
+            self.log.warning(
+                f"Portfolio Manager skipped: {e!r} at {where.filename}:{where.lineno}"
+            )
 
     async def _scan_rolls(self, today: date) -> None:
         """Quote the candidates of the strategy longest without a scan
