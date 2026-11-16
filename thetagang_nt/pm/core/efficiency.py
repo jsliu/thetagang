@@ -11,16 +11,30 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass, field
 from datetime import date, timedelta
+from functools import lru_cache
+
+import exchange_calendars as xcals
+import pandas as pd
 
 from thetagang_nt.pm.core.classify import LONG, SHORT
 
 HORIZONS = (1, 5, 10)  # trading days
 
 
+@lru_cache(maxsize=1)
+def _xnys() -> xcals.ExchangeCalendar:
+    return xcals.get_calendar("XNYS")
+
+
+@lru_cache(maxsize=4096)
 def calendar_days(today: date, h: int) -> int:
-    """Calendar days from today to the close of the h-th trading day after it
-    (1 trading day from a Friday = 3). ponytail: weekends only; exchange
-    holidays not counted, add the NYSE calendar if it matters."""
+    """Calendar days from today to the close of the h-th NYSE session after it
+    (1 trading day from a Friday = 3, from the day before Thanksgiving = 2).
+    Outside the calendar's range, weekdays stand in for sessions."""
+    sessions = _xnys().sessions
+    i = int(sessions.searchsorted(pd.Timestamp(today), side="right")) + h - 1
+    if sessions[0].date() <= today and i < len(sessions):
+        return (sessions[i].date() - today).days
     d, left = today, h
     while left:
         d += timedelta(days=1)

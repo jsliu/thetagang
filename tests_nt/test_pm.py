@@ -131,6 +131,29 @@ def test_calendar_days_count_weekends():
     assert calendar_days(TODAY, 5) == 7  # -> next Monday
     assert calendar_days(TODAY, 10) == 14
     assert calendar_days(date(2026, 11, 6), 1) == 3  # Friday -> Monday
+    # NYSE holidays: Wed 25 Nov -> Fri 27 (Thanksgiving); Thu 24 Dec -> Mon 28
+    assert calendar_days(date(2026, 11, 25), 1) == 2
+    assert calendar_days(date(2026, 12, 24), 1) == 4
+    assert calendar_days(date(1990, 1, 5), 1) == 3  # before the calendar: weekdays
+
+
+def test_stress_gaps_scale_with_the_forecast_vol():
+    from thetagang_nt.pm.core.scenarios import RATE, bsm, grid
+
+    p, g = priced("p", "P", 100, -1, 100.0, 0.3)
+    d = calendar_days(TODAY, 1)
+
+    def gap_down(move):
+        return 100 * -(
+            bsm(100 * (1 - move), 100, (30 - d) / 365, 0.45, False, RATE)
+            - bsm(100, 100, 30 / 365, 0.3, False, RATE)
+        )
+
+    calm = 0.30  # 3 Move_1 = 5.7%: the 10% floor
+    wild = 0.80  # 3 Move_1 = 15.1%
+    for sigma_f, move in ((None, 0.10), (calm, 0.10), (wild, 3 * wild / 252**0.5)):
+        s = grid((p,), {"p": g}, TODAY, RATE, sigma_f)
+        assert s.stress["gap down"] == pytest.approx(gap_down(move))
 
 
 def test_gamma_theta_efficiency_and_breakeven_vol():

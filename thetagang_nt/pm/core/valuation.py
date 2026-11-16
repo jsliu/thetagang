@@ -9,8 +9,10 @@ Probability model (M8, a hypothesis): the price follows the forecast realised
 vol with zero drift, discretised onto the vol-scaled nodes (z = -2..+2 Move_h,
 each node the normal mass of its cell); implied vol unchanged. Without
 sigma_f there are no probabilities and nothing here is computed.
-ponytail: IV held fixed in the expectation; add an empirical h-day IV-change
-distribution per underlying (vault expected_pnl) when the history exists."""
+With IV history (pm iv_model, on by default) forward() takes the joint return
+and IV-change samples from pm.core.iv_model instead. ponytail: without that
+history, the nodes hold IV fixed; fine as a fallback, revisit if most
+strategies report from it."""
 
 from __future__ import annotations
 

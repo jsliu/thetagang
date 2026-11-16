@@ -80,6 +80,10 @@ class GridSpec:
     iv_points: tuple[float, ...] = (-10, -5, 0, 5, 10)  # [M1] parallel IV shifts
     z: tuple[int, ...] = (-2, -1, 0, 1, 2)  # vol-scaled family, in Move_h
     vix: bool = False  # VIX regime scenarios instead of the equity tails
+    # [M2] tail gaps with a forecast: stress_z Move_1 (vault stress_testing),
+    # never below stress_floor (STRESS's +-10%, also used without a forecast)
+    stress_z: float = 3.0
+    stress_floor: float = 0.10
 
 
 # [M11] VIX: futures moves skewed upward (VIX jumps up, falls gradually) and
@@ -90,7 +94,10 @@ VIX_SPEC = GridSpec(
 
 # (price move, IV points for the front expiry, IV points for later expiries),
 # repriced over 1 trading day (a gap). [M2] equity tails; Phase 2 term shocks.
-# ponytail: fixed sizes; calibrate per underlying from history (vault M2).
+# With sigma_f the gaps scale to the underlying (GridSpec.stress_z); IV sizes stay.
+# ponytail: sigma_f is a smooth realised-vol forecast that misses earnings gaps
+# and fat tails; calibrate per underlying from history (vault M2) once a
+# single-name gap breaches unflagged.
 STRESS = {
     "gap down": (-0.10, 15, 15),
     "gap up": (0.10, -10, -10),
@@ -326,7 +333,12 @@ def grid(
                 lambda p, a=f_iv, b=b_iv: a if p.front else b,
             )
     else:
+        gap = None
+        if sigma_f:
+            gap = max(spec.stress_floor, spec.stress_z * sigma_f * math.sqrt(1 / 252))
         for name, (mv, f_iv, b_iv) in STRESS.items():
+            if gap and mv:
+                mv = math.copysign(gap, mv)
             stress[name] = pnl(
                 one_day,
                 lambda p, mv=mv: mv,
