@@ -39,12 +39,17 @@ def health(
     return instance, gauges[0]
 
 
-def cache(account_id, issuer="IB"):
-    account = SimpleNamespace(
-        get_issuer=lambda: issuer,
-        get_id=lambda: account_id,
-    )
-    return SimpleNamespace(accounts=lambda: [SimpleNamespace(id=account)])
+def cache(*account_ids, issuer="IB"):
+    accounts = [
+        SimpleNamespace(
+            id=SimpleNamespace(
+                get_issuer=lambda: issuer,
+                get_id=lambda account_id=account_id: account_id,
+            )
+        )
+        for account_id in account_ids
+    ]
+    return SimpleNamespace(accounts=lambda: accounts)
 
 
 def test_session_health_starts_unhealthy_with_effective_identity(monkeypatch):
@@ -85,4 +90,42 @@ def test_session_health_rejects_mismatched_account(monkeypatch):
 
     assert metric.samples == {
         (("account", "DU999"), ("client_id", "42"), ("role", "trade")): 0
+    }
+
+
+def test_session_health_fails_closed_for_ambiguous_ib_accounts(monkeypatch):
+    session_health, metric = health(monkeypatch)
+
+    session_health.refresh_from_cache(cache("DU123", "DU456"))
+
+    assert metric.samples == {
+        (("account", ""), ("client_id", "42"), ("role", "trade")): 0
+    }
+
+
+def test_session_health_fails_closed_when_cache_accounts_raises(monkeypatch):
+    def failing_accounts():
+        raise RuntimeError("cache unavailable")
+
+    session_health, metric = health(monkeypatch)
+
+    session_health.refresh_from_cache(SimpleNamespace(accounts=failing_accounts))
+
+    assert metric.samples == {
+        (("account", ""), ("client_id", "42"), ("role", "trade")): 0
+    }
+
+
+def test_session_health_fails_closed_when_connection_check_raises(monkeypatch):
+    def failing_connection_check():
+        raise RuntimeError("connection status unavailable")
+
+    session_health, metric = health(
+        monkeypatch, connection_check=failing_connection_check
+    )
+
+    session_health.refresh_from_cache(cache("DU123"))
+
+    assert metric.samples == {
+        (("account", "DU123"), ("client_id", "42"), ("role", "trade")): 0
     }
