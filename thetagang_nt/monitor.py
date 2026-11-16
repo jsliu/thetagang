@@ -126,6 +126,7 @@ from thetagang_nt.rules import (
     weighted_strike,
     zero_delta_targets,
 )
+from thetagang_nt.session_health import IBSessionHealth
 
 BETAS_KEY = "thetagang.betas"
 ROLL_QUOTE_POLLS = 20  # 0.25 s apart: how long a batch of candidates may take
@@ -437,6 +438,7 @@ class PortfolioMonitor(Actor):
         extras: AccountExtras | None = None,
         pm: PMConfig | None = None,
         journal: Journal | None = None,
+        session_health: IBSessionHealth | None = None,
     ) -> None:
         super().__init__(config)
         self._pm = pm or PMConfig()
@@ -453,6 +455,7 @@ class PortfolioMonitor(Actor):
         # legs -> (what the strategy's rules would do, take-profit), set by _actions
         self._bot_actions: dict[frozenset[str], tuple[str, str]] = {}
         self._extras = extras
+        self._session_health = session_health
         self._iv_open: tuple[date | None, dict[InstrumentId, float]] = (None, {})
         self._vix_hedge = "-"  # what the VIX call hedge would do, set by _actions
         self._vix_chain_day: date | None = None  # VIX chain loaded for parity
@@ -476,14 +479,27 @@ class PortfolioMonitor(Actor):
                 f"Metrics on http://{self.config.metrics_addr}:"
                 f"{self.config.metrics_port}/metrics"
             )
+        if self._session_health is not None:
+            self._session_health.refresh_from_cache(self.cache)
+            self.clock.set_timer(
+                "ib-session-health",
+                timedelta(seconds=5),
+                callback=self._on_health_timer,
+            )
         aio.spawn(self, self._boot(), "monitor boot")
 
     def on_stop(self) -> None:
+        if self._session_health is not None:
+            self._session_health.refresh_from_cache(self.cache, connected=False)
         if self.config.publish:
             REGISTRY.unregister(self._snapshot)
         if self._extras is not None:
             self._extras.close()
         self.clock.cancel_timers()
+
+    def _on_health_timer(self, _event: object) -> None:
+        if self._session_health is not None:
+            self._session_health.refresh_from_cache(self.cache)
 
     async def _boot(self) -> None:
         await aio.load_contracts(self, INDEX_CONTRACTS)

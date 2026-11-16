@@ -19,6 +19,7 @@ from thetagang_nt.config import ROLES, load, node_config, split
 from thetagang_nt.ib_extra import EXTRA_CLIENT_OFFSET, AccountExtras
 from thetagang_nt.journal import Journal
 from thetagang_nt.monitor import PortfolioMonitor
+from thetagang_nt.session_health import IBSessionHealth
 
 
 def build(path: str, role: str = "all", adhoc: tuple[str, ...] = ()) -> TradingNode:
@@ -29,6 +30,16 @@ def build(path: str, role: str = "all", adhoc: tuple[str, ...] = ()) -> TradingN
             app, node=msgspec.structs.replace(app.node, log_level="ERROR")
         )
     node = TradingNode(node_config(app, client_id))
+    health_role = "trade" if role in ("trade", "pretrade") else "monitor"
+    health = IBSessionHealth(
+        health_role,
+        client_id,
+        app.ib.account_id or os.environ.get("TWS_ACCOUNT"),
+        lambda: (
+            node.kernel.data_engine.check_connected()
+            and node.kernel.exec_engine.check_connected()
+        ),
+    )
     # the read-only side connection: account extras for the dashboard, and every
     # open order at IB (TWS's too) so the strategy never doubles one
     extras = None
@@ -46,7 +57,12 @@ def build(path: str, role: str = "all", adhoc: tuple[str, ...] = ()) -> TradingN
     )
     node.trader.add_actor(
         PortfolioMonitor(
-            monitor, rules=app.strategy, extras=shown, pm=app.pm, journal=journal
+            monitor,
+            rules=app.strategy,
+            extras=shown,
+            pm=app.pm,
+            journal=journal,
+            session_health=health if role != "trade" else None,
         )
     )
     if role == "pretrade":
@@ -65,7 +81,11 @@ def build(path: str, role: str = "all", adhoc: tuple[str, ...] = ()) -> TradingN
 
         node.trader.add_strategy(
             Discretionary(
-                strategy, pretrade=app.pretrade, extras=extras, pm_decides=app.pm.decide
+                strategy,
+                pretrade=app.pretrade,
+                extras=extras,
+                pm_decides=app.pm.decide,
+                session_health=health if role == "trade" else None,
             )
         )
     if role == "trade":  # the strategy's own metrics; the monitor publishes none here

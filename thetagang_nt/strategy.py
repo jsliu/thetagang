@@ -98,6 +98,7 @@ from thetagang_nt.rules import (
     valid_strike,
     vix_hedge_weight,
 )
+from thetagang_nt.session_health import IBSessionHealth
 
 NEW_YORK = ZoneInfo("America/New_York")
 ORDERS = Counter(
@@ -139,6 +140,7 @@ class Discretionary(Strategy):
         pretrade: PreTradeSectionConfig | None = None,
         extras: Any = None,
         pm_decides: bool = False,
+        session_health: IBSessionHealth | None = None,
     ) -> None:
         super().__init__(config)
         # [pm] decide: the Portfolio Manager's review signals replace the
@@ -147,6 +149,7 @@ class Discretionary(Strategy):
         # a read-only IB connection (ib_extra.AccountExtras) for the orders this
         # node can't see: TWS's and other clients'. None: only this node's.
         self._extras = extras
+        self._session_health = session_health
         self._ib_busy: set[str] = set()
         self.pretrade = (
             pretrade  # [pretrade]: the candidates compared in the background
@@ -177,12 +180,25 @@ class Discretionary(Strategy):
             )
         if self.config.trading.dry_run:
             self.log.warning("dry_run: orders are logged, never sent")
+        if self._session_health is not None:
+            self._session_health.refresh_from_cache(self.cache)
+            self.clock.set_timer(
+                "ib-session-health",
+                timedelta(seconds=5),
+                callback=self._on_health_timer,
+            )
         aio.spawn(self, self._boot(), "strategy boot")
 
     def on_stop(self) -> None:
+        if self._session_health is not None:
+            self._session_health.refresh_from_cache(self.cache, connected=False)
         self.clock.cancel_timers()
         if self._extras is not None:
             self._extras.close()
+
+    def _on_health_timer(self, _event: TimeEvent) -> None:
+        if self._session_health is not None:
+            self._session_health.refresh_from_cache(self.cache)
 
     async def _boot(self) -> None:
         await aio.load_contracts(self, INDEX_CONTRACTS)
