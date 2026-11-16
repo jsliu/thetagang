@@ -14,6 +14,7 @@ With dry_run (the default) orders are logged and counted, never sent."""
 
 from __future__ import annotations
 
+import asyncio
 import functools
 import json
 import math
@@ -308,13 +309,22 @@ class Discretionary(Strategy):
         run never sends a second order beside one placed in TWS."""
         if self._extras is None:
             return True
-        try:
-            self._ib_busy = await self._extras.order_symbols()
-            return True
-        except Exception as e:  # noqa: BLE001 - fail closed: trade nothing
-            self.log.error(f"Open orders at IB unavailable, nothing traded: {e!r}")
-            self._extras.close()  # reconnect next run
-            return False
+        retries = 3
+        for attempt in range(1, retries + 1):
+            try:
+                self._ib_busy = await self._extras.order_symbols()
+                return True
+            except Exception as e:  # noqa: BLE001 - fail closed: trade nothing
+                if attempt < retries:
+                    await asyncio.sleep(1.0)
+                    continue
+                self.log.error(
+                    f"Open orders at IB unavailable, nothing traded: {e!r} "
+                    f"(attempt {attempt}/{retries})"
+                )
+                plan_status("IB open-order read failed")
+                self._extras.close()  # reconnect next run
+                return False
 
     def _blocking_missing(self, book: Book) -> list[InstrumentId]:
         """Positions without greeks that stop the plan (ignore_missing_greeks
@@ -1166,6 +1176,12 @@ class Discretionary(Strategy):
         qty = int(abs(qty))
         if qty < 1:
             return
+        if not math.isfinite(combo_price):
+            self.log.warning(
+                f"{symbol}: invalid order price {combo_price!r}; skipping {action}"
+            )
+            plan_status("invalid order price: no order sent")
+            return
         desc = " / ".join(f"{'+' if r > 0 else '-'}{i.symbol.value}" for i, r in combo)
         dry = self.config.trading.dry_run
         self.log.warning(
@@ -1185,11 +1201,19 @@ class Discretionary(Strategy):
         ins = self.cache.instrument(iid)
         if ins is None:
             raise NoContract(f"IB has no instrument for {iid}")
+        tick_price = self._tick_price(ins, limit)
+        if not math.isfinite(tick_price.as_double()):
+            self.log.warning(
+                f"{symbol}: invalid tick price {tick_price.as_double()!r}; "
+                f"skipping {action}"
+            )
+            plan_status("invalid order price: no order sent")
+            return
         order = self.order_factory.limit(
             iid,
             side,
             ins.make_qty(qty),
-            self._tick_price(ins, limit),
+            tick_price,
             time_in_force=TimeInForce.DAY,
         )
         self.submit_order(order)

@@ -76,12 +76,10 @@ def cli(
     from .thetagang import start
 
     try:
-        # personal setting kept from the local commits: always a dry run against a
-        # TWS/Gateway you start yourself, whatever flags are passed
         start(
             config,
-            without_ibc=True,
-            dry_run=True,
+            without_ibc=without_ibc,
+            dry_run=dry_run,
             migrate_config=migrate_config,
             auto_approve_migration=yes,
         )

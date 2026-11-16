@@ -39,6 +39,28 @@ def test_cli_passes_migration_flags(monkeypatch, tmp_path):
     assert captured["auto_approve_migration"] is True
 
 
+def test_cli_keeps_default_run_flags_false_when_not_set(monkeypatch, tmp_path):
+    config_path = tmp_path / "thetagang.toml"
+    config_path.write_text("x=1\n", encoding="utf8")
+
+    captured = {}
+
+    def fake_start(config, without_ibc, dry_run, **kwargs):
+        captured["config"] = config
+        captured["without_ibc"] = without_ibc
+        captured["dry_run"] = dry_run
+        captured.update(kwargs)
+
+    monkeypatch.setattr("thetagang.thetagang.start", fake_start)
+
+    result = CliRunner().invoke(cli, ["--config", str(config_path)])
+
+    assert result.exit_code == 0
+    assert captured["config"] == str(config_path)
+    assert captured["without_ibc"] is False
+    assert captured["dry_run"] is False
+
+
 def test_cli_handles_migration_required_without_traceback(monkeypatch, tmp_path):
     config_path = tmp_path / "thetagang.toml"
     config_path.write_text("x=1\n", encoding="utf8")
